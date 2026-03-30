@@ -681,10 +681,10 @@ function decide(ess, pvPower, amber, state, dailySummary) {
     }
   }
 
-  // ── Priority 4b: extremelyLow descriptor charging (buy < 12c) ─────────────
-  // When Amber rates the price as extremelyLow, allow charging up to 12c/kWh.
+  // ── Priority 4b: extremelyLow descriptor charging (buy < 10c) ─────────────
+  // When Amber rates the price as extremelyLow, allow charging up to 10c/kWh.
   // Priorities 1/2/2.5 guarantee we are outside the demand window here.
-  const EXTREMELY_LOW_MAX = 12; // c/kWh — relaxed ceiling for extremelyLow periods
+  const EXTREMELY_LOW_MAX = 10; // c/kWh — relaxed ceiling for extremelyLow periods
   if (!currentDemand && descriptor === 'extremelyLow' && currentPrice < EXTREMELY_LOW_MAX && soc < SOC_MAX_CHARGE) {
     targetMode = MODE.BACKUP;
     reason = `descriptor=extremelyLow, buy=${currentPrice.toFixed(2)}c (<${EXTREMELY_LOW_MAX}c) — charging (SOC ${soc}% -> ${SOC_MAX_CHARGE}%)`;

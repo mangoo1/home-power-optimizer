@@ -60,8 +60,8 @@ data/
 - Enter Backup mode to charge at low price
 
 ### Priority 4b — Extremely Low Descriptor Charging
-- Condition: `descriptor = extremelyLow` AND `buy < 12c` AND `SOC < 90%` AND outside DW
-- Relaxed price ceiling (12c) when Amber signals an extremely low price period
+- Condition: `descriptor = extremelyLow` AND `buy < 10c` AND `SOC < 90%` AND outside DW
+- Relaxed price ceiling (10c) when Amber signals an extremely low price period
 
 ### Priority 5 — Sell to Grid
 - Condition: `feedIn > avg_buy_price + 5c` AND `feedIn ≥ 14c (abs floor)` AND `SOC > 35%` AND inverter headroom > 0.2 kW
@@ -80,7 +80,7 @@ data/
 |---|---|---|---|
 | Negative price (spot ≤ 0) | — | < 90% | No |
 | Cheap rate | < 10c | < 90% | No |
-| extremelyLow descriptor | < 12c | < 90% | No |
+| extremelyLow descriptor | < 10c | < 90% | No |
 | Pre-DW forced charge | any | < 60% | No |
 | PV charging (Self-use) | — | no limit | Yes (hardware) |
 

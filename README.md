@@ -58,7 +58,7 @@ node scripts/demand-mode-manager.js
 - `buy < 10c` AND `SOC < 90%` AND outside DW → Backup
 
 ### Priority 4b — Extremely Low Descriptor
-- `descriptor = extremelyLow` AND `buy < 12c` AND `SOC < 90%` AND outside DW → Backup
+- `descriptor = extremelyLow` AND `buy < 10c` AND `SOC < 90%` AND outside DW → Backup
 - Relaxed ceiling for periods Amber flags as extremely cheap
 
 ### Priority 5 — Sell to Grid
@@ -78,7 +78,7 @@ node scripts/demand-mode-manager.js
 |---|---|---|---|
 | Negative price (spot ≤ 0) | — | < 90% | No |
 | Cheap rate | < 10c | < 90% | No |
-| extremelyLow descriptor | < 12c | < 90% | No |
+| extremelyLow descriptor | < 10c | < 90% | No |
 | Pre-DW forced charge | any | < 60% | No |
 | PV charging (Self-use) | — | no limit | Yes (inverter hardware) |
 
