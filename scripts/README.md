@@ -56,11 +56,11 @@ data/
 - Charge battery at zero cost
 
 ### Priority 4 — Cheap Rate Charging
-- Condition: `buy < 10c` AND `SOC < 90%` AND outside DW
+- Condition: `buy < 10.4c` AND `SOC < 90%` AND outside DW
 - Enter Backup mode to charge at low price
 
 ### Priority 4b — Extremely Low Descriptor Charging
-- Condition: `descriptor = extremelyLow` AND `buy < 10c` AND `SOC < 90%` AND outside DW
+- Condition: `descriptor = extremelyLow` AND `buy < 10.4c` AND `SOC < 90%` AND outside DW
 - Relaxed price ceiling (10c) when Amber signals an extremely low price period
 
 ### Priority 5 — Sell to Grid
@@ -79,8 +79,8 @@ data/
 | Rule | Price ceiling | SOC limit | DW allowed? |
 |---|---|---|---|
 | Negative price (spot ≤ 0) | — | < 90% | No |
-| Cheap rate | < 10c | < 90% | No |
-| extremelyLow descriptor | < 10c | < 90% | No |
+| Cheap rate | < 10.4c | < 90% | No |
+| extremelyLow descriptor | < 10.4c | < 90% | No |
 | Pre-DW forced charge | any | < 60% | No |
 | PV charging (Self-use) | — | no limit | Yes (hardware) |
 

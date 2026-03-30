@@ -663,9 +663,9 @@ function decide(ess, pvPower, amber, state, dailySummary) {
     return { targetMode, reason, alert };
   }
 
-  // ── Priority 4: Cheap rate charging (buy < 10c, SOC < 90%) ───────────────
+  // ── Priority 4: Cheap rate charging (buy < 10.4c, SOC < 90%) ──────────────
   // Guard: never charge during demand window.
-  const CHEAP_BUY_MAX = 10;                // c/kWh upper limit for cheap charging
+  const CHEAP_BUY_MAX = 10.4;                // c/kWh upper limit for cheap charging
   const CHEAP_CHARGE_SOC = SOC_MAX_CHARGE; // stop charging at this SOC
   if (!currentDemand && currentPrice < CHEAP_BUY_MAX && soc < CHEAP_CHARGE_SOC) {
     targetMode = MODE.BACKUP;
