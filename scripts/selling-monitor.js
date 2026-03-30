@@ -2,46 +2,44 @@
 /**
  * selling-monitor.js
  *
- * 每 5 分钟执行一次，专门管理卖电逻辑：
+ * Runs every 5 minutes as a safety monitor while selling mode is active.
+ * Checks sell conditions and exits selling if any safety condition is violated.
  *
- * 卖电安全条件（必须全部满足）：
- *   1. 不在 demand window（绝对禁止）
- *   2. PV 发电 >= 家庭用电（家用完全由光伏覆盖，电网进出 = 0）
- *   3. SOC > 55%（保留足够 demand window 用量）
- *   4. feedIn >= 15 c/kWh（卖电有利润）
- *   5. 不是夜间（PV 为 0，卖电 = 纯放电 + 电网补家用）
+ * Entry conditions (all must be met):
+ *   1. Not in demand window (absolutely prohibited)
+ *   2. SOC > 35% (reserve for tomorrow's demand window)
+ *   3. feedIn >= 10 c/kWh (profitable to sell)
+ *   4. Inverter has headroom (home load < 4.7 kW)
+ *   5. Grid not currently importing (gridPower <= 0.15 kW)
  *
- * 退出卖电条件（任一满足即退出）：
- *   - PV < 家庭用电（电网开始补电，立即停）
- *   - 进入 demand window（立即切 Self-use）
- *   - SOC <= 55%（电量不足）
- *   - feedIn < 10c（无利润）
- *   - gridPower > 0.1 kW（实测电网在补电，立即停）
+ * Exit conditions (any one triggers exit):
+ *   - Demand window starts (immediate Self-use)
+ *   - Grid importing > 0.15 kW (safety — stop before demand charge)
+ *   - SOC <= 30% (insufficient reserve)
+ *   - feedIn < 8 c/kWh (no longer profitable)
+ *   - Inverter headroom gone (home load too high)
  */
 
 const https = require("https");
 const fs = require("fs");
 const path = require("path");
 
-// Load .env from project root (one level up from scripts/)
-require("dotenv").config({ path: path.resolve(__dirname, "../.env") });
-
 const AMBER_TOKEN = process.env.AMBER_API_TOKEN;
-const AMBER_SITE_ID = process.env.AMBER_SITE_ID || "YOUR_AMBER_SITE_ID";
+const AMBER_SITE_ID = process.env.AMBER_SITE_ID || "01KMN0H71HS5SYAE5P3E9WDGCD";
 const ESS_TOKEN = process.env.ESS_TOKEN;
-const MAC_HEX = process.env.ESS_MAC_HEX || "YOUR_ESS_MAC_HEX";
+const MAC_HEX = process.env.ESS_MAC_HEX || "00534E0045FF";
 
 const MODE = { SELF_USE: 0, TIMED: 1, PV_PRIORITY: 5, SELLING: 6, BACKUP: 3 };
 const MODE_LABEL = { 0: "Self-use", 1: "Timed", 3: "Backup", 5: "PV-Priority", 6: "Selling", 7: "Voltage-Reg" };
 
-// 策略参数
-const SOC_MIN_SELL = 35;           // 卖电 SOC 底线（保留给明天 demand window ~35% = 14.7kWh）
-const SOC_EXIT_SELL = 30;          // 退出卖电的 SOC（留 5% 缓冲）
-const FEEDIN_ENTER = 10;           // 进入卖电最低 feedIn（c/kWh）
-const FEEDIN_EXIT = 8;             // 退出卖电最低 feedIn（c/kWh）
-const GRID_SAFETY_THRESHOLD = 0.15; // 电网进口容忍值（kW），超过立即停卖电
-const INVERTER_MAX_KW = 5.0;       // 逆变器最大放电功率（kW）
-const INVERTER_HEADROOM = 0.3;     // 安全余量（kW），防止边缘情况
+// Strategy parameters
+const SOC_MIN_SELL = 35;            // Min SOC to enter selling (reserve for demand window)
+const SOC_EXIT_SELL = 30;           // Exit selling if SOC drops to this (5% buffer below entry)
+const FEEDIN_ENTER = 10;            // Min feedIn to enter selling (c/kWh)
+const FEEDIN_EXIT = 8;              // Exit selling if feedIn drops below this (c/kWh)
+const GRID_SAFETY_THRESHOLD = 0.15; // Max tolerated grid import while selling (kW)
+const INVERTER_MAX_KW = 5.0;        // Max inverter discharge power (kW)
+const INVERTER_HEADROOM = 0.3;      // Safety headroom to avoid saturating inverter (kW)
 
 const STATE_FILE = "/tmp/selling-monitor-state.json";
 const GATEWAY_PORT = process.env.OPENCLAW_GATEWAY_PORT || "18789";
@@ -150,7 +148,7 @@ async function main() {
   const now = new Date();
   console.log(`[${now.toISOString()}] === selling-monitor ===`);
 
-  // 并发获取数据
+  // Fetch ESS + Amber data concurrently
   const [battery, load, meter, amberRaw] = await Promise.all([
     essGet("getBatteryInfo"),
     essGet("getLoadInfo"),
@@ -161,29 +159,27 @@ async function main() {
     ).catch(() => []),
   ]);
 
-  const soc = findVal(battery, "0x1212");
-  const battPower = findVal(battery, "0x1210");   // + 充电 / - 放电
-  const homeLoad = findVal(load, "0x1274");        // kW
-  const gridPower = findVal(meter, "0xA112");      // + 买电 / - 卖电
+  const soc       = findVal(battery, "0x1212");
+  const battPower = findVal(battery, "0x1210");  // kW: positive=charging, negative=discharging
+  const homeLoad  = findVal(load,    "0x1274");  // kW
+  const gridPower = findVal(meter,   "0xA112");  // kW: negative=import, positive=export
 
-  // 推算 PV：homeLoad = pvPower + battDischarge + gridImport
+  // Estimate PV: homeLoad = pvPower + battDischarge + gridImport
   const battDischarge = battPower != null ? -battPower : 0;
-  const gridImport = gridPower != null ? gridPower : 0;
-  const pvPower = Math.max(0, (homeLoad ?? 0) - battDischarge - gridImport);
+  const gridImport    = gridPower != null ? gridPower  : 0;
+  const pvPower       = Math.max(0, (homeLoad ?? 0) - battDischarge - gridImport);
 
-  // Amber
-  const general = Array.isArray(amberRaw) ? amberRaw.filter(p => p.channelType === "general") : [];
-  const feedInCh = Array.isArray(amberRaw) ? amberRaw.filter(p => p.channelType === "feedIn") : [];
-  const current = general[0] || {};
+  // Parse Amber response
+  const general  = Array.isArray(amberRaw) ? amberRaw.filter(p => p.channelType === "general") : [];
+  const feedInCh = Array.isArray(amberRaw) ? amberRaw.filter(p => p.channelType === "feedIn")  : [];
+  const current      = general[0]   || {};
   const demandWindow = current.tariffInformation?.demandWindow ?? false;
-  const feedInPrice = Math.abs(feedInCh[0]?.perKwh ?? 0); // Amber feedIn perKwh 为负数，取绝对值
-  const spotPrice = current.spotPerKwh ?? 0;
-  const buyPrice = current.perKwh ?? 0;
+  const feedInPrice  = Math.abs(feedInCh[0]?.perKwh ?? 0); // feedIn perKwh is negative; take abs
+  const buyPrice     = current.perKwh ?? 0;
 
-  // 可卖电余量：逆变器最大 5kW - 当前家用，剩余给卖电
-  // 卖电时：电池放电 = homeLoad + sellPower，总计 ≤ 5kW
+  // Available sell headroom: inverter max 5kW minus home load minus safety buffer
   const maxSellPower = Math.max(0, INVERTER_MAX_KW - (homeLoad ?? 0) - INVERTER_HEADROOM);
-  const canSellPower = maxSellPower > 0.2; // 至少有 0.2kW 余量才值得卖
+  const canSellPower = maxSellPower > 0.2; // need at least 0.2 kW headroom
 
   console.log(`[DATA] SOC:${soc}%  BattPwr:${battPower?.toFixed(2)}kW  HomeLoad:${homeLoad?.toFixed(2)}kW  PV:${pvPower?.toFixed(2)}kW  Grid:${gridPower?.toFixed(3)}kW`);
   console.log(`[DATA] MaxSellPower:${maxSellPower.toFixed(2)}kW  feedIn:${feedInPrice.toFixed(2)}c  demandWindow:${demandWindow}`);
@@ -191,20 +187,20 @@ async function main() {
   const state = loadState();
   const currentlySelling = state.mode === MODE.SELLING;
 
-  // ── 安全退出检查（优先级最高）──────────────────────────────────────────
+  // ── Safety exit checks (highest priority) ────────────────────────────────
   if (currentlySelling) {
     let exitReason = null;
 
     if (demandWindow) {
-      exitReason = `进入 demand window，立即停止卖电`;
+      exitReason = `demand window started — stop selling immediately`;
     } else if (gridPower > GRID_SAFETY_THRESHOLD) {
-      exitReason = `⚠️ 检测到电网进口 ${gridPower.toFixed(3)} kW > ${GRID_SAFETY_THRESHOLD} kW，立即停止卖电防 demand charge`;
+      exitReason = `⚠️ grid importing ${gridPower.toFixed(3)} kW > ${GRID_SAFETY_THRESHOLD} kW — stop selling to prevent demand charge`;
     } else if (!canSellPower) {
-      exitReason = `家用 ${homeLoad?.toFixed(2)}kW 过高，逆变器无余量卖电（最大 ${INVERTER_MAX_KW}kW）`;
+      exitReason = `home load ${homeLoad?.toFixed(2)}kW too high — inverter headroom ${maxSellPower.toFixed(2)}kW insufficient`;
     } else if (soc <= SOC_EXIT_SELL) {
-      exitReason = `SOC ${soc}% ≤ ${SOC_EXIT_SELL}%，停止卖电保留明天用量`;
+      exitReason = `SOC ${soc}% <= ${SOC_EXIT_SELL}% — stopping to preserve reserve`;
     } else if (feedInPrice < FEEDIN_EXIT) {
-      exitReason = `feedIn ${feedInPrice.toFixed(2)}c < ${FEEDIN_EXIT}c，卖电无利润`;
+      exitReason = `feedIn ${feedInPrice.toFixed(2)}c < ${FEEDIN_EXIT}c — no longer profitable`;
     }
 
     if (exitReason) {
@@ -214,50 +210,50 @@ async function main() {
         const duration = state.sellingSince
           ? ((now - new Date(state.sellingSince)) / 60000).toFixed(0)
           : "?";
-        console.log(`[ACTION] 切换到 Self-use（卖电持续了 ${duration} 分钟）`);
+        console.log(`[ACTION] Switched to Self-use (sold for ${duration} min)`);
         state.mode = MODE.SELF_USE;
         state.sellingSince = null;
         state.lastExitReason = exitReason;
-        await deleteSelfCron(); // 自删 5 分钟 cron
+        await deleteSelfCron(); // self-delete the 5-min safety monitor cron
       }
       saveState({ ...state, lastCheck: now.toISOString() });
       return;
     }
 
-    // 继续卖电
+    // Continue selling — log status
     const duration = state.sellingSince
       ? ((now - new Date(state.sellingSince)) / 60000).toFixed(0)
       : "?";
-    console.log(`[INFO] 继续卖电（已卖 ${duration} 分钟，SOC:${soc}%，feedIn:${feedInPrice.toFixed(1)}c，PV surplus:${pvSurplus.toFixed(2)}kW）`);
+    console.log(`[INFO] Selling active (${duration} min, SOC:${soc}%, feedIn:${feedInPrice.toFixed(1)}c, headroom:${maxSellPower.toFixed(2)}kW)`);
     saveState({ ...state, lastCheck: now.toISOString() });
     return;
   }
 
-  // ── 进入卖电检查 ──────────────────────────────────────────────────────────
+  // ── Entry check ───────────────────────────────────────────────────────────
   if (!currentlySelling) {
     const canSell =
-      !demandWindow &&                        // 不在 demand window
-      canSellPower &&                         // 逆变器有余量（家用 < 4.7kW）
-      soc > SOC_MIN_SELL &&                   // SOC 充裕，保留明天用量
-      feedInPrice >= FEEDIN_ENTER &&          // 卖电有利润
-      gridPower <= GRID_SAFETY_THRESHOLD;     // 电网当前不进口
+      !demandWindow &&                        // not in demand window
+      canSellPower &&                         // inverter has headroom
+      soc > SOC_MIN_SELL &&                   // sufficient SOC reserve
+      feedInPrice >= FEEDIN_ENTER &&          // profitable feed-in price
+      gridPower <= GRID_SAFETY_THRESHOLD;     // grid not currently importing
 
     if (canSell) {
-      console.log(`[ENTER SELL] feedIn:${feedInPrice.toFixed(1)}c  SOC:${soc}%  MaxSellPower:${maxSellPower.toFixed(2)}kW → 切换到 Selling Mode`);
+      console.log(`[ENTER SELL] feedIn:${feedInPrice.toFixed(1)}c  SOC:${soc}%  headroom:${maxSellPower.toFixed(2)}kW — switching to Selling`);
       const ok = await setMode(MODE.SELLING);
       if (ok) {
         state.mode = MODE.SELLING;
         state.sellingSince = now.toISOString();
-        console.log(`[ACTION] ✅ 已切换到 Selling Mode（最大可卖 ${maxSellPower.toFixed(2)}kW）`);
+        console.log(`[ACTION] Switched to Selling mode (max sell ${maxSellPower.toFixed(2)}kW)`);
       }
     } else {
       const reasons = [];
-      if (demandWindow) reasons.push(`在 demand window`);
-      if (!canSellPower) reasons.push(`家用 ${homeLoad?.toFixed(1)}kW，逆变器余量仅 ${maxSellPower.toFixed(2)}kW`);
-      if (soc <= SOC_MIN_SELL) reasons.push(`SOC ${soc}% ≤ ${SOC_MIN_SELL}%`);
-      if (feedInPrice < FEEDIN_ENTER) reasons.push(`feedIn ${feedInPrice.toFixed(1)}c < ${FEEDIN_ENTER}c`);
-      if (gridPower > GRID_SAFETY_THRESHOLD) reasons.push(`电网进口 ${gridPower.toFixed(3)}kW`);
-      console.log(`[INFO] 不卖电：${reasons.join("，")}`);
+      if (demandWindow)                          reasons.push(`demand window active`);
+      if (!canSellPower)                         reasons.push(`home load ${homeLoad?.toFixed(1)}kW, headroom only ${maxSellPower.toFixed(2)}kW`);
+      if (soc <= SOC_MIN_SELL)                   reasons.push(`SOC ${soc}% <= ${SOC_MIN_SELL}%`);
+      if (feedInPrice < FEEDIN_ENTER)            reasons.push(`feedIn ${feedInPrice.toFixed(1)}c < ${FEEDIN_ENTER}c`);
+      if (gridPower > GRID_SAFETY_THRESHOLD)     reasons.push(`grid importing ${gridPower.toFixed(3)}kW`);
+      console.log(`[INFO] Not selling: ${reasons.join(", ")}`);
     }
   }
 
