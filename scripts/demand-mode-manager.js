@@ -2,27 +2,24 @@
 /**
  * demand-mode-manager.js
  *
- * 每 30 分钟执行一次（由 cron 触发）：
- * 1. 读取实时数据：SOC、家庭用电、PV发电、电网功率
- * 2. 读取 Amber 电价（当前 + 预测）
- * 3. 根据决策树自动切换逆变器模式
- * 4. 将数据追加到 data/energy-log.jsonl（每 30 分钟一行）
- * 5. 更新 data/daily-summary.json（当天汇总）
+ * Runs every 5 minutes (triggered by cron).
+ * 1. Fetch real-time data: SOC, home load, PV power, grid power
+ * 2. Fetch Amber electricity prices (current + forecast)
+ * 3. Run decision tree and switch inverter mode automatically
+ * 4. Write data to SQLite (energy_log) at :00/:30 or on mode change
+ * 5. Upsert daily summary (daily_summary table)
  */
 
 const https = require("https");
 const fs = require("fs");
 const path = require("path");
 
-// Load .env from project root (one level up from scripts/)
-require("dotenv").config({ path: path.resolve(__dirname, "../.env") });
-
-// ── 配置 ─────────────────────────────────────────────────────────────────────
+// ── Configuration ─────────────────────────────────────────────────────────────
 const AMBER_TOKEN = process.env.AMBER_API_TOKEN;
-const AMBER_SITE_ID = process.env.AMBER_SITE_ID || "YOUR_AMBER_SITE_ID";
+const AMBER_SITE_ID = process.env.AMBER_SITE_ID || "01KMN0H71HS5SYAE5P3E9WDGCD";
 const ESS_TOKEN = process.env.ESS_TOKEN;
-const MAC_HEX = process.env.ESS_MAC_HEX || "YOUR_ESS_MAC_HEX";
-const STATION_SN = process.env.ESS_STATION_SN || "YOUR_ESS_STATION_SN";
+const MAC_HEX = process.env.ESS_MAC_HEX || "00534E0045FF";
+const STATION_SN = process.env.ESS_STATION_SN || "EU1774416396356";
 
 const WORKSPACE = path.resolve(__dirname, "..");
 const DATA_DIR = path.join(WORKSPACE, "data");
@@ -62,7 +59,8 @@ function getDb() {
         interval_sell_aud REAL,  -- grid export kWh * feedin_price / 100
         interval_net_aud REAL,   -- interval_buy_aud - interval_sell_aud
         meter_buy_delta REAL,    -- meter_buy_total - prev meter_buy_total (actual kWh from meter)
-        meter_sell_delta REAL    -- meter_sell_total - prev meter_sell_total (actual kWh from meter)
+        meter_sell_delta REAL,   -- meter_sell_total - prev meter_sell_total (actual kWh from meter)
+        record_trigger TEXT      -- why this row was written: 'scheduled' | 'mode_change'
       );
       CREATE TABLE IF NOT EXISTS daily_summary (
         date TEXT PRIMARY KEY, intervals INTEGER DEFAULT 0,
@@ -74,7 +72,6 @@ function getDb() {
         meter_buy_start REAL, meter_buy_end REAL,
         meter_sell_start REAL, meter_sell_end REAL
       );
-      -- 迁移：补加新列（已存在时忽略报错）
       CREATE TABLE IF NOT EXISTS meter_daily (
         date TEXT PRIMARY KEY,
         buy_start REAL, buy_end REAL,
@@ -89,21 +86,21 @@ function getDb() {
 const DAILY_SUMMARY = path.join(DATA_DIR, "daily-summary.json");
 const STATE_FILE = "/tmp/demand-mode-state.json";
 
-// 逆变器模式
+// Inverter modes
 const MODE = { SELF_USE: 0, TIMED: 1, PV_PRIORITY: 5, SELLING: 6, BACKUP: 3 };
 const MODE_LABEL = { 0: "Self-use", 1: "Timed", 3: "Backup", 5: "PV-Priority", 6: "Selling", 7: "Voltage-Reg" };
 
-// 策略参数
-const SOC_MAX_CHARGE = 90;        // Backup 模式充电上限
-const SOC_MIN_SELL = 35;          // 卖电时 SOC 不低于此值（保留明天 demand window 用量）
-const SOC_WARN = 20;              // Demand window 内 SOC 告警阈值
-const SELL_FEEDIN_MIN = 10;       // 卖电最低 feedIn 价格（c/kWh）
-const CHARGE_SPOT_MAX = 0;        // Backup 充电最高 spot 价格（≤0 才充）
-const BATTERY_CAPACITY = 42;      // kWh 总容量
-const BATTERY_MIN_SOC = 10;       // 最低 SOC %
-const INVERTER_MAX_DISCHARGE = 5; // kW 最大放电功率
+// Strategy parameters
+const SOC_MAX_CHARGE = 90;        // Target SOC for backup/charge modes (%)
+const SOC_MIN_SELL = 35;          // Min SOC allowed when selling (reserve for demand window)
+const SOC_WARN = 20;              // Alert threshold: SOC too low during demand window
+const SELL_FEEDIN_MIN = 0;        // Hard floor for selling (0 = rely solely on avg-buy+margin logic)
+const CHARGE_SPOT_MAX = 0;        // Max spot price for free charging (spot <= 0 = free)
+const BATTERY_CAPACITY = 42;      // kWh total battery capacity
+const BATTERY_MIN_SOC = 10;       // Min SOC % (reserve, never discharge below this)
+const INVERTER_MAX_DISCHARGE = 5; // kW max inverter discharge power
 
-// ESS API headers
+// ESS app API headers
 const ESS_HEADERS = {
   lang: "en", platform: "linux", projectType: "1", source: "app",
   Origin: "https://euapp.ess-link.com", Referer: "https://euapp.ess-link.com/",
@@ -137,7 +134,7 @@ function httpsPost(url, body, headers = {}) {
   });
 }
 
-// ESS Web API headers (uses Bearer prefix, different from app API)
+// ESS Web API headers (Bearer prefix, different from app API)
 const ESS_WEB_HEADERS = {
   Authorization: `Bearer ${ESS_TOKEN}`,
   Referer: "https://eu.ess-link.com/appViews/appHome",
@@ -190,21 +187,21 @@ async function getESSData() {
   ]);
 
   return {
-    // App API — realtime instantaneous
-    soc:            findVal(battery, "0x1212"),       // %
-    battPower:      findVal(battery, "0x1210"),       // kW (+充电 / -放电)
+    // App API — realtime instantaneous values
+    soc:            findVal(battery, "0x1212"),       // % state of charge
+    battPower:      findVal(battery, "0x1210"),       // kW (positive=charging, negative=discharging)
     battVoltage:    findVal(battery, "0x120C"),       // V
     battCurrent:    findVal(battery, "0x120E"),       // A
-    homeLoad:       findVal(load, "0x1274"),          // kW 家庭用电总功率
-    gridPower:      findVal(meter, "0xA112"),         // kW: negative=import(买电) / positive=export(卖电)
-    pvPowerApp:     findValStr(pv, "0x1270"),         // kW 实时 PV（用 valueStr，value 字段有编码 bug）
-    pvEnergy:       findVal(pv, "0x125C"),            // kWh 累计发电
-    purchasedTotal: findVal(meter, "0x1240"),         // kWh 累计买电
-    feedTotal:      findVal(meter, "0x1242"),         // kWh 累计卖电
+    homeLoad:       findVal(load, "0x1274"),          // kW total home load
+    gridPower:      findVal(meter, "0xA112"),         // kW: negative=import / positive=export
+    pvPowerApp:     findValStr(pv, "0x1270"),         // kW realtime PV (valueStr avoids encoding bug)
+    pvEnergy:       findVal(pv, "0x125C"),            // kWh cumulative PV generation
+    purchasedTotal: findVal(meter, "0x1240"),         // kWh cumulative grid import
+    feedTotal:      findVal(meter, "0x1242"),         // kWh cumulative grid export
 
     // Web API — flow diagram (single-call energy snapshot)
     flowPV:         flow?.totalPVPower      ?? null,  // kW solar
-    flowGrid:       flow?.totalGridPower    ?? null,  // kW: negative=import(买电) / positive=export(卖电)
+    flowGrid:       flow?.totalGridPower    ?? null,  // kW: negative=import / positive=export
     flowBattery:    flow?.totalBatteryPower ?? null,  // kW: positive=charging
     flowLoad:       flow?.totalLoadPower    ?? null,  // kW AC home load
 
@@ -212,25 +209,24 @@ async function getESSData() {
     todayChargeKwh:    battDetails?.todaycharge    ?? null,
     todayDischargeKwh: battDetails?.todaydischarge ?? null,
 
-    // Web API — running info (today's totals + current mode)
-    todayPvKwh:       runInfo?.x1264 ?? null,   // today PV kWh
-    todayBattChargeKwh2: runInfo?.x1266 ?? null, // today batt charge kWh (alt source)
-    todayGridBuyKwh:  runInfo?.x126A ?? null,   // today grid buy kWh
-    todayGridSellKwh: runInfo?.x126C ?? null,   // today grid sell kWh
-    todayHomeKwh:     runInfo?.x126E ?? null,   // today home load kWh
-    todayCarbonKg:    runInfo?.carbon ?? null,  // kg CO2 saved today
-    reportedMode:     runInfo?.x300C ?? null,   // current mode from portal
+    // Web API — running info (today's totals + current reported mode)
+    todayPvKwh:       runInfo?.x1264 ?? null,
+    todayBattChargeKwh2: runInfo?.x1266 ?? null,
+    todayGridBuyKwh:  runInfo?.x126A ?? null,
+    todayGridSellKwh: runInfo?.x126C ?? null,
+    todayHomeKwh:     runInfo?.x126E ?? null,
+    todayCarbonKg:    runInfo?.carbon ?? null,
+    reportedMode:     runInfo?.x300C ?? null,        // current mode as reported by portal
   };
 }
 
-// PV 实时功率：优先用 app API 0x1270 真实值，fallback 推算
-// homeLoad = pvPower + battDischarge + gridImport  (逆变器能量守恒)
+// PV power: prefer app API real value; fall back to energy-balance estimate.
+// Energy balance: homeLoad = pvPower + battDischarge + gridImport
 function calcPVPower(ess) {
   if (ess.pvPowerApp != null) return ess.pvPowerApp;
   if (ess.homeLoad == null) return null;
-  const battDischarge = ess.battPower != null ? -ess.battPower : 0; // 放电为正
-  // gridPower 负=买电(import)，取反得正的买电量
-  const gridImport = ess.gridPower != null ? -ess.gridPower : 0;
+  const battDischarge = ess.battPower != null ? -ess.battPower : 0; // discharge is positive
+  const gridImport = ess.gridPower != null ? -ess.gridPower : 0;    // import is positive
   return Math.max(0, ess.homeLoad - battDischarge + gridImport);
 }
 
@@ -271,7 +267,7 @@ async function createSellingCron() {
     sessionTarget: "main",
     payload: {
       kind: "systemEvent",
-      text: `【卖电安全监控】\n\nAMBER_API_TOKEN=ESS_TOKEN=${ESS_TOKEN} ESS_MAC_HEX=${MAC_HEX} AMBER_SITE_ID=${AMBER_SITE_ID} node /home/deven/.openclaw/workspace/scripts/selling-monitor.js\n\n如果输出包含 [EXIT SELL] 或 [ENTER SELL] 或 ⚠️，请转告用户。否则静默。`,
+      text: `[Selling Safety Monitor]\n\nAMBER_API_TOKEN=psk_c654897f6caa055fda06e83369936242 ESS_TOKEN=${ESS_TOKEN} ESS_MAC_HEX=${MAC_HEX} AMBER_SITE_ID=${AMBER_SITE_ID} node /home/deven/.openclaw/workspace/scripts/selling-monitor.js\n\nIf output contains [EXIT SELL] or [ENTER SELL] or warning, relay to user. Otherwise silent.`,
     },
   };
   try {
@@ -290,16 +286,168 @@ async function deleteSellingCron() {
 }
 
 // ── Inverter control ──────────────────────────────────────────────────────────
-async function setMode(mode) {
-  if (!ESS_TOKEN) { console.log(`[SKIP] No ESS_TOKEN, would set mode ${MODE_LABEL[mode]}`); return false; }
+async function setParam(index, data) {
+  if (!ESS_TOKEN) return false;
   try {
     const r = await httpsPost(
       "https://eu.ess-link.com/api/app/deviceInfo/setDeviceParam",
-      { data: mode, macHex: MAC_HEX, index: "0x300C" },
+      { data, macHex: MAC_HEX, index },
       { Authorization: ESS_TOKEN, ...ESS_HEADERS }
     );
     return r.code === 200;
   } catch { return false; }
+}
+
+async function setDateParam(index, data) {
+  if (!ESS_TOKEN) return false;
+  try {
+    const r = await httpsPost(
+      "https://eu.ess-link.com/api/app/deviceInfo/setDeviceDateOrTimeParam",
+      { data, macHex: MAC_HEX, index },
+      { Authorization: ESS_TOKEN, ...ESS_HEADERS }
+    );
+    return r.code === 200;
+  } catch { return false; }
+}
+
+async function setMode(mode) {
+  return setParam("0x300C", mode);
+}
+
+// Set Timed/Selling mode with all required parameters.
+// Steps:
+//   0. Sync inverter clock to current AEST time
+//   1. Set mode to Timed (1)
+//   2. Set start time = now (HHMM)
+//   3. Set end time = now + 10 min (HHMM) — rolling window, updated each 5-min cron
+//   4. Set discharge power = 5 kW
+//   5. Set other mode param = 0 (fixed)
+//   6. Set active days = all week [0-6] (fixed)
+//   7. Set start date = yesterday (already active)
+//   8. Set end date = tomorrow (covers today fully)
+async function setSellingMode() {
+  if (!ESS_TOKEN) { console.log(`[SKIP] No ESS_TOKEN, would set Selling mode`); return false; }
+
+  const now = new Date();
+  const aest = new Date(now.getTime() + 11 * 3600 * 1000); // AEST = UTC+11
+
+  // Current time as HHMM string (e.g. "1830")
+  const fmt2 = n => String(n).padStart(2,'0');
+  const startHHMM = fmt2(aest.getUTCHours()) + fmt2(aest.getUTCMinutes());
+
+  // End time = now + 10 min rolling window
+  const endDate = new Date(aest.getTime() + 10 * 60 * 1000);
+  const endHHMM = fmt2(endDate.getUTCHours()) + fmt2(endDate.getUTCMinutes());
+
+  // AEST datetime string for clock sync: "YYYY-MM-DD HH:MM:SS"
+  const clockStr = aest.toISOString().replace('T',' ').substring(0,19);
+
+  // Yesterday and tomorrow in AEST
+  const fmtDate = d => d.toISOString().substring(0,10);
+  const yesterday = fmtDate(new Date(aest.getTime() - 86400000));
+  const tomorrow  = fmtDate(new Date(aest.getTime() + 86400000));
+
+  console.log(`[SELL] Setting Timed mode: ${startHHMM}–${endHHMM} AEST, clock=${clockStr}, dates ${yesterday}–${tomorrow}`);
+
+  const steps = [
+    { label: `syncClock=${clockStr}`,  fn: () => httpsPost('https://eu.ess-link.com/api/app/deviceInfo/setDeviceDateParam', { data: clockStr, macHex: MAC_HEX, index: '0x3050' }, { Authorization: ESS_TOKEN, ...ESS_HEADERS }).then(r => r.code === 200).catch(() => false) },
+    { label: 'mode=Timed(1)',          fn: () => setParam('0x300C',  1) },
+    { label: `startTime=${startHHMM}`, fn: () => setParam('0xC018', startHHMM) },
+    { label: `endTime=${endHHMM}`,     fn: () => setParam('0xC01A', endHHMM) },
+    { label: 'discharge=5kW',          fn: () => setParam('0xC0BC', 5) },
+    { label: 'otherMode=0',            fn: () => setParam('0x314E', 0) },
+    { label: 'weekdays=all',           fn: () => setParam('0xC0B4', [0,1,2,3,4,5,6]) },
+    { label: `startDate=${yesterday}`, fn: () => setDateParam('0xC0B6', yesterday) },
+    { label: `endDate=${tomorrow}`,    fn: () => setDateParam('0xC0B8', tomorrow) },
+  ];
+
+  for (const step of steps) {
+    const ok = await step.fn();
+    console.log(`[SELL]   ${step.label} -> ${ok ? 'OK' : 'FAILED'}`);
+    if (!ok && step.label.startsWith('mode=')) return false; // mode step is critical
+    await new Promise(r => setTimeout(r, 500));
+  }
+  return true;
+}
+
+// Update rolling end time window for active Selling mode (called each cron run while selling).
+async function updateSellingEndTime() {
+  const aest = new Date(Date.now() + 11 * 3600 * 1000);
+  const end = new Date(aest.getTime() + 10 * 60 * 1000);
+  const endHHMM = String(end.getUTCHours()).padStart(2,'0') + String(end.getUTCMinutes()).padStart(2,'0');
+  const ok = await setParam('0xC01A', endHHMM);
+  console.log(`[SELL] Rolling end time -> ${endHHMM} ${ok ? 'OK' : 'FAILED'}`);
+  return ok;
+}
+
+// Read current inverter mode from portal (0x300C)
+async function getReportedMode() {
+  try {
+    const data = await essWebGet(`/api/web/deviceInfo/getDevicRunningInfo?stationSn=${STATION_SN}`);
+    return data?.x300C ?? null;
+  } catch { return null; }
+}
+
+// Read current grid power (negative = import, positive = export)
+async function getGridPower() {
+  try {
+    const data = await essGet('getMeterInfo');
+    return data ? findVal(data, '0xA112') : null;
+  } catch { return null; }
+}
+
+// Set mode with post-switch verification and up to 4 retries (5 attempts total).
+// For Selling mode, uses the full 8-step Timed mode setup.
+// Also verifies grid is actually exporting (gridPower > 0) for Selling.
+// Returns true if mode was confirmed, false if all attempts failed.
+async function setModeWithVerify(targetMode) {
+  const label = MODE_LABEL[targetMode] ?? targetMode;
+  const maxAttempts = targetMode === MODE.SELLING ? 2 : 5; // Selling: max 2 (8 steps × 2 costly)
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    // Use full Timed mode setup for Selling; simple setMode for others
+    const ok = targetMode === MODE.SELLING
+      ? await setSellingMode()
+      : await setMode(targetMode);
+
+    if (!ok) {
+      console.warn(`[WARN] Mode setup failed (attempt ${attempt}/${maxAttempts})`);
+      if (attempt < maxAttempts) await new Promise(r => setTimeout(r, 3000));
+      continue;
+    }
+
+    // Wait for inverter to apply
+    await new Promise(r => setTimeout(r, 4000));
+
+    const reported = await getReportedMode();
+
+    if (targetMode === MODE.SELLING) {
+      // For Selling: verify mode=Timed(1) AND grid is exporting
+      const gridPower = await getGridPower();
+      const modeOk = reported === MODE.TIMED; // Timed mode = 1
+      const exportOk = gridPower != null && gridPower > 0;
+      console.log(`[VERIFY] Selling check: mode=${reported}(${MODE_LABEL[reported]}) grid=${gridPower?.toFixed(2)}kW`);
+      if (modeOk && exportOk) {
+        console.log(`[VERIFY] Selling confirmed ✓ (mode=Timed, grid export=${gridPower.toFixed(2)}kW)`);
+        return true;
+      }
+      if (modeOk && !exportOk) {
+        console.warn(`[WARN] Mode=Timed but grid not exporting (${gridPower?.toFixed(2)}kW) — attempt ${attempt}/${maxAttempts}`);
+      } else {
+        console.warn(`[WARN] Mode mismatch: expected Timed(1), got ${reported}(${MODE_LABEL[reported]}) — attempt ${attempt}/${maxAttempts}`);
+      }
+    } else {
+      if (reported === targetMode) {
+        console.log(`[VERIFY] Mode confirmed: ${label} (reported=${reported}) ✓`);
+        return true;
+      }
+      console.warn(`[WARN] Mode mismatch after attempt ${attempt}/${maxAttempts}: expected ${targetMode}(${label}), got ${reported}(${MODE_LABEL[reported] ?? reported})`);
+    }
+
+    if (attempt < maxAttempts) await new Promise(r => setTimeout(r, 3000));
+  }
+  console.error(`[ERROR] Mode switch to ${label} failed after ${maxAttempts} attempts`);
+  return false;
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -316,10 +464,10 @@ function ensureDataDir() {
 
 function appendLog(record) {
   ensureDataDir();
-  // 1. 写 JSONL（备份）
+  // 1. Write JSONL backup
   fs.appendFileSync(ENERGY_LOG, JSON.stringify(record) + "\n");
 
-  // 2. 写 SQLite
+  // 2. Write to SQLite
   const db = getDb();
   if (!db) return;
   try {
@@ -337,7 +485,7 @@ function appendLog(record) {
          amber_feedin_price, amber_spot_price,
          next_demand_min, reported_mode,
          interval_buy_aud, interval_sell_aud, interval_net_aud,
-         meter_buy_delta, meter_sell_delta)
+         meter_buy_delta, meter_sell_delta, record_trigger)
       VALUES
         (@ts, @nemTime, @soc, @battPower, @homeLoad, @pvPower, @gridPower,
          @buyPrice, @feedInPrice, @spotPrice, @demandWindow, @mode, @modeChanged, @modeReason, @renewables, @alert,
@@ -351,7 +499,7 @@ function appendLog(record) {
          @feedInPriceRaw, @spotPriceRaw,
          @nextDemandMin, @reportedMode,
          @intervalBuyAud, @intervalSellAud, @intervalNetAud,
-         @meterBuyDelta, @meterSellDelta)
+         @meterBuyDelta, @meterSellDelta, @recordTrigger)
     `).run({
       ts: record.ts, nemTime: record.nemTime, soc: record.soc,
       battPower: record.battPower, homeLoad: record.homeLoad,
@@ -390,6 +538,7 @@ function appendLog(record) {
       intervalNetAud:  record.intervalNetAud  ?? null,
       meterBuyDelta:   record.meterBuyDelta   ?? null,
       meterSellDelta:  record.meterSellDelta  ?? null,
+      recordTrigger:   record.recordTrigger   ?? null,
     });
   } catch (e) { console.warn("[DB] insert failed:", e.message); }
 }
@@ -398,7 +547,6 @@ function updateDailySummary(record) {
   ensureDataDir();
   const today = record.ts.substring(0, 10);
 
-  // SQLite upsert
   const db = getDb();
   if (db) {
     try {
@@ -427,7 +575,7 @@ function updateDailySummary(record) {
       `).run({
         date: today,
         home: (record.homeLoad || 0) * 0.5,
-        // gridPower: negative=import(买电), positive=export(卖电)
+        // gridPower: negative=import(buy), positive=export(sell)
         buy:  record.gridPower < 0 ? Math.abs(record.gridPower) * 0.5 : 0,
         sell: record.gridPower > 0 ? record.gridPower * 0.5 : 0,
         cost: record.gridPower < 0 ? Math.abs(record.gridPower) * 0.5 * (record.buyPrice || 0) / 100 : 0,
@@ -440,7 +588,7 @@ function updateDailySummary(record) {
     } catch (e) { console.warn("[DB] daily upsert failed:", e.message); }
   }
 
-  // 返回今天汇总供打印
+  // Return today's summary for printing
   if (db) {
     try { return db.prepare("SELECT * FROM daily_summary WHERE date=?").get(today) || {}; }
     catch {}
@@ -449,94 +597,168 @@ function updateDailySummary(record) {
 }
 
 // ── Decision engine ───────────────────────────────────────────────────────────
-function decide(ess, pvPower, amber, state) {
+function decide(ess, pvPower, amber, state, dailySummary) {
   const { soc, homeLoad, gridPower, battPower } = ess;
-  const { currentDemand, currentPrice, feedInPrice, spotPrice, nextDemandMinutes } = amber;
-  const usableEnergy = (soc - BATTERY_MIN_SOC) / 100 * BATTERY_CAPACITY; // kWh 可用
+  const { currentDemand, currentPrice, feedInPrice, spotPrice, nextDemandMinutes, descriptor } = amber;
+  const usableEnergy = (soc - BATTERY_MIN_SOC) / 100 * BATTERY_CAPACITY; // usable kWh remaining
   const hoursRemaining = homeLoad > 0 ? usableEnergy / homeLoad : 99;
 
   let targetMode = state.currentMode;
   let reason = "no change";
   let alert = null;
 
-  // ── 优先级 1：Demand window 保护（最高优先级）──────────────────────
+  // ── Priority 1: Demand window protection (highest priority) ───────────────
+  // During demand window:
+  //   - NO charging allowed (grid import = demand charge)
+  //   - Selling IS allowed (grid export does NOT create demand charge)
   if (currentDemand) {
     if (soc < SOC_WARN) {
-      alert = `⚠️ Demand window 中 SOC 仅 ${soc}%，剩余可用 ${usableEnergy.toFixed(1)} kWh，预计 ${hoursRemaining.toFixed(1)} 小时后耗尽`;
+      alert = `⚠️ Demand window: SOC only ${soc}%, usable ${usableEnergy.toFixed(1)} kWh, ~${hoursRemaining.toFixed(1)}h remaining`;
     }
-    if (state.currentMode !== MODE.SELF_USE) {
-      targetMode = MODE.SELF_USE;
-      reason = `demand window 中，强制 Self-use（SOC ${soc}%）`;
-    } else {
-      reason = `demand window 中，维持 Self-use`;
-    }
-    return { targetMode, reason, alert };
-  }
-
-  // ── 优先级 2：Demand window 即将开始（5 分钟内）───────────────────
-  if (!currentDemand && nextDemandMinutes != null && nextDemandMinutes <= 5 && nextDemandMinutes > -5) {
-    targetMode = MODE.SELF_USE;
-    reason = `demand window 将在 ${nextDemandMinutes.toFixed(0)} 分钟后开始`;
-    return { targetMode, reason, alert };
-  }
-
-  // ── 优先级 3：免费/负价充电（spot ≤ 0）──────────────────────────────
-  if (spotPrice <= CHARGE_SPOT_MAX && soc < SOC_MAX_CHARGE) {
-    targetMode = MODE.BACKUP;
-    reason = `spot=${spotPrice.toFixed(2)}c（≤0），免费充电（SOC ${soc}% → 目标 ${SOC_MAX_CHARGE}%）`;
-    return { targetMode, reason, alert };
-  }
-  if (spotPrice <= CHARGE_SPOT_MAX && soc >= SOC_MAX_CHARGE) {
-    // 满了，切回 Self-use
+    // If currently charging — stop immediately
     if (state.currentMode === MODE.BACKUP) {
       targetMode = MODE.SELF_USE;
-      reason = `SOC 已达 ${soc}%（≥${SOC_MAX_CHARGE}%），停止充电`;
+      reason = `demand window active — stop charging, switch to Self-use (SOC ${soc}%)`;
+      return { targetMode, reason, alert };
+    }
+    // Not charging: allow sell logic (priority 5) to run below.
+    // Set a default reason in case sell doesn't trigger.
+    if (state.currentMode !== MODE.SELLING) {
+      reason = `demand window active — maintaining Self-use`;
+    }
+    // Fall through to priority 5 sell check
+  }
+
+  // ── Priority 2: Demand window imminent (within 10 minutes) ────────────────
+  // Stop any charging before demand window starts. 10-min buffer for mode switch.
+  if (!currentDemand && nextDemandMinutes != null && nextDemandMinutes <= 10 && nextDemandMinutes > -5) {
+    targetMode = MODE.SELF_USE;
+    reason = `demand window starts in ${nextDemandMinutes.toFixed(0)} min — switching to Self-use`;
+    return { targetMode, reason, alert };
+  }
+
+  // ── Priority 2.5: Pre-demand window forced charge (10–60 min before) ──────
+  // Only force charge if SOC < 60% — enough reserve to cover the demand window.
+  // If SOC >= 60%, the battery is sufficient; let normal price rules apply.
+  const PRE_DW_CHARGE_SOC = 60; // % minimum SOC threshold for forced pre-DW charging
+  if (!currentDemand && nextDemandMinutes != null && nextDemandMinutes <= 60 && nextDemandMinutes > 10 && soc < PRE_DW_CHARGE_SOC) {
+    targetMode = MODE.BACKUP;
+    reason = `demand window in ${nextDemandMinutes.toFixed(0)} min — force charging (SOC ${soc}% < ${PRE_DW_CHARGE_SOC}%)`;
+    return { targetMode, reason, alert };
+  }
+
+  // ── Priority 3: Free/negative-price charging (spot <= 0) ─────────────────
+  // Guard: never charge during demand window (handled in priority 1)
+  if (!currentDemand && spotPrice <= CHARGE_SPOT_MAX && soc < SOC_MAX_CHARGE) {
+    targetMode = MODE.BACKUP;
+    reason = `spot=${spotPrice.toFixed(2)}c (<=0) — free charging (SOC ${soc}% -> ${SOC_MAX_CHARGE}%)`;
+    return { targetMode, reason, alert };
+  }
+  if (!currentDemand && spotPrice <= CHARGE_SPOT_MAX && soc >= SOC_MAX_CHARGE) {
+    // Battery full — exit Backup
+    if (state.currentMode === MODE.BACKUP) {
+      targetMode = MODE.SELF_USE;
+      reason = `SOC reached ${soc}% (>=${SOC_MAX_CHARGE}%) — stop charging`;
     }
     return { targetMode, reason, alert };
   }
 
-  // ── 优先级 4：低价充电（buy < 10c 且 SOC < 95%）────────────────────────────────
-  // Demand window 已在优先级 1/2 处理，走到这里说明不在 demand window 内
-  const CHEAP_BUY_MAX = 10;   // c/kWh
-  const CHEAP_CHARGE_SOC = 95; // % 充到此 SOC 停止
-  if (currentPrice < CHEAP_BUY_MAX && soc < CHEAP_CHARGE_SOC) {
+  // ── Priority 4: Cheap rate charging (buy < 10c, SOC < 90%) ───────────────
+  // Guard: never charge during demand window.
+  const CHEAP_BUY_MAX = 10;                // c/kWh upper limit for cheap charging
+  const CHEAP_CHARGE_SOC = SOC_MAX_CHARGE; // stop charging at this SOC
+  if (!currentDemand && currentPrice < CHEAP_BUY_MAX && soc < CHEAP_CHARGE_SOC) {
     targetMode = MODE.BACKUP;
-    reason = `buy=${currentPrice.toFixed(2)}c（<${CHEAP_BUY_MAX}c），低价充电（SOC ${soc}% → 目标 ${CHEAP_CHARGE_SOC}%）`;
+    reason = `buy=${currentPrice.toFixed(2)}c (<${CHEAP_BUY_MAX}c) — cheap rate charging (SOC ${soc}% -> ${CHEAP_CHARGE_SOC}%)`;
     return { targetMode, reason, alert };
   }
-  // 充满或电价回升 → 已在 Backup 模式则退出
+  // Exit cheap-rate charging: SOC full or price rose above threshold
   if (state.currentMode === MODE.BACKUP && (currentPrice >= CHEAP_BUY_MAX || soc >= CHEAP_CHARGE_SOC)) {
-    // 只有当前处于"低价充电"触发的 Backup 才退出（免费/负价充电在优先级 3 已处理）
     if (spotPrice > CHARGE_SPOT_MAX) {
       targetMode = MODE.SELF_USE;
-      reason = `低价充电结束（buy=${currentPrice.toFixed(2)}c，SOC=${soc}%）`;
+      reason = `cheap rate charging ended (buy=${currentPrice.toFixed(2)}c, SOC=${soc}%, target=${CHEAP_CHARGE_SOC}%)`;
       return { targetMode, reason, alert };
     }
   }
 
-  // ── 优先级 5：高价卖电机会（feedIn 高 且 SOC 充裕 且 逆变器有余量）──────────────
-  if (feedInPrice >= SELL_FEEDIN_MIN && soc > SOC_MIN_SELL) {
+  // ── Priority 4b: extremelyLow descriptor charging (buy < 12c) ─────────────
+  // When Amber rates the price as extremelyLow, allow charging up to 12c/kWh.
+  // Priorities 1/2/2.5 guarantee we are outside the demand window here.
+  const EXTREMELY_LOW_MAX = 12; // c/kWh — relaxed ceiling for extremelyLow periods
+  if (!currentDemand && descriptor === 'extremelyLow' && currentPrice < EXTREMELY_LOW_MAX && soc < SOC_MAX_CHARGE) {
+    targetMode = MODE.BACKUP;
+    reason = `descriptor=extremelyLow, buy=${currentPrice.toFixed(2)}c (<${EXTREMELY_LOW_MAX}c) — charging (SOC ${soc}% -> ${SOC_MAX_CHARGE}%)`;
+    return { targetMode, reason, alert };
+  }
+  // Exit extremelyLow charging
+  if (state.currentMode === MODE.BACKUP && descriptor === 'extremelyLow' && (currentPrice >= EXTREMELY_LOW_MAX || soc >= SOC_MAX_CHARGE) && spotPrice > CHARGE_SPOT_MAX) {
+    targetMode = MODE.SELF_USE;
+    reason = `extremelyLow charging ended (buy=${currentPrice.toFixed(2)}c, SOC=${soc}%)`;
+    return { targetMode, reason, alert };
+  }
+
+  // ── Priority 5: Sell to grid (high feedIn, sufficient SOC, inverter headroom) ──
+  // Selling is allowed during demand window (exporting does NOT create demand charge).
+  // Charging priorities 3/4/4b are NOT reached during demand window because
+  // priority 1 either returns early (if was charging) or falls through here.
+  const SELL_MIN_MARGIN = 5;        // c/kWh minimum margin above avg buy price
+  const SELL_ABS_MIN = 12;          // c/kWh absolute floor (protects against midnight/no-data edge case)
+  const SELL_MIN_SAMPLES_KWH = 1.0; // require at least 1 kWh bought today to have a reliable avg
+
+  const avgBuyCalc = (() => {
+    try {
+      const _db = getDb();
+      if (!_db) return { avg: null, kwh: 0, reason: 'db unavailable' };
+      const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Australia/Sydney' });
+      const sql = 'SELECT SUM(meter_buy_delta * buy_price / 100.0) AS cost, SUM(meter_buy_delta) AS kwh, COUNT(*) AS cnt' +
+                  ' FROM energy_log WHERE date(ts) = ? AND meter_buy_delta > 0 AND buy_price IS NOT NULL';
+      const r = _db.prepare(sql).get(today);
+      if (!r || r.kwh == null || r.kwh < SELL_MIN_SAMPLES_KWH) {
+        return { avg: null, kwh: r?.kwh ?? 0, reason: `insufficient data (bought ${(r?.kwh??0).toFixed(2)} kWh today, need ${SELL_MIN_SAMPLES_KWH})` };
+      }
+      const avg = (r.cost / r.kwh) * 100; // cents/kWh
+      if (avg < 1) {
+        return { avg: null, kwh: r.kwh, reason: `avg price anomaly (${avg.toFixed(2)}c — possible data error)` };
+      }
+      return { avg, kwh: r.kwh, reason: null };
+    } catch (e) {
+      return { avg: null, kwh: 0, reason: `query failed: ${e.message}` };
+    }
+  })();
+
+  const avgBuyPrice = avgBuyCalc.avg;
+  // If avg price is valid: use avg + margin (floor at SELL_ABS_MIN).
+  // If avg is unavailable (midnight/error): fall back to absolute floor to prevent false triggers.
+  const effectiveSellMin = avgBuyPrice != null
+    ? Math.max(SELL_ABS_MIN, avgBuyPrice + SELL_MIN_MARGIN)
+    : SELL_ABS_MIN;
+  const sellMinLabel = avgBuyPrice != null
+    ? `avg_buy=${avgBuyPrice.toFixed(1)}c+${SELL_MIN_MARGIN}c=>${effectiveSellMin.toFixed(1)}c`
+    : `abs_floor=${SELL_ABS_MIN}c (${avgBuyCalc.reason})`;
+
+  if (feedInPrice >= effectiveSellMin && soc > SOC_MIN_SELL) {
     const maxSellPower = INVERTER_MAX_DISCHARGE - (homeLoad ?? 0) - 0.3;
     if (maxSellPower > 0.2) {
       targetMode = MODE.SELLING;
-      reason = `feedIn=${feedInPrice.toFixed(1)}c（≥${SELL_FEEDIN_MIN}c），SOC ${soc}%（>${SOC_MIN_SELL}%），逆变器余量 ${maxSellPower.toFixed(1)}kW`;
+      reason = `feedIn=${feedInPrice.toFixed(1)}c (>=${effectiveSellMin.toFixed(1)}c, ${sellMinLabel}), SOC ${soc}% (>${SOC_MIN_SELL}%), headroom ${maxSellPower.toFixed(1)}kW`;
     } else {
-      reason = `feedIn 够高但家用 ${homeLoad?.toFixed(1)}kW 占满逆变器，不卖电`;
+      reason = `feedIn high but home load ${homeLoad?.toFixed(1)}kW saturates inverter — no selling (${sellMinLabel})`;
     }
     return { targetMode, reason, alert };
   }
 
-  // 已在卖电模式，但价格不够高或 SOC 太低 → 停止
-  if (state.currentMode === MODE.SELLING && (feedInPrice < SELL_FEEDIN_MIN || soc <= SOC_MIN_SELL)) {
+  // Exit selling mode: price dropped or SOC too low
+  if (state.currentMode === MODE.SELLING && (feedInPrice < effectiveSellMin || soc <= SOC_MIN_SELL)) {
     targetMode = MODE.SELF_USE;
-    reason = `停止卖电（feedIn=${feedInPrice.toFixed(1)}c，SOC=${soc}%）`;
+    reason = `stop selling (feedIn=${feedInPrice.toFixed(1)}c < ${effectiveSellMin.toFixed(1)}c, ${sellMinLabel}, SOC=${soc}%)`;
     return { targetMode, reason, alert };
   }
 
-  // ── 默认：Self-use ────────────────────────────────────────────────────
+  // ── Default: Self-use ────────────────────────────────────────────────────
+  // Also catches: demand window active + sell not triggered = stay Self-use
   if (state.currentMode == null) {
     targetMode = MODE.SELF_USE;
-    reason = "初始化默认模式";
+    reason = "initialising — default to Self-use";
   }
 
   return { targetMode, reason, alert };
@@ -549,16 +771,16 @@ async function main() {
 
   if (!AMBER_TOKEN) { console.error("[ERROR] AMBER_API_TOKEN not set"); process.exit(1); }
 
-  // 1. 并发获取 ESS + Amber 数据
+  // 1. Fetch ESS + Amber data concurrently
   const [ess, amberRaw] = await Promise.all([
     getESSData(),
     httpsGet(
-      `https://api.amber.com.au/v1/sites/${AMBER_SITE_ID}/prices/current?resolution=30&next=8`,
+      `https://api.amber.com.au/v1/sites/${AMBER_SITE_ID}/prices/current?resolution=5&next=3`,
       { Authorization: `Bearer ${AMBER_TOKEN}` }
     ).catch(() => []),
   ]);
 
-  // 2. 解析 Amber 数据
+  // 2. Parse Amber response
   const general        = Array.isArray(amberRaw) ? amberRaw.filter(p => p.channelType === "general")        : [];
   const feedInCh       = Array.isArray(amberRaw) ? amberRaw.filter(p => p.channelType === "feedIn")         : [];
   const controlledLoad = Array.isArray(amberRaw) ? amberRaw.filter(p => p.channelType === "controlledLoad") : [];
@@ -569,9 +791,8 @@ async function main() {
 
   const currentDemand  = current.tariffInformation?.demandWindow ?? false;
   const currentPrice   = current.perKwh ?? 0;
-  const feedInPrice    = Math.abs(feedInCurrent.perKwh ?? 0);  // feedIn perKwh 为负，取绝对值得实际收入
-  const feedInSpot     = current.spotPerKwh ?? 0;               // spot 对 feedIn 也相同（同一 NEM 节点）
-  const clPrice        = clCurrent.perKwh ?? null;              // Controlled Load 电价（null 若不存在）
+  const feedInPrice    = Math.abs(feedInCurrent.perKwh ?? 0);
+  const clPrice        = clCurrent.perKwh ?? null;
   const clDescriptor   = clCurrent.descriptor ?? null;
   const spotPrice      = current.spotPerKwh ?? 0;
   const descriptor     = current.descriptor ?? "unknown";
@@ -580,7 +801,16 @@ async function main() {
   const tariffPeriod   = current.tariffInformation?.period ?? null;
   const clTariffPeriod = clCurrent.tariffInformation?.period ?? null;
 
-  // 找下一个 demand window 开始时间
+  // Guard: detect Amber API returning all-zero data (transient error).
+  // Zero price + zero renewables + no nemTime = bad data. Skip decision to avoid false charging.
+  const amberDataValid = general.length > 0 && (currentPrice !== 0 || renewables !== 0 || current.nemTime != null);
+  if (!amberDataValid) {
+    console.error("[ERROR] Amber API returned invalid/zero data — skipping decision to avoid false mode switch");
+    console.log(`[DONE]`);
+    return;
+  }
+
+  // Find next demand window start time from forecast
   const nextDemandInterval = !currentDemand
     ? forecast.find(p => p.tariffInformation?.demandWindow === true)
     : null;
@@ -590,48 +820,75 @@ async function main() {
 
   const amber = { currentDemand, currentPrice, feedInPrice, spotPrice, descriptor, renewables, nextDemandMinutes, tariffPeriod, clPrice, clDescriptor, clTariffPeriod };
 
-  // 3. 计算推算 PV 功率
+  // 3. Calculate PV power
   const pvPower = calcPVPower(ess);
 
-  // 4. 打印实时状态
+  // 4. Print real-time status
   console.log(`[DATA] NEM: ${nemTime}`);
   console.log(`[DATA] SOC: ${ess.soc}%  BattPwr: ${ess.battPower?.toFixed(2)} kW  HomeLoad: ${ess.homeLoad?.toFixed(2)} kW  PV: ${pvPower?.toFixed(2)} kW  Grid: ${ess.gridPower?.toFixed(2)} kW`);
   console.log(`[DATA] Price: buy=${currentPrice.toFixed(2)}c  cl=${clPrice != null ? clPrice.toFixed(2)+"c" : "n/a"}  feedIn=${feedInPrice.toFixed(2)}c  spot=${spotPrice.toFixed(2)}c  demandWindow=${currentDemand}  renewables=${renewables}%`);
   if (nextDemandMinutes != null) console.log(`[DATA] Next demandWindow in ${nextDemandMinutes.toFixed(0)} min`);
 
-  // 5. 执行决策
+  // 5. Run decision engine
+  // Load today's summary first (used for avg buy price in sell decision)
   const state = loadState();
-  const { targetMode, reason, alert } = decide(ess, pvPower, amber, state);
+  const todaySummary = (() => {
+    try {
+      const _db = getDb();
+      if (!_db) return {};
+      const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Australia/Sydney' });
+      return _db.prepare("SELECT * FROM daily_summary WHERE date=?").get(today) || {};
+    } catch { return {}; }
+  })();
+  const { targetMode, reason, alert } = decide(ess, pvPower, amber, state, todaySummary);
 
   if (alert) console.log(`[ALERT] ${alert}`);
 
   let modeChanged = false;
   if (targetMode !== null && targetMode !== state.currentMode) {
-    console.log(`[ACTION] ${MODE_LABEL[state.currentMode] ?? "unknown"} → ${MODE_LABEL[targetMode]}: ${reason}`);
-    const ok = await setMode(targetMode);
+    console.log(`[ACTION] ${MODE_LABEL[state.currentMode] ?? "unknown"} -> ${MODE_LABEL[targetMode]}: ${reason}`);
+    const ok = await setModeWithVerify(targetMode);
     if (ok) {
       state.currentMode = targetMode;
       state.lastSwitchTime = now.toISOString();
       state.lastSwitchReason = reason;
       modeChanged = true;
-      // 进入卖电模式：启动 5 分钟安全监控 cron
       if (targetMode === MODE.SELLING) {
         await createSellingCron();
       } else {
-        // 离开卖电模式：停止安全监控 cron
         await deleteSellingCron();
       }
     } else {
       console.error(`[ERROR] Mode switch failed`);
     }
   } else {
+    // Already in Selling mode: roll the end time window forward (+10 min)
+    if (state.currentMode === MODE.SELLING) {
+      await updateSellingEndTime();
+    }
     console.log(`[INFO] Mode: ${MODE_LABEL[state.currentMode] ?? "none"} (${reason})`);
   }
 
   state.lastCheck = now.toISOString();
   saveState(state);
 
-  // 6. 记录数据
+  // ── Write decision ────────────────────────────────────────────────────────
+  // Runs every 5 min but only writes to DB on:
+  //   A. Scheduled intervals (:00 or :30 of each hour)
+  //   B. Mode change (immediate capture of trigger reason)
+  const minOfHour = now.getMinutes();
+  const isScheduledInterval = (minOfHour === 0 || minOfHour === 30);
+  const shouldLog = isScheduledInterval || modeChanged;
+
+  if (!shouldLog) {
+    console.log(`[SKIP] Not a log interval (${minOfHour}min, no mode change) — skipping DB write`);
+    console.log(`[DONE]`);
+    return;
+  }
+
+  if (modeChanged) console.log(`[LOG] Mode change triggered record`);
+  else console.log(`[LOG] Scheduled record (${minOfHour === 0 ? "on-the-hour" : "half-hour"})`);
+
   const record = {
     ts: now.toISOString(),
     nemTime,
@@ -647,7 +904,6 @@ async function main() {
     spotPrice,
     descriptor,
     tariffPeriod: tariffPeriod ?? null,
-    // Amber — Controlled Load channel
     clPrice:       clPrice ?? null,
     clDescriptor:  clDescriptor ?? null,
     clTariffPeriod: clTariffPeriod ?? null,
@@ -660,12 +916,10 @@ async function main() {
     alert: alert || null,
     meterBuyTotal: ess.purchasedTotal ?? null,
     meterSellTotal: ess.feedTotal ?? null,
-    // Web API — flow
     flowPV:      ess.flowPV      ?? null,
     flowGrid:    ess.flowGrid    ?? null,
     flowBattery: ess.flowBattery ?? null,
     flowLoad:    ess.flowLoad    ?? null,
-    // Web API — today's totals (from battDetails + runInfo)
     todayChargeKwh:    ess.todayChargeKwh    ?? null,
     todayDischargeKwh: ess.todayDischargeKwh ?? null,
     todayPvKwh:        ess.todayPvKwh        ?? null,
@@ -674,19 +928,21 @@ async function main() {
     todayHomeKwh:      ess.todayHomeKwh      ?? null,
     todayCarbonKg:     ess.todayCarbonKg     ?? null,
     reportedMode:      ess.reportedMode      ?? null,
+    recordTrigger: modeChanged ? "mode_change" : "scheduled",
   };
 
   // ── Interval cost accounting ──────────────────────────────────────────────
-  // gridPower: negative=import(买电), positive=export(卖电)
-  // 0.5h window: kWh = |gridPower| * 0.5
-  const intervalImportKwh = ess.gridPower != null && ess.gridPower < 0 ? Math.abs(ess.gridPower) * 0.5 : 0;
-  const intervalExportKwh = ess.gridPower != null && ess.gridPower > 0 ? ess.gridPower * 0.5 : 0;
+  // gridPower: negative=import(buy), positive=export(sell)
+  // Scheduled records use 0.5h window; mode-change records use 5-min window.
+  const intervalHours = modeChanged ? (5/60) : 0.5;
+  const intervalImportKwh = ess.gridPower != null && ess.gridPower < 0 ? Math.abs(ess.gridPower) * intervalHours : 0;
+  const intervalExportKwh = ess.gridPower != null && ess.gridPower > 0 ? ess.gridPower * intervalHours : 0;
   record.intervalBuyAud  = parseFloat((intervalImportKwh * currentPrice / 100).toFixed(6));
   record.intervalSellAud = parseFloat((intervalExportKwh * feedInPrice  / 100).toFixed(6));
   record.intervalNetAud  = parseFloat((record.intervalBuyAud - record.intervalSellAud).toFixed(6));
 
-  // ── Meter delta (actual kWh from meter cumulative totals) ─────────────────
-  // More accurate than power * 0.5h estimate — uses real meter readings
+  // ── Meter delta (actual kWh from cumulative meter readings) ──────────────
+  // More accurate than power * interval — uses real meter values from inverter.
   const db = getDb();
   if (db && ess.purchasedTotal != null && ess.feedTotal != null) {
     try {
@@ -696,29 +952,29 @@ async function main() {
       if (prev && prev.meter_buy_total != null) {
         const buyDelta  = ess.purchasedTotal - prev.meter_buy_total;
         const sellDelta = ess.feedTotal      - prev.meter_sell_total;
-        // Sanity check: delta should be positive and < 5 kWh (max 10 kW * 0.5h)
-        record.meterBuyDelta  = buyDelta  >= 0 && buyDelta  < 5 ? parseFloat(buyDelta.toFixed(4))  : null;
-        record.meterSellDelta = sellDelta >= 0 && sellDelta < 5 ? parseFloat(sellDelta.toFixed(4)) : null;
+        // Sanity check: delta must be non-negative and under 1 kWh (max in 5 min at 10 kW)
+        record.meterBuyDelta  = buyDelta  >= 0 && buyDelta  < 1 ? parseFloat(buyDelta.toFixed(4))  : null;
+        record.meterSellDelta = sellDelta >= 0 && sellDelta < 1 ? parseFloat(sellDelta.toFixed(4)) : null;
       }
     } catch { /* silent */ }
   }
   appendLog(record);
   const daily = updateDailySummary(record);
 
-  // 7. 电价告警
+  // 7. Price spike alerts
   if (descriptor === "spike" || currentPrice > 50) {
-    console.log(`🚨 电价尖峰！${currentPrice.toFixed(1)} c/kWh`);
+    console.log(`🚨 Price spike! ${currentPrice.toFixed(1)} c/kWh`);
   } else if (descriptor === "high" || currentPrice > 30) {
-    console.log(`⚠️ 电价偏高：${currentPrice.toFixed(1)} c/kWh`);
+    console.log(`⚠️ High price: ${currentPrice.toFixed(1)} c/kWh`);
   }
 
-  // 8. 打印今日汇总
+  // 8. Print today's summary
   const netCost = ((daily.cost_aud || 0) - (daily.earnings_aud || 0));
-  console.log(`\n[TODAY] 家用: ${(daily.home_kwh||0).toFixed(2)} kWh  买电: ${(daily.grid_buy_kwh||0).toFixed(2)} kWh  卖电: ${(daily.grid_sell_kwh||0).toFixed(2)} kWh`);
-  console.log(`[TODAY] 电费: $${(daily.cost_aud||0).toFixed(3)}  卖电收入: $${(daily.earnings_aud||0).toFixed(3)}  净成本: $${netCost.toFixed(3)}`);
+  console.log(`\n[TODAY] Home: ${(daily.home_kwh||0).toFixed(2)} kWh  Grid-buy: ${(daily.grid_buy_kwh||0).toFixed(2)} kWh  Grid-sell: ${(daily.grid_sell_kwh||0).toFixed(2)} kWh`);
+  console.log(`[TODAY] Cost: $${(daily.cost_aud||0).toFixed(3)}  Revenue: $${(daily.earnings_aud||0).toFixed(3)}  Net: $${netCost.toFixed(3)}`);
   console.log(`[TODAY] SOC avg/min/max: ${(daily.avg_soc||0).toFixed(0)}% / ${daily.min_soc||0}% / ${daily.max_soc||0}%`);
   if ((daily.demand_peak_kw || 0) > 0) {
-    console.log(`[TODAY] ⚠️ demand window 内电网峰值: ${daily.demand_peak_kw.toFixed(2)} kW → 预估需量电费: $${(daily.demand_charge_est||0).toFixed(2)}/day`);
+    console.log(`[TODAY] ⚠️ Demand window peak: ${daily.demand_peak_kw.toFixed(2)} kW -> est. demand charge $${(daily.demand_charge_est||0).toFixed(2)}/day`);
   }
 
   console.log(`[DONE]`);
