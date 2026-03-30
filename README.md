@@ -10,7 +10,7 @@ Automatically monitors electricity prices and switches the inverter mode to mini
 
 - 🔋 **Smart charging** — charges during cheap/negative price periods; respects SOC limits
 - ⚡ **Demand window protection** — blocks all grid charging during peak demand windows; selling still allowed
-- 💰 **Dynamic sell threshold** — sells only when `feedIn > today's avg buy price + 5c` (min 12c floor)
+- 💰 **Dynamic sell threshold** — sells only when `feedIn > today's avg buy price + 5c` (min 14c floor)
 - 📊 **Data logging** — SQLite + JSONL at :00/:30 or on mode change; includes meter delta, cost accounting
 - 🌞 **Real-time data** — SOC, PV, grid, home load, battery voltage/current via ESS-Link API
 - 🛡️ **API fault protection** — skips decision if Amber returns invalid/zero data
@@ -63,7 +63,7 @@ node scripts/demand-mode-manager.js
 
 ### Priority 5 — Sell to Grid
 - `feedIn ≥ effective_sell_min` AND `SOC > 35%` AND inverter headroom > 0.2 kW → Selling
-- `effective_sell_min = max(12c, today_avg_buy_price + 5c)`
+- `effective_sell_min = max(14c, today_avg_buy_price + 5c)`
 - Allowed **inside and outside** demand window
 
 ### Default — Self-use
@@ -90,7 +90,7 @@ node scripts/demand-mode-manager.js
 ## Sell Threshold — Dynamic Average Buy Price
 
 ```
-effective_sell_min = max(12c, today_avg_buy_price + 5c)
+effective_sell_min = max(14c, today_avg_buy_price + 5c)
 ```
 
 `today_avg_buy_price` is calculated from actual meter readings:
@@ -101,7 +101,7 @@ FROM energy_log
 WHERE date(ts) = today AND meter_buy_delta > 0
 ```
 
-**Edge case protection** (falls back to 12c floor when):
+**Edge case protection** (falls back to 14c floor when):
 - Today's grid purchases < 1 kWh (e.g. midnight, no data yet)
 - Calculated avg < 1c (data anomaly)
 - DB unavailable

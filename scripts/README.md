@@ -64,7 +64,7 @@ data/
 - Relaxed price ceiling (12c) when Amber signals an extremely low price period
 
 ### Priority 5 — Sell to Grid
-- Condition: `feedIn > avg_buy_price + 5c` AND `feedIn ≥ 12c (abs floor)` AND `SOC > 35%` AND inverter headroom > 0.2 kW
+- Condition: `feedIn > avg_buy_price + 5c` AND `feedIn ≥ 14c (abs floor)` AND `SOC > 35%` AND inverter headroom > 0.2 kW
 - **Allowed inside and outside demand window**
 - avg_buy_price = today's weighted average buy price (meter_buy_delta × buy_price method)
 
@@ -94,15 +94,15 @@ data/
 Selling threshold is calculated dynamically each run:
 
 ```
-effective_sell_min = max(12c, today_avg_buy_price + 5c)
+effective_sell_min = max(14c, today_avg_buy_price + 5c)
 ```
 
 `today_avg_buy_price` = `SUM(meter_buy_delta × buy_price) / SUM(meter_buy_delta)` for today.
 
 **Edge case protection:**
-- Today's grid purchases < 1 kWh (e.g. midnight, early morning) → fall back to 12c floor
-- Calculated avg < 1c (data anomaly) → fall back to 12c floor
-- DB unavailable → fall back to 12c floor
+- Today's grid purchases < 1 kWh (e.g. midnight, early morning) → fall back to 14c floor
+- Calculated avg < 1c (data anomaly) → fall back to 14c floor
+- DB unavailable → fall back to 14c floor
 
 ---
 
@@ -175,6 +175,7 @@ Key milestones:
 - `c44369b` Translate all code comments to English
 - `d4bf159` Sell avg-price: triple protection (insufficient samples / anomaly / midnight → 12c floor)
 - `92fb438` Sell absolute floor 10c → 12c
+- `e4b0810` Sell absolute floor 12c → 14c
 - `5a7019f` Sell threshold: today avg buy price (meter_buy_delta method) + 5c, remove 15c hard floor
 - `1b9051f` Pre-DW forced charge (Priority 2.5) + extremelyLow relaxed ceiling (Priority 4b)
 - `9eb04f8` Cheap charge exit SOC unified to 90% (was 95%)
