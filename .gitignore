@@ -1,0 +1,12 @@
+# Secrets
+.env
+data/
+*.db
+*.jsonl
+
+# Dependencies
+mcp/*/node_modules/
+node_modules/
+
+# Runtime
+/tmp/demand-mode-state.json
