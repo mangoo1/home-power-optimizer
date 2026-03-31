@@ -10,6 +10,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@libsql/client": "^0.17.2",
     "dotenv": "^17.3.1",
     "javascript-lp-solver": "^1.0.3"
   }
