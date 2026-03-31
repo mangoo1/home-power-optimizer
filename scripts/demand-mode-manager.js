@@ -873,11 +873,11 @@ async function main() {
   saveState(state);
 
   // ── Write decision ────────────────────────────────────────────────────────
-  // Runs every 5 min but only writes to DB on:
-  //   A. Scheduled intervals (:00 or :30 of each hour)
+  // Runs every 5 min. Writes to DB on:
+  //   A. Scheduled intervals: every 30 min (within a 6-min window to tolerate drift/delay)
   //   B. Mode change (immediate capture of trigger reason)
   const minOfHour = now.getMinutes();
-  const isScheduledInterval = (minOfHour === 0 || minOfHour === 30);
+  const isScheduledInterval = (minOfHour % 30) < 6;
   const shouldLog = isScheduledInterval || modeChanged;
 
   if (!shouldLog) {
@@ -887,7 +887,7 @@ async function main() {
   }
 
   if (modeChanged) console.log(`[LOG] Mode change triggered record`);
-  else console.log(`[LOG] Scheduled record (${minOfHour === 0 ? "on-the-hour" : "half-hour"})`);
+  else console.log(`[LOG] Scheduled record (~${minOfHour === 0 || minOfHour < 6 ? "on-the-hour" : "half-hour"})`);
 
   const record = {
     ts: now.toISOString(),
