@@ -91,7 +91,9 @@ const MODE = { SELF_USE: 0, TIMED: 1, PV_PRIORITY: 5, SELLING: 6, BACKUP: 3 };
 const MODE_LABEL = { 0: "Self-use", 1: "Timed", 3: "Backup", 5: "PV-Priority", 6: "Selling", 7: "Voltage-Reg" };
 
 // Strategy parameters
-const SOC_MAX_CHARGE = 90;        // Target SOC for backup/charge modes (%)
+const SOC_MAX_CHARGE = 85;        // Target SOC for backup/charge modes (%)
+                                  // 85% chosen: above this BMS throttles charge rate,
+                                  // PV surplus only earns ~2.8c feedIn — not worth grid charging
 const SOC_MIN_SELL = 35;          // Min SOC allowed when selling (reserve for demand window)
 const SOC_WARN = 20;              // Alert threshold: SOC too low during demand window
 const SELL_FEEDIN_MIN = 0;        // Hard floor for selling (0 = rely solely on avg-buy+margin logic)
@@ -314,28 +316,18 @@ async function setMode(mode) {
   return setParam("0x300C", mode);
 }
 
-// Set Timed/Selling mode with all required parameters.
-// Steps:
-//   0. Sync inverter clock to current AEST time
-//   1. Set mode to Timed (1)
-//   2. Set start time = now (HHMM)
-//   3. Set end time = now + 10 min (HHMM) — rolling window, updated each 5-min cron
-//   4. Set discharge power = 5 kW
-//   5. Set other mode param = 0 (fixed)
-//   6. Set active days = all week [0-6] (fixed)
-//   7. Set start date = yesterday (already active)
-//   8. Set end date = tomorrow (covers today fully)
-async function setSellingMode() {
-  if (!ESS_TOKEN) { console.log(`[SKIP] No ESS_TOKEN, would set Selling mode`); return false; }
-
+// ── Timed mode helpers (shared by buy and sell) ───────────────────────────────
+// Returns { aest, fmt2, startHHMM, startMinus1HHMM, endHHMM, clockStr, yesterday, tomorrow }
+function timedModeTimeContext() {
   const now = new Date();
   const aest = new Date(now.getTime() + 11 * 3600 * 1000); // AEST = UTC+11
-
-  // Current time as HHMM string (e.g. "1830")
   const fmt2 = n => String(n).padStart(2,'0');
-  const startHHMM = fmt2(aest.getUTCHours()) + fmt2(aest.getUTCMinutes());
 
-  // End time = now + 10 min rolling window
+  // start = current time - 1 min (so window is already active)
+  const startDate = new Date(aest.getTime() - 1 * 60 * 1000);
+  const startHHMM = fmt2(startDate.getUTCHours()) + fmt2(startDate.getUTCMinutes());
+
+  // end = current time + 10 min rolling window
   const endDate = new Date(aest.getTime() + 10 * 60 * 1000);
   const endHHMM = fmt2(endDate.getUTCHours()) + fmt2(endDate.getUTCMinutes());
 
@@ -347,27 +339,99 @@ async function setSellingMode() {
   const yesterday = fmtDate(new Date(aest.getTime() - 86400000));
   const tomorrow  = fmtDate(new Date(aest.getTime() + 86400000));
 
-  console.log(`[SELL] Setting Timed mode: ${startHHMM}–${endHHMM} AEST, clock=${clockStr}, dates ${yesterday}–${tomorrow}`);
+  return { aest, fmt2, startHHMM, endHHMM, clockStr, yesterday, tomorrow };
+}
 
-  const steps = [
+// Set Timed/Selling mode (discharge to grid).
+// Steps:
+//   0. Sync inverter clock
+//   1. Set mode = Timed (1)
+//   2. startTime = now - 1 min  (window already active)
+//   3. endTime   = now + 10 min (rolling)
+//   4. discharge power = 5 kW   (0xC0BC)
+//   5. otherMode = 0             (0x314E)
+//   6. weekdays = all            (0xC0B4)
+//   7. startDate = yesterday     (0xC0B6)
+//   8. endDate = tomorrow        (0xC0B8)
+async function setTimedChargeDischarge({ mode, powerKw, tag }) {
+  // mode: 'sell' | 'charge'
+  // powerKw: number — for sell = discharge kW (0xC0BC), for charge = charge kW (0xC0BA)
+  // tag: log prefix e.g. '[SELL]' or '[BUY]'
+  if (!ESS_TOKEN) { console.log(`[SKIP] No ESS_TOKEN, would set ${tag} Timed mode`); return false; }
+
+  const { startHHMM, endHHMM, clockStr, yesterday, tomorrow } = timedModeTimeContext();
+
+  console.log(`${tag} Setting Timed mode (${mode}): ${startHHMM}–${endHHMM} AEST, clock=${clockStr}, dates ${yesterday}–${tomorrow}, power=${powerKw}kW`);
+
+  const steps = mode === 'sell' ? [
     { label: `syncClock=${clockStr}`,  fn: () => httpsPost('https://eu.ess-link.com/api/app/deviceInfo/setDeviceDateParam', { data: clockStr, macHex: MAC_HEX, index: '0x3050' }, { Authorization: ESS_TOKEN, ...ESS_HEADERS }).then(r => r.code === 200).catch(() => false) },
     { label: 'mode=Timed(1)',          fn: () => setParam('0x300C',  1) },
-    { label: `startTime=${startHHMM}`, fn: () => setParam('0xC018', startHHMM) },
-    { label: `endTime=${endHHMM}`,     fn: () => setParam('0xC01A', endHHMM) },
-    { label: 'discharge=5kW',          fn: () => setParam('0xC0BC', 5) },
+    { label: `sellStart=${startHHMM}`, fn: () => setParam('0xC018', startHHMM) },
+    { label: `sellEnd=${endHHMM}`,     fn: () => setParam('0xC01A', endHHMM) },
+    { label: `discharge=${powerKw}kW`, fn: () => setParam('0xC0BC', powerKw) },
+    { label: 'charge=0kW',             fn: () => setParam('0xC0BA', 0) },    // prevent simultaneous charging
+    { label: 'chargeStart=0000',       fn: () => setParam('0xC014', '0000') }, // collapse charge window
+    { label: 'chargeEnd=0000',         fn: () => setParam('0xC016', '0000') }, // collapse charge window
     { label: 'otherMode=0',            fn: () => setParam('0x314E', 0) },
     { label: 'weekdays=all',           fn: () => setParam('0xC0B4', [0,1,2,3,4,5,6]) },
     { label: `startDate=${yesterday}`, fn: () => setDateParam('0xC0B6', yesterday) },
     { label: `endDate=${tomorrow}`,    fn: () => setDateParam('0xC0B8', tomorrow) },
+  ] : [
+    // Charge from grid: collapse sell window, set charge window + power, zero discharge
+    { label: `syncClock=${clockStr}`,    fn: () => httpsPost('https://eu.ess-link.com/api/app/deviceInfo/setDeviceDateParam', { data: clockStr, macHex: MAC_HEX, index: '0x3050' }, { Authorization: ESS_TOKEN, ...ESS_HEADERS }).then(r => r.code === 200).catch(() => false) },
+    { label: 'mode=Timed(1)',            fn: () => setParam('0x300C',  1) },
+    { label: `chargeStart=${startHHMM}`, fn: () => setParam('0xC014', startHHMM) },
+    { label: `chargeEnd=${endHHMM}`,     fn: () => setParam('0xC016', endHHMM) },
+    { label: `charge=${powerKw}kW`,      fn: () => setParam('0xC0BA', powerKw) },
+    { label: 'discharge=0kW',            fn: () => setParam('0xC0BC', 0) },    // prevent simultaneous discharging
+    { label: 'sellStart=0000',           fn: () => setParam('0xC018', '0000') }, // collapse sell window
+    { label: 'sellEnd=0000',             fn: () => setParam('0xC01A', '0000') }, // collapse sell window
+    { label: 'otherMode=0',              fn: () => setParam('0x314E', 0) },
+    { label: 'weekdays=all',             fn: () => setParam('0xC0B4', [0,1,2,3,4,5,6]) },
+    { label: `startDate=${yesterday}`,   fn: () => setDateParam('0xC0B6', yesterday) },
+    { label: `endDate=${tomorrow}`,      fn: () => setDateParam('0xC0B8', tomorrow) },
   ];
 
   for (const step of steps) {
     const ok = await step.fn();
-    console.log(`[SELL]   ${step.label} -> ${ok ? 'OK' : 'FAILED'}`);
+    console.log(`${tag}   ${step.label} -> ${ok ? 'OK' : 'FAILED'}`);
     if (!ok && step.label.startsWith('mode=')) return false; // mode step is critical
     await new Promise(r => setTimeout(r, 500));
   }
   return true;
+}
+
+// Convenience wrappers
+async function setSellingMode() {
+  return setTimedChargeDischarge({ mode: 'sell', powerKw: 5, tag: '[SELL]' });
+}
+
+// chargeGridKw: dynamic charge power calculation
+// Logic: grid must supply (homeLoad - pvPower) for the house, plus chargeKw for the battery.
+// Total grid import = (homeLoad - pvPower) + chargeKw <= MAX_GRID_TARGET
+// => chargeKw <= MAX_GRID_TARGET - homeLoad + pvPower
+// Capped at MAX_CHARGE_KW (inverter limit), floor at 0. If below MIN_CHARGE_KW, skip charging.
+const MAX_GRID_TARGET  = parseFloat(process.env.MAIN_BREAKER_KW ?? '7.7'); // kW — read from .env, default 7.7kW (32A@240V)
+const MAX_GRID_IMPORT_KW = MAX_GRID_TARGET - 0.2; // hard guard: refuse Backup if grid would exceed this (breaker - 0.2kW headroom)
+const MAX_CHARGE_KW    = 5.0;  // kW inverter max charge rate
+const MIN_CHARGE_KW    = 1.0;  // kW minimum worth charging (below this, skip)
+
+function calcChargeKw(homeLoad, pvPower) {
+  // Available grid headroom for charging = target - net house draw
+  const netHouseDraw = (homeLoad ?? 0) - (pvPower ?? 0);
+  const available = MAX_GRID_TARGET - netHouseDraw;
+  const chargeKw = Math.min(MAX_CHARGE_KW, Math.max(0, available));
+  return parseFloat(chargeKw.toFixed(2));
+}
+
+async function setChargingMode(homeLoad, pvPower) {
+  const chargeKw = calcChargeKw(homeLoad, pvPower);
+  if (chargeKw < MIN_CHARGE_KW) {
+    console.log(`[BUY] chargeKw=${chargeKw.toFixed(2)}kW < ${MIN_CHARGE_KW}kW min — skipping charge`);
+    return false;
+  }
+  console.log(`[BUY] chargeKw=${chargeKw.toFixed(2)}kW (homeLoad=${(homeLoad??0).toFixed(2)}kW, PV=${(pvPower??0).toFixed(2)}kW, gridTarget=${MAX_GRID_TARGET}kW)`);
+  return setTimedChargeDischarge({ mode: 'charge', powerKw: chargeKw, tag: '[BUY]' });
 }
 
 // Update rolling end time window for active Selling mode (called each cron run while selling).
@@ -397,18 +461,33 @@ async function getGridPower() {
 }
 
 // Set mode with post-switch verification and up to 4 retries (5 attempts total).
-// For Selling mode, uses the full 8-step Timed mode setup.
+// For Selling mode, uses the full Timed discharge setup.
+// For Charging mode (BACKUP), uses the Timed charge setup with dynamic power calc.
 // Also verifies grid is actually exporting (gridPower > 0) for Selling.
 // Returns true if mode was confirmed, false if all attempts failed.
-async function setModeWithVerify(targetMode) {
+async function setModeWithVerify(targetMode, { homeLoad, pvPower } = {}) {
   const label = MODE_LABEL[targetMode] ?? targetMode;
-  const maxAttempts = targetMode === MODE.SELLING ? 2 : 5; // Selling: max 2 (8 steps × 2 costly)
+  const isTimed = targetMode === MODE.SELLING || targetMode === MODE.BACKUP;
+  const maxAttempts = isTimed ? 2 : 5; // Timed setup: max 2 (multi-step × 2 costly); Self-use/others: up to 5
+  // Self-use needs longer wait — inverter takes time to exit Timed mode
+  const verifyWaitMs = targetMode === MODE.SELF_USE ? 6000 : 4000;
+  const retryWaitMs  = targetMode === MODE.SELF_USE ? 5000 : 3000;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    // Use full Timed mode setup for Selling; simple setMode for others
-    const ok = targetMode === MODE.SELLING
-      ? await setSellingMode()
-      : await setMode(targetMode);
+    // Use full Timed mode setup for Selling/Charging; simple setMode for others
+    let ok;
+    if (targetMode === MODE.SELLING) {
+      ok = await setSellingMode();
+    } else if (targetMode === MODE.BACKUP) {
+      ok = await setChargingMode(homeLoad, pvPower);
+      if (!ok) {
+        console.warn(`[WARN] Charging setup skipped or failed (attempt ${attempt}/${maxAttempts})`);
+        if (attempt < maxAttempts) await new Promise(r => setTimeout(r, 3000));
+        continue;
+      }
+    } else {
+      ok = await setMode(targetMode);
+    }
 
     if (!ok) {
       console.warn(`[WARN] Mode setup failed (attempt ${attempt}/${maxAttempts})`);
@@ -417,7 +496,7 @@ async function setModeWithVerify(targetMode) {
     }
 
     // Wait for inverter to apply
-    await new Promise(r => setTimeout(r, 4000));
+    await new Promise(r => setTimeout(r, verifyWaitMs));
 
     const reported = await getReportedMode();
 
@@ -436,6 +515,22 @@ async function setModeWithVerify(targetMode) {
       } else {
         console.warn(`[WARN] Mode mismatch: expected Timed(1), got ${reported}(${MODE_LABEL[reported]}) — attempt ${attempt}/${maxAttempts}`);
       }
+    } else if (targetMode === MODE.BACKUP) {
+      // For Backup/Charging: inverter reports Timed(1) when charging via Timed mode — accept that
+      const modeOk = reported === MODE.TIMED || reported === MODE.BACKUP;
+      if (modeOk) {
+        console.log(`[VERIFY] Charging confirmed ✓ (mode=${reported}(${MODE_LABEL[reported] ?? reported}))`);
+        return true;
+      }
+      console.warn(`[WARN] Mode mismatch after attempt ${attempt}/${maxAttempts}: expected Timed/Backup, got ${reported}(${MODE_LABEL[reported] ?? reported})`);
+    } else if (targetMode === MODE.SELF_USE) {
+      // Self-use: send setMode(0) then verify reported mode is 0.
+      // Inverter may lag after exiting Timed mode — retry up to maxAttempts.
+      if (reported === MODE.SELF_USE) {
+        console.log(`[VERIFY] Self-use confirmed ✓ (reported=0)`);
+        return true;
+      }
+      console.warn(`[WARN] Self-use not confirmed (reported=${reported}(${MODE_LABEL[reported] ?? reported})) — attempt ${attempt}/${maxAttempts}`);
     } else {
       if (reported === targetMode) {
         console.log(`[VERIFY] Mode confirmed: ${label} (reported=${reported}) ✓`);
@@ -444,16 +539,43 @@ async function setModeWithVerify(targetMode) {
       console.warn(`[WARN] Mode mismatch after attempt ${attempt}/${maxAttempts}: expected ${targetMode}(${label}), got ${reported}(${MODE_LABEL[reported] ?? reported})`);
     }
 
-    if (attempt < maxAttempts) await new Promise(r => setTimeout(r, 3000));
+    if (attempt < maxAttempts) await new Promise(r => setTimeout(r, retryWaitMs));
   }
   console.error(`[ERROR] Mode switch to ${label} failed after ${maxAttempts} attempts`);
   return false;
 }
 
-// ── State ─────────────────────────────────────────────────────────────────────
+// ── Solar forecast helper ─────────────────────────────────────────────────────
+// Reads current-hour solar data from the solar_forecast table (populated by solar-forecast.js).
+// Falls back to null if not available — does not call external API inline.
+function getCurrentSolarData() {
+  try {
+    const db = getDb();
+    if (!db) return { solar_wm2: null, cloud_cover_pct: null };
+    const now = new Date();
+    const sydneyNow = new Date(now.getTime() + 11 * 3600 * 1000);
+    const today = sydneyNow.toISOString().substring(0, 10);
+    const hour  = sydneyNow.getUTCHours();
+    const target = `${today}T${String(hour).padStart(2, '0')}:00`;
+
+    const row = db.prepare('SELECT forecast_json FROM solar_forecast WHERE date=?').get(today);
+    // Do NOT close db here — getDb() returns a shared singleton connection
+    if (!row) return { solar_wm2: null, cloud_cover_pct: null };
+
+    const fc = JSON.parse(row.forecast_json);
+    const idx = fc.time.indexOf(target);
+    if (idx === -1) return { solar_wm2: null, cloud_cover_pct: null };
+    return {
+      solar_wm2:       fc.sw[idx]    ?? null,
+      cloud_cover_pct: fc.cloud[idx] ?? null,
+    };
+  } catch { return { solar_wm2: null, cloud_cover_pct: null }; }
+}
+
+
 function loadState() {
   try { return JSON.parse(fs.readFileSync(STATE_FILE, "utf8")); }
-  catch { return { currentMode: null, lastSwitchTime: null }; }
+  catch { return { currentMode: null, lastSwitchTime: null, chargeExitCount: 0 }; }
 }
 function saveState(s) { fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2)); }
 
@@ -485,7 +607,9 @@ function appendLog(record) {
          amber_feedin_price, amber_spot_price,
          next_demand_min, reported_mode,
          interval_buy_aud, interval_sell_aud, interval_net_aud,
-         meter_buy_delta, meter_sell_delta, record_trigger)
+         meter_buy_delta, meter_sell_delta, record_trigger,
+         charge_kw, discharge_kw, mode_verify_ok, mode_from, mode_to,
+         solar_wm2, cloud_cover_pct)
       VALUES
         (@ts, @nemTime, @soc, @battPower, @homeLoad, @pvPower, @gridPower,
          @buyPrice, @feedInPrice, @spotPrice, @demandWindow, @mode, @modeChanged, @modeReason, @renewables, @alert,
@@ -499,7 +623,9 @@ function appendLog(record) {
          @feedInPriceRaw, @spotPriceRaw,
          @nextDemandMin, @reportedMode,
          @intervalBuyAud, @intervalSellAud, @intervalNetAud,
-         @meterBuyDelta, @meterSellDelta, @recordTrigger)
+         @meterBuyDelta, @meterSellDelta, @recordTrigger,
+         @chargeKw, @dischargeKw, @modeVerifyOk, @modeFrom, @modeTo,
+         @solarWm2, @cloudCoverPct)
     `).run({
       ts: record.ts, nemTime: record.nemTime, soc: record.soc,
       battPower: record.battPower, homeLoad: record.homeLoad,
@@ -539,6 +665,13 @@ function appendLog(record) {
       meterBuyDelta:   record.meterBuyDelta   ?? null,
       meterSellDelta:  record.meterSellDelta  ?? null,
       recordTrigger:   record.recordTrigger   ?? null,
+      chargeKw:        record.chargeKw        ?? null,
+      dischargeKw:     record.dischargeKw     ?? null,
+      modeVerifyOk:    record.mode_verify_ok  ?? null,
+      modeFrom:        record.mode_from       ?? null,
+      modeTo:          record.mode_to         ?? null,
+      solarWm2:        record.solar_wm2       ?? null,
+      cloudCoverPct:   record.cloud_cover_pct ?? null,
     });
   } catch (e) { console.warn("[DB] insert failed:", e.message); }
 }
@@ -550,40 +683,58 @@ function updateDailySummary(record) {
   const db = getDb();
   if (db) {
     try {
+      const isCharging  = record.mode === MODE.BACKUP;
+      const isSelling   = record.mode === MODE.SELLING;
+      const isModeChange = record.modeChanged ? 1 : 0;
+
       db.prepare(`
         INSERT INTO daily_summary (date, intervals, home_kwh, grid_buy_kwh, grid_sell_kwh,
           cost_aud, earnings_aud, demand_peak_kw, demand_charge_est, avg_soc, min_soc, max_soc,
-          meter_buy_start, meter_buy_end, meter_sell_start, meter_sell_end)
-        VALUES (@date, 1, @home, @buy, @sell, @cost, @earn, @peak, @charge, @soc, @soc, @soc,
-          @meterBuy, @meterBuy, @meterSell, @meterSell)
+          meter_buy_start, meter_buy_end, meter_sell_start, meter_sell_end,
+          pv_kwh, charge_grid_kwh, discharge_kwh, mode_changes, sell_sessions, charge_sessions)
+        VALUES (@date, 1, @home, @buy, @sell, @cost, @earn, @peak, @peakCharge, @soc, @soc, @soc,
+          @meterBuy, @meterBuy, @meterSell, @meterSell,
+          @pv, @chargeGrid, @discharge, @modeChange, @sellSess, @chargeSess)
         ON CONFLICT(date) DO UPDATE SET
-          intervals = intervals + 1,
-          home_kwh = home_kwh + @home,
-          grid_buy_kwh = grid_buy_kwh + @buy,
-          grid_sell_kwh = grid_sell_kwh + @sell,
-          cost_aud = cost_aud + @cost,
-          earnings_aud = earnings_aud + @earn,
-          demand_peak_kw = MAX(demand_peak_kw, @peak),
+          intervals        = intervals + 1,
+          home_kwh         = home_kwh + @home,
+          grid_buy_kwh     = grid_buy_kwh + @buy,
+          grid_sell_kwh    = grid_sell_kwh + @sell,
+          cost_aud         = cost_aud + @cost,
+          earnings_aud     = earnings_aud + @earn,
+          demand_peak_kw   = MAX(demand_peak_kw, @peak),
           demand_charge_est = MAX(demand_peak_kw, @peak) * 0.6104,
-          avg_soc = (avg_soc * intervals + @soc) / (intervals + 1),
-          min_soc = MIN(min_soc, @soc),
-          max_soc = MAX(max_soc, @soc),
-          meter_buy_end  = COALESCE(@meterBuy, meter_buy_end),
-          meter_sell_end = COALESCE(@meterSell, meter_sell_end),
+          avg_soc          = (avg_soc * intervals + @soc) / (intervals + 1),
+          min_soc          = MIN(min_soc, @soc),
+          max_soc          = MAX(max_soc, @soc),
+          meter_buy_end    = COALESCE(@meterBuy, meter_buy_end),
+          meter_sell_end   = COALESCE(@meterSell, meter_sell_end),
           meter_buy_start  = COALESCE(meter_buy_start, @meterBuy),
-          meter_sell_start = COALESCE(meter_sell_start, @meterSell)
+          meter_sell_start = COALESCE(meter_sell_start, @meterSell),
+          pv_kwh           = pv_kwh + @pv,
+          charge_grid_kwh  = charge_grid_kwh + @chargeGrid,
+          discharge_kwh    = discharge_kwh + @discharge,
+          mode_changes     = mode_changes + @modeChange,
+          sell_sessions    = sell_sessions + @sellSess,
+          charge_sessions  = charge_sessions + @chargeSess
       `).run({
         date: today,
-        home: (record.homeLoad || 0) * 0.5,
-        // gridPower: negative=import(buy), positive=export(sell)
-        buy:  record.gridPower < 0 ? Math.abs(record.gridPower) * 0.5 : 0,
-        sell: record.gridPower > 0 ? record.gridPower * 0.5 : 0,
-        cost: record.gridPower < 0 ? Math.abs(record.gridPower) * 0.5 * (record.buyPrice || 0) / 100 : 0,
-        earn: record.gridPower > 0 ? record.gridPower * 0.5 * (record.feedInPrice || 0) / 100 : 0,
-        peak: (record.demandWindow && record.gridPower < 0) ? Math.abs(record.gridPower) : 0,
-        charge: 0, soc: record.soc || 0,
-        meterBuy:  record.meterBuyTotal ?? null,
+        home:   (record.homeLoad || 0) * 0.5,
+        buy:    record.gridPower < 0 ? Math.abs(record.gridPower) * 0.5 : 0,
+        sell:   record.gridPower > 0 ? record.gridPower * 0.5 : 0,
+        cost:   record.gridPower < 0 ? Math.abs(record.gridPower) * 0.5 * (record.buyPrice || 0) / 100 : 0,
+        earn:   record.gridPower > 0 ? record.gridPower * 0.5 * (record.feedInPrice || 0) / 100 : 0,
+        peak:   (record.demandWindow && record.gridPower < 0) ? Math.abs(record.gridPower) : 0,
+        peakCharge: 0,
+        soc:    record.soc || 0,
+        meterBuy:  record.meterBuyTotal  ?? null,
         meterSell: record.meterSellTotal ?? null,
+        pv:         (record.pvPower || 0) * 0.5,
+        chargeGrid: isCharging  ? (record.chargeKw  || 0) * 0.5 : 0,
+        discharge:  isSelling   ? (record.dischargeKw || 0) * 0.5 : 0,
+        modeChange: isModeChange,
+        sellSess:   (isModeChange && isSelling)  ? 1 : 0,
+        chargeSess: (isModeChange && isCharging) ? 1 : 0,
       });
     } catch (e) { console.warn("[DB] daily upsert failed:", e.message); }
   }
@@ -641,15 +792,35 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   // Only force charge if SOC < 60% — enough reserve to cover the demand window.
   // If SOC >= 60%, the battery is sufficient; let normal price rules apply.
   const PRE_DW_CHARGE_SOC = 60; // % minimum SOC threshold for forced pre-DW charging
-  if (!currentDemand && nextDemandMinutes != null && nextDemandMinutes <= 60 && nextDemandMinutes > 10 && soc < PRE_DW_CHARGE_SOC) {
+  if (!currentDemand && nextDemandMinutes != null && nextDemandMinutes <= 60 && nextDemandMinutes > 10 && soc < PRE_DW_CHARGE_SOC && gridHeadroomOk) {
     targetMode = MODE.BACKUP;
     reason = `demand window in ${nextDemandMinutes.toFixed(0)} min — force charging (SOC ${soc}% < ${PRE_DW_CHARGE_SOC}%)`;
     return { targetMode, reason, alert };
   }
 
+  // ── Grid headroom check (shared by all charging decisions) ──────────────
+  // Calculate actual available charge power based on current load and PV.
+  // chargeKw = MAX_GRID_TARGET - (homeLoad - pvPower)
+  // If chargeKw < MIN_CHARGE_KW → no point entering charge mode at all.
+  // We skip this guard if homeLoad/pvPower data is unavailable (null/undefined).
+  const pvPowerVal = pvPower ?? 0;
+  const homeLoadVal = homeLoad ?? 0;
+  const netHouseDraw = homeLoadVal - pvPowerVal;
+  const availableChargeKw = MAX_GRID_TARGET - netHouseDraw;
+  const gridHeadroomOk = (homeLoad == null) || availableChargeKw >= MIN_CHARGE_KW;
+  if (!gridHeadroomOk) {
+    // Stay in self-use / exit backup if currently charging
+    if (state.currentMode === MODE.BACKUP) {
+      targetMode = MODE.SELF_USE;
+      reason = `no grid headroom: homeLoad=${homeLoadVal.toFixed(2)}kW PV=${pvPowerVal.toFixed(2)}kW netDraw=${netHouseDraw.toFixed(2)}kW → available=${availableChargeKw.toFixed(2)}kW < ${MIN_CHARGE_KW}kW min`;
+      return { targetMode, reason, alert };
+    }
+    // Skip all charging branches below
+  }
+
   // ── Priority 3: Free/negative-price charging (spot <= 0) ─────────────────
   // Guard: never charge during demand window (handled in priority 1)
-  if (!currentDemand && spotPrice <= CHARGE_SPOT_MAX && soc < SOC_MAX_CHARGE) {
+  if (gridHeadroomOk && !currentDemand && spotPrice <= CHARGE_SPOT_MAX && soc < SOC_MAX_CHARGE) {
     targetMode = MODE.BACKUP;
     reason = `spot=${spotPrice.toFixed(2)}c (<=0) — free charging (SOC ${soc}% -> ${SOC_MAX_CHARGE}%)`;
     return { targetMode, reason, alert };
@@ -667,34 +838,54 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   // Guard: never charge during demand window.
   const CHEAP_BUY_MAX = 10.4;                // c/kWh upper limit for cheap charging
   const CHEAP_CHARGE_SOC = SOC_MAX_CHARGE; // stop charging at this SOC
-  if (!currentDemand && currentPrice < CHEAP_BUY_MAX && soc < CHEAP_CHARGE_SOC) {
+  if (gridHeadroomOk && !currentDemand && currentPrice < CHEAP_BUY_MAX && soc < CHEAP_CHARGE_SOC) {
     targetMode = MODE.BACKUP;
     reason = `buy=${currentPrice.toFixed(2)}c (<${CHEAP_BUY_MAX}c) — cheap rate charging (SOC ${soc}% -> ${CHEAP_CHARGE_SOC}%)`;
     return { targetMode, reason, alert };
   }
   // Exit cheap-rate charging: SOC full or price rose above threshold
+  // BUFFER: require 2 consecutive over-threshold readings before stopping
+  // (prevents single price spike from interrupting a good charging window)
   if (state.currentMode === MODE.BACKUP && (currentPrice >= CHEAP_BUY_MAX || soc >= CHEAP_CHARGE_SOC)) {
     if (spotPrice > CHARGE_SPOT_MAX) {
-      targetMode = MODE.SELF_USE;
-      reason = `cheap rate charging ended (buy=${currentPrice.toFixed(2)}c, SOC=${soc}%, target=${CHEAP_CHARGE_SOC}%)`;
-      return { targetMode, reason, alert };
+      const overCount = (state.chargeExitCount || 0) + 1;
+      if (soc >= CHEAP_CHARGE_SOC || overCount >= 2) {
+        targetMode = MODE.SELF_USE;
+        reason = `cheap rate charging ended (buy=${currentPrice.toFixed(2)}c, SOC=${soc}%, target=${CHEAP_CHARGE_SOC}%, exitCount=${overCount})`;
+        state.chargeExitCount = 0;
+        return { targetMode, reason, alert };
+      } else {
+        // First time over threshold — log but don't exit yet
+        state.chargeExitCount = overCount;
+        console.log(`[INFO] Charge exit buffer: buy=${currentPrice.toFixed(2)}c over threshold (count=${overCount}/2) — waiting one more interval`);
+      }
     }
+  } else if (state.currentMode === MODE.BACKUP) {
+    // Price back below threshold — reset exit counter
+    state.chargeExitCount = 0;
   }
 
   // ── Priority 4b: extremelyLow descriptor charging (buy < 10c) ─────────────
   // When Amber rates the price as extremelyLow, allow charging up to 10c/kWh.
   // Priorities 1/2/2.5 guarantee we are outside the demand window here.
   const EXTREMELY_LOW_MAX = 10; // c/kWh — relaxed ceiling for extremelyLow periods
-  if (!currentDemand && descriptor === 'extremelyLow' && currentPrice < EXTREMELY_LOW_MAX && soc < SOC_MAX_CHARGE) {
+  if (gridHeadroomOk && !currentDemand && descriptor === 'extremelyLow' && currentPrice < EXTREMELY_LOW_MAX && soc < SOC_MAX_CHARGE) {
     targetMode = MODE.BACKUP;
     reason = `descriptor=extremelyLow, buy=${currentPrice.toFixed(2)}c (<${EXTREMELY_LOW_MAX}c) — charging (SOC ${soc}% -> ${SOC_MAX_CHARGE}%)`;
     return { targetMode, reason, alert };
   }
-  // Exit extremelyLow charging
+  // Exit extremelyLow charging (same 2-interval buffer)
   if (state.currentMode === MODE.BACKUP && descriptor === 'extremelyLow' && (currentPrice >= EXTREMELY_LOW_MAX || soc >= SOC_MAX_CHARGE) && spotPrice > CHARGE_SPOT_MAX) {
-    targetMode = MODE.SELF_USE;
-    reason = `extremelyLow charging ended (buy=${currentPrice.toFixed(2)}c, SOC=${soc}%)`;
-    return { targetMode, reason, alert };
+    const overCount = (state.chargeExitCount || 0) + 1;
+    if (soc >= SOC_MAX_CHARGE || overCount >= 2) {
+      targetMode = MODE.SELF_USE;
+      reason = `extremelyLow charging ended (buy=${currentPrice.toFixed(2)}c, SOC=${soc}%, exitCount=${overCount})`;
+      state.chargeExitCount = 0;
+      return { targetMode, reason, alert };
+    } else {
+      state.chargeExitCount = overCount;
+      console.log(`[INFO] ExtremeLow exit buffer: buy=${currentPrice.toFixed(2)}c over threshold (count=${overCount}/2)`);
+    }
   }
 
   // ── Priority 5: Sell to grid (high feedIn, sufficient SOC, inverter headroom) ──
@@ -845,13 +1036,15 @@ async function main() {
   if (alert) console.log(`[ALERT] ${alert}`);
 
   let modeChanged = false;
+  const modeFrom = state.currentMode;  // capture before any switch
   if (targetMode !== null && targetMode !== state.currentMode) {
     console.log(`[ACTION] ${MODE_LABEL[state.currentMode] ?? "unknown"} -> ${MODE_LABEL[targetMode]}: ${reason}`);
-    const ok = await setModeWithVerify(targetMode);
+    const ok = await setModeWithVerify(targetMode, { homeLoad: ess.homeLoad, pvPower });
     if (ok) {
       state.currentMode = targetMode;
       state.lastSwitchTime = now.toISOString();
       state.lastSwitchReason = reason;
+      state.lastModeVerifyOk = true;
       modeChanged = true;
       if (targetMode === MODE.SELLING) {
         await createSellingCron();
@@ -859,12 +1052,32 @@ async function main() {
         await deleteSellingCron();
       }
     } else {
+      state.lastModeVerifyOk = false;
       console.error(`[ERROR] Mode switch failed`);
     }
   } else {
     // Already in Selling mode: roll the end time window forward (+10 min)
     if (state.currentMode === MODE.SELLING) {
       await updateSellingEndTime();
+    }
+    // Already in Backup (charging) mode: roll the charge end time window forward (+10 min)
+    if (state.currentMode === MODE.BACKUP) {
+      const { startHHMM, endHHMM } = timedModeTimeContext();
+      // Roll charge window
+      const startOk = await setParam('0xC014', startHHMM);
+      const endOk = await setParam('0xC016', endHHMM);
+      console.log(`[BUY] Rolling charge window -> ${startHHMM}–${endHHMM} start=${startOk?'OK':'FAILED'} end=${endOk?'OK':'FAILED'}`);
+      // Keep sell window collapsed (mutual exclusion)
+      await setParam('0xC018', '0000');
+      await setParam('0xC01A', '0000');
+      // Recalculate and update charge power based on current load/PV
+      const chargeKw = calcChargeKw(ess.homeLoad, pvPower);
+      if (chargeKw >= MIN_CHARGE_KW) {
+        const pwOk = await setParam('0xC0BA', chargeKw);
+        console.log(`[BUY] Updated charge power -> ${chargeKw.toFixed(2)}kW (homeLoad=${(ess.homeLoad??0).toFixed(2)}kW, PV=${(pvPower??0).toFixed(2)}kW) ${pwOk?'OK':'FAILED'}`);
+      } else {
+        console.log(`[BUY] chargeKw=${chargeKw.toFixed(2)}kW < ${MIN_CHARGE_KW}kW — keeping previous power setting`);
+      }
     }
     console.log(`[INFO] Mode: ${MODE_LABEL[state.currentMode] ?? "none"} (${reason})`);
   }
@@ -887,7 +1100,7 @@ async function main() {
   }
 
   if (modeChanged) console.log(`[LOG] Mode change triggered record`);
-  else console.log(`[LOG] Scheduled record (~${minOfHour === 0 || minOfHour < 6 ? "on-the-hour" : "half-hour"})`);
+  else console.log(`[LOG] Scheduled record (~${minOfHour < 6 ? "on-the-hour" : "half-hour"})`);
 
   const record = {
     ts: now.toISOString(),
@@ -929,6 +1142,14 @@ async function main() {
     todayCarbonKg:     ess.todayCarbonKg     ?? null,
     reportedMode:      ess.reportedMode      ?? null,
     recordTrigger: modeChanged ? "mode_change" : "scheduled",
+    // Timed mode charge/discharge power set this interval (null if not in charge/sell mode)
+    chargeKw:    state.currentMode === MODE.BACKUP  ? calcChargeKw(ess.homeLoad, pvPower) : null,
+    dischargeKw: state.currentMode === MODE.SELLING ? 5.0 : null,
+    mode_verify_ok: modeChanged ? (state.lastModeVerifyOk ? 1 : 0) : null,
+    mode_from: modeChanged ? modeFrom : null,
+    mode_to:   modeChanged ? state.currentMode : null,
+    // Solar/weather data from Open-Meteo forecast (populated by solar-forecast.js cron at 07:00)
+    ...getCurrentSolarData(),
   };
 
   // ── Interval cost accounting ──────────────────────────────────────────────
