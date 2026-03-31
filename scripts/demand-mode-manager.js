@@ -1023,6 +1023,31 @@ async function main() {
   // 5. Run decision engine
   // Load today's summary first (used for avg buy price in sell decision)
   const state = loadState();
+
+  // ── Force mode override ───────────────────────────────────────────────────
+  // If state.forceMode is set and forceModeUntil is in the future,
+  // skip the decision engine and hold the forced mode.
+  if (state.forceMode != null && state.forceModeUntil) {
+    const forceUntil = new Date(state.forceModeUntil);
+    if (now < forceUntil) {
+      const minsLeft = ((forceUntil - now) / 60000).toFixed(0);
+      console.log(`[INFO] Force mode active: ${MODE_LABEL[state.forceMode] ?? state.forceMode} until ${state.forceModeUntil} (${minsLeft} min remaining)`);
+      // Roll sell end time if currently selling
+      if (state.forceMode === MODE.SELLING) {
+        await updateSellingEndTime();
+      }
+      state.lastCheck = now.toISOString();
+      saveState(state);
+      console.log(`[DONE]`);
+      return;
+    } else {
+      // Force period expired — clear it
+      console.log(`[INFO] Force mode expired, resuming normal decision`);
+      delete state.forceMode;
+      delete state.forceModeUntil;
+      saveState(state);
+    }
+  }
   const todaySummary = (() => {
     try {
       const _db = getDb();
