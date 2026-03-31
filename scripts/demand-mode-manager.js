@@ -1190,8 +1190,22 @@ async function main() {
   }
 
   // 8. Print today's summary
+  // Prefer inverter's own daily totals (accurate, from inverter registers x126A/x126C/x126E)
+  // Fall back to DB accumulated values if inverter data unavailable
+  const todayBuyKwh  = ess.todayGridBuyKwh  ?? daily.grid_buy_kwh  ?? 0;
+  const todaySellKwh = ess.todayGridSellKwh ?? daily.grid_sell_kwh ?? 0;
+  const todayHomeKwh = ess.todayHomeKwh     ?? daily.home_kwh      ?? 0;
+  // Cost: use meter_buy/sell delta totals from DB (start vs end of day)
+  const meterBuyKwh  = (daily.meter_buy_end  != null && daily.meter_buy_start  != null)
+    ? (daily.meter_buy_end  - daily.meter_buy_start).toFixed(3)  : null;
+  const meterSellKwh = (daily.meter_sell_end != null && daily.meter_sell_start != null)
+    ? (daily.meter_sell_end - daily.meter_sell_start).toFixed(3) : null;
+
   const netCost = ((daily.cost_aud || 0) - (daily.earnings_aud || 0));
-  console.log(`\n[TODAY] Home: ${(daily.home_kwh||0).toFixed(2)} kWh  Grid-buy: ${(daily.grid_buy_kwh||0).toFixed(2)} kWh  Grid-sell: ${(daily.grid_sell_kwh||0).toFixed(2)} kWh`);
+  console.log(`\n[TODAY] Home: ${todayHomeKwh.toFixed(2)} kWh  Grid-buy: ${todayBuyKwh.toFixed(2)} kWh  Grid-sell: ${todaySellKwh.toFixed(2)} kWh`);
+  if (meterBuyKwh != null) {
+    console.log(`[TODAY] Meter: buy=${meterBuyKwh} kWh  sell=${meterSellKwh} kWh  (cumulative delta, accurate)`);
+  }
   console.log(`[TODAY] Cost: $${(daily.cost_aud||0).toFixed(3)}  Revenue: $${(daily.earnings_aud||0).toFixed(3)}  Net: $${netCost.toFixed(3)}`);
   console.log(`[TODAY] SOC avg/min/max: ${(daily.avg_soc||0).toFixed(0)}% / ${daily.min_soc||0}% / ${daily.max_soc||0}%`);
   if ((daily.demand_peak_kw || 0) > 0) {
