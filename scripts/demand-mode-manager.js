@@ -893,7 +893,7 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   // Charging priorities 3/4/4b are NOT reached during demand window because
   // priority 1 either returns early (if was charging) or falls through here.
   const SELL_MIN_MARGIN = 5;        // c/kWh minimum margin above avg buy price
-  const SELL_ABS_MIN = 14;          // c/kWh absolute floor (protects against midnight/no-data edge case)
+  const SELL_ABS_MIN = 12;          // c/kWh absolute floor (protects against midnight/no-data edge case)
   const SELL_MIN_SAMPLES_KWH = 1.0; // require at least 1 kWh bought today to have a reliable avg
 
   const avgBuyCalc = (() => {
