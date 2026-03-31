@@ -575,7 +575,7 @@ function getCurrentSolarData() {
 
 function loadState() {
   try { return JSON.parse(fs.readFileSync(STATE_FILE, "utf8")); }
-  catch { return { currentMode: null, lastSwitchTime: null, chargeExitCount: 0 }; }
+  catch { return { currentMode: null, lastSwitchTime: null, chargeExitCount: 0, chargeEntryCount: 0, extremelyLowEntryCount: 0 }; }
 }
 function saveState(s) { fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2)); }
 
@@ -836,12 +836,24 @@ function decide(ess, pvPower, amber, state, dailySummary) {
 
   // ── Priority 4: Cheap rate charging (buy < 10.4c, SOC < 90%) ──────────────
   // Guard: never charge during demand window.
+  // ENTRY BUFFER: require 2 consecutive below-threshold readings before starting
+  // (prevents a momentary price dip from triggering an unnecessary charge session)
   const CHEAP_BUY_MAX = 10.4;                // c/kWh upper limit for cheap charging
   const CHEAP_CHARGE_SOC = SOC_MAX_CHARGE; // stop charging at this SOC
-  if (gridHeadroomOk && !currentDemand && currentPrice < CHEAP_BUY_MAX && soc < CHEAP_CHARGE_SOC) {
-    targetMode = MODE.BACKUP;
-    reason = `buy=${currentPrice.toFixed(2)}c (<${CHEAP_BUY_MAX}c) — cheap rate charging (SOC ${soc}% -> ${CHEAP_CHARGE_SOC}%)`;
-    return { targetMode, reason, alert };
+  if (gridHeadroomOk && !currentDemand && currentPrice < CHEAP_BUY_MAX && soc < CHEAP_CHARGE_SOC && state.currentMode !== MODE.BACKUP) {
+    const entryCount = (state.chargeEntryCount || 0) + 1;
+    if (entryCount >= 2) {
+      targetMode = MODE.BACKUP;
+      reason = `buy=${currentPrice.toFixed(2)}c (<${CHEAP_BUY_MAX}c) — cheap rate charging (SOC ${soc}% -> ${CHEAP_CHARGE_SOC}%, entryCount=${entryCount})`;
+      state.chargeEntryCount = 0;
+      return { targetMode, reason, alert };
+    } else {
+      state.chargeEntryCount = entryCount;
+      console.log(`[INFO] Charge entry buffer: buy=${currentPrice.toFixed(2)}c below threshold (count=${entryCount}/2) — waiting one more interval`);
+    }
+  } else if (state.currentMode !== MODE.BACKUP) {
+    // Price not below threshold — reset entry counter
+    state.chargeEntryCount = 0;
   }
   // Exit cheap-rate charging: SOC full or price rose above threshold
   // BUFFER: require 2 consecutive over-threshold readings before stopping
@@ -868,11 +880,22 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   // ── Priority 4b: extremelyLow descriptor charging (buy < 10c) ─────────────
   // When Amber rates the price as extremelyLow, allow charging up to 10c/kWh.
   // Priorities 1/2/2.5 guarantee we are outside the demand window here.
+  // ENTRY BUFFER: require 2 consecutive readings before starting
   const EXTREMELY_LOW_MAX = 10; // c/kWh — relaxed ceiling for extremelyLow periods
-  if (gridHeadroomOk && !currentDemand && descriptor === 'extremelyLow' && currentPrice < EXTREMELY_LOW_MAX && soc < SOC_MAX_CHARGE) {
-    targetMode = MODE.BACKUP;
-    reason = `descriptor=extremelyLow, buy=${currentPrice.toFixed(2)}c (<${EXTREMELY_LOW_MAX}c) — charging (SOC ${soc}% -> ${SOC_MAX_CHARGE}%)`;
-    return { targetMode, reason, alert };
+  if (gridHeadroomOk && !currentDemand && descriptor === 'extremelyLow' && currentPrice < EXTREMELY_LOW_MAX && soc < SOC_MAX_CHARGE && state.currentMode !== MODE.BACKUP) {
+    const elEntryCount = (state.extremelyLowEntryCount || 0) + 1;
+    if (elEntryCount >= 2) {
+      targetMode = MODE.BACKUP;
+      reason = `descriptor=extremelyLow, buy=${currentPrice.toFixed(2)}c (<${EXTREMELY_LOW_MAX}c) — charging (SOC ${soc}% -> ${SOC_MAX_CHARGE}%, entryCount=${elEntryCount})`;
+      state.extremelyLowEntryCount = 0;
+      return { targetMode, reason, alert };
+    } else {
+      state.extremelyLowEntryCount = elEntryCount;
+      console.log(`[INFO] ExtremeLow entry buffer: buy=${currentPrice.toFixed(2)}c below threshold (count=${elEntryCount}/2) — waiting one more interval`);
+    }
+  } else if (state.currentMode !== MODE.BACKUP) {
+    // Not eligible — reset entry counter
+    state.extremelyLowEntryCount = 0;
   }
   // Exit extremelyLow charging (same 2-interval buffer)
   if (state.currentMode === MODE.BACKUP && descriptor === 'extremelyLow' && (currentPrice >= EXTREMELY_LOW_MAX || soc >= SOC_MAX_CHARGE) && spotPrice > CHARGE_SPOT_MAX) {
