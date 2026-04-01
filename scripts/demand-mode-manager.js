@@ -1050,9 +1050,13 @@ async function main() {
   const feedInForecastOuter = feedInCh.filter(p => p.type === "ForecastInterval");
   const nowMsOuter          = Date.now();
   const sixHoursMsOuter     = 6 * 60 * 60 * 1000;
-  const peakFeedInForecast  = feedInForecastOuter
+  // Use average of top-4 feedIn forecast values in next 6h (more robust than single peak)
+  const feedInInRange       = feedInForecastOuter
     .filter(p => { const t = new Date(p.startTime).getTime(); return t > nowMsOuter && t <= nowMsOuter + sixHoursMsOuter; })
-    .reduce((max, p) => Math.max(max, Math.abs(p.perKwh ?? 0)), 0);
+    .map(p => Math.abs(p.perKwh ?? 0))
+    .sort((a, b) => b - a);
+  const top4               = feedInInRange.slice(0, 4);
+  const peakFeedInForecast  = top4.length > 0 ? top4.reduce((s, v) => s + v, 0) / top4.length : 0;
 
   const amber = { currentDemand, currentPrice, feedInPrice, spotPrice, descriptor, renewables, nextDemandMinutes, tariffPeriod, clPrice, clDescriptor, clTariffPeriod, peakFeedInForecast };
 
