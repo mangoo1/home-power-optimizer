@@ -33,8 +33,14 @@ const MODE = { SELF_USE: 0, TIMED: 1, PV_PRIORITY: 5, SELLING: 6, BACKUP: 3 };
 const MODE_LABEL = { 0: "Self-use", 1: "Timed", 3: "Backup", 5: "PV-Priority", 6: "Selling", 7: "Voltage-Reg" };
 
 // Strategy parameters
-const SOC_MIN_SELL = 35;            // Min SOC to enter selling (reserve for demand window)
-const SOC_EXIT_SELL = 30;           // Exit selling if SOC drops to this (5% buffer below entry)
+const SOC_MIN_SELL_MORNING   = 12;  // 00:00–13:59 Sydney (can recharge before demand window)
+const SOC_MIN_SELL_AFTERNOON = 35;  // 14:00–23:59 Sydney (reserve for demand window + overnight)
+const SOC_MIN_SELL_CUTOFF_HOUR = 14;
+
+// Derive current SOC floor based on Sydney time
+const _sydHour = (new Date().getUTCHours() + 11) % 24;
+const SOC_MIN_SELL = _sydHour < SOC_MIN_SELL_CUTOFF_HOUR ? SOC_MIN_SELL_MORNING : SOC_MIN_SELL_AFTERNOON;
+const SOC_EXIT_SELL = SOC_MIN_SELL - 2; // 2% buffer below entry floor
 const FEEDIN_ENTER = 20;            // Min feedIn to enter selling (c/kWh) — absolute floor
 const FEEDIN_EXIT = 18;             // Exit selling if feedIn drops below this (c/kWh)
 const GRID_SAFETY_THRESHOLD = 0.15; // Max tolerated grid import while selling (kW)

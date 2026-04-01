@@ -94,7 +94,12 @@ const MODE_LABEL = { 0: "Self-use", 1: "Timed", 3: "Backup", 5: "PV-Priority", 6
 const SOC_MAX_CHARGE = 85;        // Target SOC for backup/charge modes (%)
                                   // 85% chosen: above this BMS throttles charge rate,
                                   // PV surplus only earns ~2.8c feedIn — not worth grid charging
-const SOC_MIN_SELL = 35;          // Min SOC allowed when selling (reserve for night use)
+// SOC_MIN_SELL is time-dependent (see getSocMinSell() below):
+//   00:00–13:59 Sydney → 12% (morning, can recharge from grid/PV before demand window)
+//   14:00–23:59 Sydney → 35% (afternoon/evening, must reserve for demand window + overnight)
+const SOC_MIN_SELL_MORNING  = 12;
+const SOC_MIN_SELL_AFTERNOON = 35;
+const SOC_MIN_SELL_CUTOFF_HOUR = 14; // switch to afternoon reserve at 14:00 Sydney time
 const SELL_STOP_HOUR = 21;        // Hard stop selling after this hour (Sydney time) — reserve battery for overnight
 const SOC_WARN = 20;              // Alert threshold: SOC too low during demand window
 const SELL_FEEDIN_MIN = 0;        // Hard floor for selling (0 = rely solely on avg-buy+margin logic)
@@ -973,6 +978,11 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   })();
   const afterSellStopHour = sydneyHourNow >= SELL_STOP_HOUR;
 
+  // Time-dependent SOC floor: morning allows lower reserve (can recharge before demand window)
+  const socMinSell = sydneyHourNow < SOC_MIN_SELL_CUTOFF_HOUR
+    ? SOC_MIN_SELL_MORNING    // 00:00–13:59 → 12%
+    : SOC_MIN_SELL_AFTERNOON; // 14:00–23:59 → 35%
+
   if (afterSellStopHour) {
     if (state.currentMode === MODE.SELLING) {
       targetMode = MODE.SELF_USE;
@@ -980,11 +990,11 @@ function decide(ess, pvPower, amber, state, dailySummary) {
       return { targetMode, reason, alert };
     }
     // Don't enter selling after stop hour
-  } else if (feedInPrice >= effectiveSellMin && soc > SOC_MIN_SELL) {
+  } else if (feedInPrice >= effectiveSellMin && soc > socMinSell) {
     const maxSellPower = INVERTER_MAX_DISCHARGE - (homeLoad ?? 0) - 0.3;
     if (maxSellPower > 0.2) {
       targetMode = MODE.SELLING;
-      reason = `feedIn=${feedInPrice.toFixed(1)}c (>=${effectiveSellMin.toFixed(1)}c, ${sellMinLabel}), SOC ${soc}% (>${SOC_MIN_SELL}%), headroom ${maxSellPower.toFixed(1)}kW`;
+      reason = `feedIn=${feedInPrice.toFixed(1)}c (>=${effectiveSellMin.toFixed(1)}c, ${sellMinLabel}), SOC ${soc}% (>${socMinSell}% ${sydneyHourNow < SOC_MIN_SELL_CUTOFF_HOUR ? "morning" : "afternoon"}), headroom ${maxSellPower.toFixed(1)}kW`;
     } else {
       reason = `feedIn high but home load ${homeLoad?.toFixed(1)}kW saturates inverter — no selling (${sellMinLabel})`;
     }
@@ -992,9 +1002,9 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   }
 
   // Exit selling mode: price dropped, SOC too low, or past stop hour
-  if (state.currentMode === MODE.SELLING && (feedInPrice < effectiveSellMin || soc <= SOC_MIN_SELL)) {
+  if (state.currentMode === MODE.SELLING && (feedInPrice < effectiveSellMin || soc <= socMinSell)) {
     targetMode = MODE.SELF_USE;
-    reason = `stop selling (feedIn=${feedInPrice.toFixed(1)}c < ${effectiveSellMin.toFixed(1)}c, ${sellMinLabel}, SOC=${soc}%)`;
+    reason = `stop selling (feedIn=${feedInPrice.toFixed(1)}c < ${effectiveSellMin.toFixed(1)}c, ${sellMinLabel}, SOC=${soc}%, floor=${socMinSell}%)`;
     return { targetMode, reason, alert };
   }
 
