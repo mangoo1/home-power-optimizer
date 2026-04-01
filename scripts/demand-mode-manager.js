@@ -876,7 +876,7 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   const forecastMinBuy = avgWindowN > 0
     ? sortedBuyPrices.slice(0, avgWindowN).reduce((s, v) => s + v, 0) / avgWindowN
     : currentPrice;
-  const dynamicBuyMax = Math.max(9.0, forecastMinBuy * 1.1); // 1.1× avg of 6 cheapest slots in next 10h
+  const dynamicBuyMax = forecastMinBuy * 1.1; // 1.1× avg of 6 cheapest slots in next 10h (no floor — lower is better)
 
   // Peak feedIn until end of selling window (until SELL_STOP_HOUR or demand window)
   const sellStopMs = (() => { const d = new Date(); d.setHours(SELL_STOP_HOUR,0,0,0); return d.getTime(); })();
