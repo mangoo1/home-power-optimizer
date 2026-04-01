@@ -750,7 +750,7 @@ function updateDailySummary(record) {
 // ── Decision engine ───────────────────────────────────────────────────────────
 function decide(ess, pvPower, amber, state, dailySummary) {
   const { soc, homeLoad, gridPower, battPower } = ess;
-  const { currentDemand, currentPrice, feedInPrice, spotPrice, nextDemandMinutes, descriptor } = amber;
+  const { currentDemand, currentPrice, feedInPrice, spotPrice, nextDemandMinutes, descriptor, peakFeedInForecast } = amber;
   const usableEnergy = (soc - BATTERY_MIN_SOC) / 100 * BATTERY_CAPACITY; // usable kWh remaining
   const hoursRemaining = homeLoad > 0 ? usableEnergy / homeLoad : 99;
 
@@ -847,12 +847,13 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   const CHEAP_CHARGE_SOC = SOC_MAX_CHARGE;
 
   // Calculate peak evening feedIn from forecast (next 6h feedIn channel, take max)
-  const peakFeedIn      = amber.peakFeedInForecast ?? 0;
+  const peakFeedIn      = peakFeedInForecast ?? 0;
   const spreadOk        = peakFeedIn > 0 && (currentPrice + SPREAD_MIN) <= peakFeedIn;
 
   const cheapEntryOk    = gridHeadroomOk && !currentDemand && soc < CHEAP_CHARGE_SOC && state.currentMode !== MODE.BACKUP;
   const priceCondition  = currentPrice < CHEAP_BUY_MAX;
   const spreadCondition = spreadOk;
+
 
   if (cheapEntryOk && (priceCondition || spreadCondition)) {
     const entryCount = (state.chargeEntryCount || 0) + 1;
@@ -1002,7 +1003,7 @@ async function main() {
   const [ess, amberRaw] = await Promise.all([
     getESSData(),
     httpsGet(
-      `https://api.amber.com.au/v1/sites/${AMBER_SITE_ID}/prices/current?resolution=5&next=3`,
+      `https://api.amber.com.au/v1/sites/${AMBER_SITE_ID}/prices/current?resolution=5&next=72`,
       { Authorization: `Bearer ${AMBER_TOKEN}` }
     ).catch(() => []),
   ]);
