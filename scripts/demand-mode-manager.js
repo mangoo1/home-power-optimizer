@@ -582,7 +582,7 @@ function getCurrentSolarData() {
 
 function loadState() {
   try { return JSON.parse(fs.readFileSync(STATE_FILE, "utf8")); }
-  catch { return { currentMode: null, lastSwitchTime: null, chargeExitCount: 0, chargeEntryCount: 0, extremelyLowEntryCount: 0 }; }
+  catch { return { currentMode: null, lastSwitchTime: null, chargeExitCount: 0, chargeEntryCount: 0, extremelyLowEntryCount: 0, elExitCount: 0 }; }
 }
 function saveState(s) { fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2)); }
 
@@ -957,17 +957,28 @@ function decide(ess, pvPower, amber, state, dailySummary) {
     // Not eligible — reset entry counter
     state.extremelyLowEntryCount = 0;
   }
-  // Exit extremelyLow charging (same 2-interval buffer)
-  if (state.currentMode === MODE.BACKUP && descriptor === 'extremelyLow' && (currentPrice >= EXTREMELY_LOW_MAX || soc >= SOC_MAX_CHARGE) && spotPrice > CHARGE_SPOT_MAX) {
-    const overCount = (state.chargeExitCount || 0) + 1;
-    if (soc >= SOC_MAX_CHARGE || overCount >= 2) {
-      targetMode = MODE.SELF_USE;
-      reason = `extremelyLow charging ended (buy=${currentPrice.toFixed(2)}c, SOC=${soc}%, exitCount=${overCount})`;
-      state.chargeExitCount = 0;
-      return { targetMode, reason, alert };
+  // Exit extremelyLow charging.
+  // Fix 1: use a dedicated counter (elExitCount) — avoids interference with chargeExitCount from
+  //         the cheap-rate exit block above, which was resetting the counter on every price dip.
+  // Fix 2: remove `descriptor === 'extremelyLow'` guard — once we are in Backup via this path,
+  //         exit must fire regardless of current descriptor (Amber can hold the label while price rises).
+  // Fix 3 (fallback): also exit immediately if price > dynamicBuyMax regardless of how we entered Backup.
+  if (state.currentMode === MODE.BACKUP) {
+    const elExitTriggered = currentPrice >= EXTREMELY_LOW_MAX || soc >= SOC_MAX_CHARGE;
+    const fallbackExit    = currentPrice > dynamicBuyMax;  // safety net: price drifted above our ceiling
+    if (elExitTriggered || fallbackExit) {
+      const overCount = (state.elExitCount || 0) + 1;
+      if (soc >= SOC_MAX_CHARGE || overCount >= 2 || fallbackExit) {
+        targetMode = MODE.SELF_USE;
+        reason = `extremelyLow charging ended (buy=${currentPrice.toFixed(2)}c, dynamicBuyMax=${dynamicBuyMax.toFixed(1)}c, SOC=${soc}%, exitCount=${overCount}, fallback=${fallbackExit})`;
+        state.elExitCount = 0;
+        return { targetMode, reason, alert };
+      } else {
+        state.elExitCount = overCount;
+        console.log(`[INFO] ExtremeLow exit buffer: buy=${currentPrice.toFixed(2)}c over threshold (count=${overCount}/2, fallback=${fallbackExit})`);
+      }
     } else {
-      state.chargeExitCount = overCount;
-      console.log(`[INFO] ExtremeLow exit buffer: buy=${currentPrice.toFixed(2)}c over threshold (count=${overCount}/2)`);
+      state.elExitCount = 0;  // price back below threshold — reset
     }
   }
 
