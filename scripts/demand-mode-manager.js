@@ -834,31 +834,45 @@ function decide(ess, pvPower, amber, state, dailySummary) {
     return { targetMode, reason, alert };
   }
 
-  // ── Priority 4: Cheap rate charging (buy < 10.4c, SOC < 90%) ──────────────
+  // ── Priority 4: Cheap rate charging ──────────────────────────────────────
+  // Two entry conditions (either triggers charging):
+  //   A. Price < CHEAP_BUY_MAX (absolute cheap threshold)
+  //   B. Price spread: currentPrice + SPREAD_MIN <= peak evening feedIn forecast
+  //      (buy cheap now, sell high tonight — worthwhile even at moderate buy price)
   // Guard: never charge during demand window.
-  // ENTRY BUFFER: require 2 consecutive below-threshold readings before starting
-  // (prevents a momentary price dip from triggering an unnecessary charge session)
-  const CHEAP_BUY_MAX = 10.4;                // c/kWh upper limit for cheap charging
-  const CHEAP_CHARGE_SOC = SOC_MAX_CHARGE; // stop charging at this SOC
-  if (gridHeadroomOk && !currentDemand && currentPrice < CHEAP_BUY_MAX && soc < CHEAP_CHARGE_SOC && state.currentMode !== MODE.BACKUP) {
+  // ENTRY BUFFER: require 2 consecutive qualifying readings before starting.
+  const CHEAP_BUY_MAX   = 9.0;   // c/kWh — absolute cheap ceiling (lowered from 10.4c)
+  const CHEAP_EXIT_MIN  = 13.0;  // c/kWh — exit threshold (asymmetric: hold charge longer)
+  const SPREAD_MIN      = 7.0;   // c/kWh — minimum buy→sell spread to justify charging
+  const CHEAP_CHARGE_SOC = SOC_MAX_CHARGE;
+
+  // Calculate peak evening feedIn from forecast (next 6h feedIn channel, take max)
+  const peakFeedIn      = amber.peakFeedInForecast ?? 0;
+  const spreadOk        = peakFeedIn > 0 && (currentPrice + SPREAD_MIN) <= peakFeedIn;
+
+  const cheapEntryOk    = gridHeadroomOk && !currentDemand && soc < CHEAP_CHARGE_SOC && state.currentMode !== MODE.BACKUP;
+  const priceCondition  = currentPrice < CHEAP_BUY_MAX;
+  const spreadCondition = spreadOk;
+
+  if (cheapEntryOk && (priceCondition || spreadCondition)) {
     const entryCount = (state.chargeEntryCount || 0) + 1;
+    const condLabel  = priceCondition ? `buy=${currentPrice.toFixed(2)}c (<${CHEAP_BUY_MAX}c)` : `spread: buy=${currentPrice.toFixed(2)}c + ${SPREAD_MIN}c <= peakFeedIn=${peakFeedIn.toFixed(2)}c`;
     if (entryCount >= 2) {
       targetMode = MODE.BACKUP;
-      reason = `buy=${currentPrice.toFixed(2)}c (<${CHEAP_BUY_MAX}c) — cheap rate charging (SOC ${soc}% -> ${CHEAP_CHARGE_SOC}%, entryCount=${entryCount})`;
+      reason = `${condLabel} — cheap rate charging (SOC ${soc}% -> ${CHEAP_CHARGE_SOC}%, entryCount=${entryCount})`;
       state.chargeEntryCount = 0;
       return { targetMode, reason, alert };
     } else {
       state.chargeEntryCount = entryCount;
-      console.log(`[INFO] Charge entry buffer: buy=${currentPrice.toFixed(2)}c below threshold (count=${entryCount}/2) — waiting one more interval`);
+      console.log(`[INFO] Charge entry buffer: ${condLabel} (count=${entryCount}/2) — waiting one more interval`);
     }
   } else if (state.currentMode !== MODE.BACKUP) {
-    // Price not below threshold — reset entry counter
+    // Neither condition met — reset entry counter
     state.chargeEntryCount = 0;
   }
-  // Exit cheap-rate charging: SOC full or price rose above threshold
+  // Exit cheap-rate charging: SOC full or price rose above exit threshold (asymmetric)
   // BUFFER: require 2 consecutive over-threshold readings before stopping
-  // (prevents single price spike from interrupting a good charging window)
-  if (state.currentMode === MODE.BACKUP && (currentPrice >= CHEAP_BUY_MAX || soc >= CHEAP_CHARGE_SOC)) {
+  if (state.currentMode === MODE.BACKUP && (currentPrice >= CHEAP_EXIT_MIN || soc >= CHEAP_CHARGE_SOC)) {
     if (spotPrice > CHARGE_SPOT_MAX) {
       const overCount = (state.chargeExitCount || 0) + 1;
       if (soc >= CHEAP_CHARGE_SOC || overCount >= 2) {
@@ -867,13 +881,12 @@ function decide(ess, pvPower, amber, state, dailySummary) {
         state.chargeExitCount = 0;
         return { targetMode, reason, alert };
       } else {
-        // First time over threshold — log but don't exit yet
         state.chargeExitCount = overCount;
-        console.log(`[INFO] Charge exit buffer: buy=${currentPrice.toFixed(2)}c over threshold (count=${overCount}/2) — waiting one more interval`);
+        console.log(`[INFO] Charge exit buffer: buy=${currentPrice.toFixed(2)}c over exit threshold ${CHEAP_EXIT_MIN}c (count=${overCount}/2) — waiting one more interval`);
       }
     }
   } else if (state.currentMode === MODE.BACKUP) {
-    // Price back below threshold — reset exit counter
+    // Price back below exit threshold — reset exit counter
     state.chargeExitCount = 0;
   }
 
@@ -1032,7 +1045,15 @@ async function main() {
     ? (new Date(nextDemandInterval.startTime) - now) / 1000 / 60
     : null;
 
-  const amber = { currentDemand, currentPrice, feedInPrice, spotPrice, descriptor, renewables, nextDemandMinutes, tariffPeriod, clPrice, clDescriptor, clTariffPeriod };
+  // Peak evening feedIn in next 6 hours (used for spread-based charging decision)
+  const feedInForecastOuter = feedInCh.filter(p => p.type === "ForecastInterval");
+  const nowMsOuter          = Date.now();
+  const sixHoursMsOuter     = 6 * 60 * 60 * 1000;
+  const peakFeedInForecast  = feedInForecastOuter
+    .filter(p => { const t = new Date(p.startTime).getTime(); return t > nowMsOuter && t <= nowMsOuter + sixHoursMsOuter; })
+    .reduce((max, p) => Math.max(max, Math.abs(p.perKwh ?? 0)), 0);
+
+  const amber = { currentDemand, currentPrice, feedInPrice, spotPrice, descriptor, renewables, nextDemandMinutes, tariffPeriod, clPrice, clDescriptor, clTariffPeriod, peakFeedInForecast };
 
   // 3. Calculate PV power
   const pvPower = calcPVPower(ess);
