@@ -1186,21 +1186,13 @@ async function main() {
   saveState(state);
 
   // ── Write decision ────────────────────────────────────────────────────────
-  // Runs every 5 min. Writes to DB on:
-  //   A. Scheduled intervals: every 30 min (within a 6-min window to tolerate drift/delay)
-  //   B. Mode change (immediate capture of trigger reason)
+  // Write every 5-min cron run — ensures no gaps (manual mode changes, selling state, etc. always captured)
   const minOfHour = now.getMinutes();
-  const isScheduledInterval = (minOfHour % 30) < 6;
-  const shouldLog = isScheduledInterval || modeChanged;
-
-  if (!shouldLog) {
-    console.log(`[SKIP] Not a log interval (${minOfHour}min, no mode change) — skipping DB write`);
-    console.log(`[DONE]`);
-    return;
-  }
+  const isScheduledInterval = (minOfHour % 30) < 6; // still tracked for interval cost accounting
+  const shouldLog = true; // always write
 
   if (modeChanged) console.log(`[LOG] Mode change triggered record`);
-  else console.log(`[LOG] Scheduled record (~${minOfHour < 6 ? "on-the-hour" : "half-hour"})`);
+  else console.log(`[LOG] 5-min record (${minOfHour}min)`);
 
   const record = {
     ts: now.toISOString(),
@@ -1241,7 +1233,7 @@ async function main() {
     todayHomeKwh:      ess.todayHomeKwh      ?? null,
     todayCarbonKg:     ess.todayCarbonKg     ?? null,
     reportedMode:      ess.reportedMode      ?? null,
-    recordTrigger: modeChanged ? "mode_change" : "scheduled",
+    recordTrigger: modeChanged ? "mode_change" : isScheduledInterval ? "scheduled" : "5min",
     // Timed mode charge/discharge power set this interval (null if not in charge/sell mode)
     chargeKw:    state.currentMode === MODE.BACKUP  ? calcChargeKw(ess.homeLoad, pvPower) : null,
     dischargeKw: state.currentMode === MODE.SELLING ? 5.0 : null,
@@ -1255,7 +1247,7 @@ async function main() {
   // ── Interval cost accounting ──────────────────────────────────────────────
   // gridPower: negative=import(buy), positive=export(sell)
   // Scheduled records use 0.5h window; mode-change records use 5-min window.
-  const intervalHours = modeChanged ? (5/60) : 0.5;
+  const intervalHours = 5/60; // always 5-min intervals (cron runs every 5 min)
   const intervalImportKwh = ess.gridPower != null && ess.gridPower < 0 ? Math.abs(ess.gridPower) * intervalHours : 0;
   const intervalExportKwh = ess.gridPower != null && ess.gridPower > 0 ? ess.gridPower * intervalHours : 0;
   record.intervalBuyAud  = parseFloat((intervalImportKwh * currentPrice / 100).toFixed(6));
