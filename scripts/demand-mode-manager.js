@@ -95,11 +95,12 @@ const SOC_MAX_CHARGE = 85;        // Target SOC for backup/charge modes (%)
                                   // 85% chosen: above this BMS throttles charge rate,
                                   // PV surplus only earns ~2.8c feedIn — not worth grid charging
 // SOC_MIN_SELL is time-dependent (see getSocMinSell() below):
-//   00:00–13:59 Sydney → 12% (morning, can recharge from grid/PV before demand window)
-//   14:00–23:59 Sydney → 35% (afternoon/evening, must reserve for demand window + overnight)
+//   00:00–10:59 Sydney → 12% (morning, enough time for grid/PV to recharge before demand window)
+//   11:00–23:59 Sydney → 35% (afternoon/evening, must reserve for demand window + overnight)
+// Cutoff changed from 14:00 to 11:00: after 11am there's not enough recharge time before 15:00 DW
 const SOC_MIN_SELL_MORNING  = 12;
 const SOC_MIN_SELL_AFTERNOON = 35;
-const SOC_MIN_SELL_CUTOFF_HOUR = 14; // switch to afternoon reserve at 14:00 Sydney time
+const SOC_MIN_SELL_CUTOFF_HOUR = 11; // switch to afternoon reserve at 11:00 Sydney time
 const SELL_STOP_HOUR = 21;        // Hard stop selling after this hour (Sydney time) — reserve battery for overnight
 const SOC_WARN = 20;              // Alert threshold: SOC too low during demand window
 const SELL_FEEDIN_MIN = 0;        // Hard floor for selling (0 = rely solely on avg-buy+margin logic)
@@ -796,7 +797,9 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   }
 
   // ── Priority 2.5: Pre-demand window forced charge (10–60 min before) ──────
-  // Only force charge if SOC < 60% — enough reserve to cover the demand window.
+  // Only force charge if SOC < 60% AND a demand window is actually scheduled today.
+  // nextDemandMinutes != null means the Amber API returned a real upcoming demand window event.
+  // On non-demand days (weekends/holidays) nextDemandMinutes is null → this branch is skipped.
   // If SOC >= 60%, the battery is sufficient; let normal price rules apply.
   const PRE_DW_CHARGE_SOC = 60; // % minimum SOC threshold for forced pre-DW charging
   if (!currentDemand && nextDemandMinutes != null && nextDemandMinutes <= 60 && nextDemandMinutes > 10 && soc < PRE_DW_CHARGE_SOC && gridHeadroomOk) {
@@ -860,8 +863,14 @@ function decide(ess, pvPower, amber, state, dailySummary) {
     .filter(p => !p.tariffInformation?.demandWindow)
     .filter(p => new Date(p.startTime).getTime() <= chargeHorizonMs)
     .map(p => p.perKwh ?? 999);
-  const forecastMinBuy = forecastBuyPrices.length > 0 ? Math.min(...forecastBuyPrices) : currentPrice;
-  const dynamicBuyMax  = Math.max(9.0, forecastMinBuy * 1.5); // floor at 9c so we always allow truly cheap rates
+  // Use average of the cheapest ~6.5h window (13 half-hour slots) instead of a single minimum.
+  // Avoids a single negative-price outlier skewing the threshold too low.
+  const sortedBuyPrices = [...forecastBuyPrices].sort((a, b) => a - b);
+  const avgWindowN = Math.min(13, sortedBuyPrices.length);
+  const forecastMinBuy = avgWindowN > 0
+    ? sortedBuyPrices.slice(0, avgWindowN).reduce((s, v) => s + v, 0) / avgWindowN
+    : currentPrice;
+  const dynamicBuyMax  = Math.max(9.0, forecastMinBuy * 1.2); // 1.2× avg-of-cheapest-13 (was 1.5× single min)
 
   // Peak feedIn until end of selling window (until SELL_STOP_HOUR or demand window)
   const sellStopMs = (() => { const d = new Date(); d.setHours(SELL_STOP_HOUR,0,0,0); return d.getTime(); })();
@@ -884,7 +893,7 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   const priceCondition  = currentPrice <= dynamicBuyMax;
   const spreadCondition = spreadOk;
 
-  console.log(`[CHARGE] dynamicBuyMax=${dynamicBuyMax.toFixed(1)}c (forecastMin=${forecastMinBuy.toFixed(1)}c×1.5), peakFeedInToday=${peakFeedIn.toFixed(1)}c, spread=${spreadOk?'OK':'NO'}`);
+  console.log(`[CHARGE] dynamicBuyMax=${dynamicBuyMax.toFixed(1)}c (forecastAvg13=${forecastMinBuy.toFixed(1)}c×1.2, n=${avgWindowN}), peakFeedInToday=${peakFeedIn.toFixed(1)}c, spread=${spreadOk?'OK':'NO'}`);
 
   if (cheapEntryOk && (priceCondition || spreadCondition)) {
     const entryCount = (state.chargeEntryCount || 0) + 1;
@@ -1211,22 +1220,24 @@ async function main() {
   saveState(state);
 
   // ── Write decision ────────────────────────────────────────────────────────
-  // Cron runs every 5 min (at :01,:06,:11,...,:56).
-  // Write to DB on:
-  //   A. Scheduled half-hour intervals: exactly :01 and :31
-  //   B. Mode change (immediate capture)
+  // Dense logging window: every 5 min from 2026-04-02 to 2026-04-16 (14 days) for analysis.
+  // Storage: 288 records/day × ~650 bytes ≈ 187 KB/day → ~2.6 MB for 14 days (SQLite ~4-5MB).
+  // After the dense window, revert to :01/:31 half-hour intervals + mode changes only.
   const minOfHour = now.getMinutes();
+  const DENSE_LOG_END   = new Date('2026-04-16T00:00:00+11:00');
+  const inDenseWindow   = now < DENSE_LOG_END;
   const isScheduledInterval = minOfHour === 1 || minOfHour === 31;
-  const shouldLog = isScheduledInterval || modeChanged;
+  const shouldLog = inDenseWindow || isScheduledInterval || modeChanged;
 
   if (!shouldLog) {
-    console.log(`[SKIP] No mode change, not a log interval (:${String(minOfHour).padStart(2,'0')}) — skipping DB write`);
+    console.log(`[SKIP] Not a log interval (:${String(minOfHour).padStart(2,'0')}, no mode change) — skipping DB write`);
     console.log(`[DONE]`);
     return;
   }
 
   if (modeChanged) console.log(`[LOG] Mode change triggered record`);
-  else console.log(`[LOG] Scheduled half-hour record (:${String(minOfHour).padStart(2,'0')})`);
+  else if (inDenseWindow) console.log(`[LOG] 5-min record (:${String(minOfHour).padStart(2,'0')})`);
+  else console.log(`[LOG] Scheduled record (~${isScheduledInterval ? 'half-hour' : 'on-the-hour'})`);
 
   const record = {
     ts: now.toISOString(),
