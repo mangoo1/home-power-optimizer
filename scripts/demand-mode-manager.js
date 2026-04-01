@@ -756,7 +756,8 @@ function updateDailySummary(record) {
 // ── Decision engine ───────────────────────────────────────────────────────────
 function decide(ess, pvPower, amber, state, dailySummary) {
   const { soc, homeLoad, gridPower, battPower } = ess;
-  const { currentDemand, currentPrice, feedInPrice, spotPrice, nextDemandMinutes, descriptor, peakFeedInForecast } = amber;
+  const { currentDemand, currentPrice, feedInPrice, spotPrice, nextDemandMinutes, descriptor, peakFeedInForecast, forecastGeneral, forecastFeedIn } = amber;
+  const forecast = forecastGeneral ?? [];
   const usableEnergy = (soc - BATTERY_MIN_SOC) / 100 * BATTERY_CAPACITY; // usable kWh remaining
   const hoursRemaining = homeLoad > 0 ? usableEnergy / homeLoad : 99;
 
@@ -842,28 +843,52 @@ function decide(ess, pvPower, amber, state, dailySummary) {
 
   // ── Priority 4: Cheap rate charging ──────────────────────────────────────
   // Two entry conditions (either triggers charging):
-  //   A. Price < CHEAP_BUY_MAX (absolute cheap threshold)
-  //   B. Price spread: currentPrice + SPREAD_MIN <= peak evening feedIn forecast
-  //      (buy cheap now, sell high tonight — worthwhile even at moderate buy price)
-  // Guard: never charge during demand window.
+  //   A. Price <= dynamicBuyMax: today's forecast min buy price * 1.5 (captures whole cheap window)
+  //   B. Price spread: currentPrice + SPREAD_MIN <= peakFeedInToday
+  //      (buy cheap now, sell high later — worthwhile even at moderate buy price)
+  // Charging stops when: demand window starts OR price rises above CHEAP_EXIT_MIN.
   // ENTRY BUFFER: require 2 consecutive qualifying readings before starting.
-  const CHEAP_BUY_MAX   = 9.0;   // c/kWh — absolute cheap ceiling (lowered from 10.4c)
+
+  // Dynamic buy ceiling: cheapest forecast price today (until DW or end of day) × 1.5
+  // This self-adjusts: on an expensive day the threshold rises, on a cheap day it stays low.
+  const nowMs = Date.now();
+  const demandWindowMs = nextDemandMinutes != null ? nowMs + nextDemandMinutes * 60 * 1000 : null;
+  const endOfDayMs = (() => { const d = new Date(); d.setHours(23,30,0,0); return d.getTime(); })();
+  const chargeHorizonMs = demandWindowMs ?? endOfDayMs;
+
+  const forecastBuyPrices = forecast
+    .filter(p => !p.tariffInformation?.demandWindow)
+    .filter(p => new Date(p.startTime).getTime() <= chargeHorizonMs)
+    .map(p => p.perKwh ?? 999);
+  const forecastMinBuy = forecastBuyPrices.length > 0 ? Math.min(...forecastBuyPrices) : currentPrice;
+  const dynamicBuyMax  = Math.max(9.0, forecastMinBuy * 1.5); // floor at 9c so we always allow truly cheap rates
+
+  // Peak feedIn until end of selling window (until SELL_STOP_HOUR or demand window)
+  const sellStopMs = (() => { const d = new Date(); d.setHours(SELL_STOP_HOUR,0,0,0); return d.getTime(); })();
+  const feedInHorizonMs = demandWindowMs ? Math.min(demandWindowMs, sellStopMs) : sellStopMs;
+  const peakFeedInToday = (forecastFeedIn ?? [])
+    .filter(p => { const t = new Date(p.startTime).getTime(); return t > nowMs && t <= feedInHorizonMs; })
+    .map(p => Math.abs(p.perKwh ?? 0))
+    .sort((a,b) => b-a)
+    .slice(0,4)
+    .reduce((s,v,_,a) => s + v/a.length, 0); // top-4 average
+
   const CHEAP_EXIT_MIN  = 13.0;  // c/kWh — exit threshold (asymmetric: hold charge longer)
   const SPREAD_MIN      = 7.0;   // c/kWh — minimum buy→sell spread to justify charging
   const CHEAP_CHARGE_SOC = SOC_MAX_CHARGE;
 
-  // Calculate peak evening feedIn from forecast (next 6h feedIn channel, take max)
-  const peakFeedIn      = peakFeedInForecast ?? 0;
+  const peakFeedIn      = peakFeedInToday ?? 0;
   const spreadOk        = peakFeedIn > 0 && (currentPrice + SPREAD_MIN) <= peakFeedIn;
 
   const cheapEntryOk    = gridHeadroomOk && !currentDemand && soc < CHEAP_CHARGE_SOC && state.currentMode !== MODE.BACKUP;
-  const priceCondition  = currentPrice < CHEAP_BUY_MAX;
+  const priceCondition  = currentPrice <= dynamicBuyMax;
   const spreadCondition = spreadOk;
 
+  console.log(`[CHARGE] dynamicBuyMax=${dynamicBuyMax.toFixed(1)}c (forecastMin=${forecastMinBuy.toFixed(1)}c×1.5), peakFeedInToday=${peakFeedIn.toFixed(1)}c, spread=${spreadOk?'OK':'NO'}`);
 
   if (cheapEntryOk && (priceCondition || spreadCondition)) {
     const entryCount = (state.chargeEntryCount || 0) + 1;
-    const condLabel  = priceCondition ? `buy=${currentPrice.toFixed(2)}c (<${CHEAP_BUY_MAX}c)` : `spread: buy=${currentPrice.toFixed(2)}c + ${SPREAD_MIN}c <= peakFeedIn=${peakFeedIn.toFixed(2)}c`;
+      const condLabel  = priceCondition ? `buy=${currentPrice.toFixed(2)}c (<=${dynamicBuyMax.toFixed(1)}c dynamic)` : `spread: buy=${currentPrice.toFixed(2)}c + ${SPREAD_MIN}c <= peakFeedIn=${peakFeedIn.toFixed(2)}c`;
     if (entryCount >= 2) {
       targetMode = MODE.BACKUP;
       reason = `${condLabel} — cheap rate charging (SOC ${soc}% -> ${CHEAP_CHARGE_SOC}%, entryCount=${entryCount})`;
@@ -1084,7 +1109,7 @@ async function main() {
   const top4               = feedInInRange.slice(0, 4);
   const peakFeedInForecast  = top4.length > 0 ? top4.reduce((s, v) => s + v, 0) / top4.length : 0;
 
-  const amber = { currentDemand, currentPrice, feedInPrice, spotPrice, descriptor, renewables, nextDemandMinutes, tariffPeriod, clPrice, clDescriptor, clTariffPeriod, peakFeedInForecast };
+  const amber = { currentDemand, currentPrice, feedInPrice, spotPrice, descriptor, renewables, nextDemandMinutes, tariffPeriod, clPrice, clDescriptor, clTariffPeriod, peakFeedInForecast, forecastGeneral: forecast, forecastFeedIn: feedInCh.filter(p => p.type === "ForecastInterval") };
 
   // 3. Calculate PV power
   const pvPower = calcPVPower(ess);
