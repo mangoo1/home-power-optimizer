@@ -1226,13 +1226,18 @@ async function main() {
   saveState(state);
 
   // ── Write decision ────────────────────────────────────────────────────────
-  // Dense logging window: every 5 min from 2026-04-02 to 2026-04-16 (14 days) for analysis.
-  // Storage: 288 records/day × ~650 bytes ≈ 187 KB/day → ~2.6 MB for 14 days (SQLite ~4-5MB).
-  // After the dense window, revert to :01/:31 half-hour intervals + mode changes only.
+  // Logging rules (DO NOT remove modeChanged from shouldLog when adjusting intervals):
+  //   1. MODE CHANGE → ALWAYS write to DB, regardless of sampling interval.
+  //      This is a hard requirement so mode transitions are never lost, even if the
+  //      sampling cadence is later changed (e.g. from 5-min to 30-min or hourly).
+  //   2. Dense logging window (2026-04-02 → 2026-04-16, 14 days): every 5-min run.
+  //      Storage: 288 records/day × ~650 bytes ≈ 187 KB/day → ~2.6 MB total (SQLite ~4-5MB).
+  //   3. After dense window: fall back to :01/:31 half-hour scheduled intervals.
   const minOfHour = now.getMinutes();
   const DENSE_LOG_END   = new Date('2026-04-16T00:00:00+11:00');
   const inDenseWindow   = now < DENSE_LOG_END;
   const isScheduledInterval = minOfHour === 1 || minOfHour === 31;
+  // ⚠️  Keep `modeChanged` as an independent OR — never fold it into inDenseWindow/isScheduledInterval.
   const shouldLog = inDenseWindow || isScheduledInterval || modeChanged;
 
   if (!shouldLog) {
