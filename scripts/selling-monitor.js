@@ -8,7 +8,7 @@
  * Entry conditions (all must be met):
  *   1. Not in demand window (absolutely prohibited)
  *   2. SOC > 35% (reserve for tomorrow's demand window)
- *   3. feedIn >= 10 c/kWh (profitable to sell)
+ *   3. feedIn >= 20 c/kWh (absolute floor; demand-mode-manager checks avg+7c spread)
  *   4. Inverter has headroom (home load < 4.7 kW)
  *   5. Grid not currently importing (gridPower <= 0.15 kW)
  *
@@ -16,7 +16,7 @@
  *   - Demand window starts (immediate Self-use)
  *   - Grid importing > 0.15 kW (safety — stop before demand charge)
  *   - SOC <= 30% (insufficient reserve)
- *   - feedIn < 8 c/kWh (no longer profitable)
+ *   - feedIn < 18 c/kWh (approaching floor, exit with buffer)
  *   - Inverter headroom gone (home load too high)
  */
 
@@ -35,8 +35,8 @@ const MODE_LABEL = { 0: "Self-use", 1: "Timed", 3: "Backup", 5: "PV-Priority", 6
 // Strategy parameters
 const SOC_MIN_SELL = 35;            // Min SOC to enter selling (reserve for demand window)
 const SOC_EXIT_SELL = 30;           // Exit selling if SOC drops to this (5% buffer below entry)
-const FEEDIN_ENTER = 10;            // Min feedIn to enter selling (c/kWh)
-const FEEDIN_EXIT = 8;              // Exit selling if feedIn drops below this (c/kWh)
+const FEEDIN_ENTER = 20;            // Min feedIn to enter selling (c/kWh) — absolute floor
+const FEEDIN_EXIT = 18;             // Exit selling if feedIn drops below this (c/kWh)
 const GRID_SAFETY_THRESHOLD = 0.15; // Max tolerated grid import while selling (kW)
 const INVERTER_MAX_KW = 5.0;        // Max inverter discharge power (kW)
 const INVERTER_HEADROOM = 0.3;      // Safety headroom to avoid saturating inverter (kW)
