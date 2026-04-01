@@ -859,20 +859,24 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   const endOfDayMs = (() => { const d = new Date(); d.setHours(23,30,0,0); return d.getTime(); })();
   const chargeHorizonMs = demandWindowMs ?? endOfDayMs;
 
+  // Forecast window: next 10 hours, non-demand-window slots only.
+  // chargeHorizonMs already caps at DW start; the demandWindow filter below double-guards.
+  const tenHoursMs = 10 * 60 * 60 * 1000;
   const forecastBuyPrices = forecast
     .filter(p => !p.tariffInformation?.demandWindow)
-    .filter(p => new Date(p.startTime).getTime() <= chargeHorizonMs)
+    .filter(p => {
+      const t = new Date(p.startTime).getTime();
+      return t > nowMs && t <= Math.min(nowMs + tenHoursMs, chargeHorizonMs);
+    })
     .map(p => p.perKwh ?? 999);
-  // Use average of the cheapest ~6.5h window (13 half-hour slots) instead of a single minimum.
-  // Avoids a single negative-price outlier skewing the threshold too low.
+  // Take the 6 cheapest half-hour slots (≈3h low-valley) and average them.
+  // Multiply by 1.1 — tight buffer so we only charge when price is truly near the valley.
   const sortedBuyPrices = [...forecastBuyPrices].sort((a, b) => a - b);
-  // Take average of cheapest 20 half-hour slots (≈10h) excluding demand window periods.
-  // demand window prices are already filtered out above; chargeHorizonMs caps at DW start.
-  const avgWindowN = Math.min(20, sortedBuyPrices.length);
+  const avgWindowN = Math.min(6, sortedBuyPrices.length);
   const forecastMinBuy = avgWindowN > 0
     ? sortedBuyPrices.slice(0, avgWindowN).reduce((s, v) => s + v, 0) / avgWindowN
     : currentPrice;
-  const dynamicBuyMax  = Math.max(9.0, forecastMinBuy * 1.2); // 1.2× avg-of-cheapest-20 non-DW slots
+  const dynamicBuyMax = Math.max(9.0, forecastMinBuy * 1.1); // 1.1× avg of 6 cheapest slots in next 10h
 
   // Peak feedIn until end of selling window (until SELL_STOP_HOUR or demand window)
   const sellStopMs = (() => { const d = new Date(); d.setHours(SELL_STOP_HOUR,0,0,0); return d.getTime(); })();
@@ -895,7 +899,7 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   const priceCondition  = currentPrice <= dynamicBuyMax;
   const spreadCondition = spreadOk;
 
-  console.log(`[CHARGE] dynamicBuyMax=${dynamicBuyMax.toFixed(1)}c (forecastAvg20=${forecastMinBuy.toFixed(1)}c×1.2, n=${avgWindowN}), peakFeedInToday=${peakFeedIn.toFixed(1)}c, spread=${spreadOk?'OK':'NO'}`);
+  console.log(`[CHARGE] dynamicBuyMax=${dynamicBuyMax.toFixed(1)}c (forecastAvg6of10h=${forecastMinBuy.toFixed(1)}c×1.1, n=${avgWindowN}), peakFeedInToday=${peakFeedIn.toFixed(1)}c, spread=${spreadOk?'OK':'NO'}`);
 
   if (cheapEntryOk && (priceCondition || spreadCondition)) {
     const entryCount = (state.chargeEntryCount || 0) + 1;
