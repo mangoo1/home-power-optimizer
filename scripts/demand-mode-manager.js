@@ -876,7 +876,7 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   const forecastMinBuy = avgWindowN > 0
     ? sortedBuyPrices.slice(0, avgWindowN).reduce((s, v) => s + v, 0) / avgWindowN
     : currentPrice;
-  const dynamicBuyMax = forecastMinBuy * 1.1; // 1.1× avg of 6 cheapest slots in next 10h (no floor — lower is better)
+  const dynamicBuyMax = Math.max(9.6, forecastMinBuy * 1.3); // max(avg6×1.3, 9.6c) — floor ensures we catch cheap windows even on low-forecast days
 
   // Peak feedIn until end of selling window (until SELL_STOP_HOUR or demand window)
   const sellStopMs = (() => { const d = new Date(); d.setHours(SELL_STOP_HOUR,0,0,0); return d.getTime(); })();
@@ -899,7 +899,7 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   const priceCondition  = currentPrice <= dynamicBuyMax;
   const spreadCondition = spreadOk;
 
-  console.log(`[CHARGE] dynamicBuyMax=${dynamicBuyMax.toFixed(1)}c (forecastAvg6of10h=${forecastMinBuy.toFixed(1)}c×1.1, n=${avgWindowN}), peakFeedInToday=${peakFeedIn.toFixed(1)}c, spread=${spreadOk?'OK':'NO'}`);
+  console.log(`[CHARGE] dynamicBuyMax=${dynamicBuyMax.toFixed(1)}c (forecastAvg6of10h=${forecastMinBuy.toFixed(1)}c×1.3, n=${avgWindowN}), peakFeedInToday=${peakFeedIn.toFixed(1)}c, spread=${spreadOk?'OK':'NO'}`);
 
   if (cheapEntryOk && (priceCondition || spreadCondition)) {
     const entryCount = (state.chargeEntryCount || 0) + 1;
