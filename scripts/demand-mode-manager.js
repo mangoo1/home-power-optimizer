@@ -872,15 +872,22 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   // Hard cap: don't consider slots after 16:00 local time for charging decisions.
   // Without this, evening peak prices (17–21c) get included in the avg6 window when there's
   // no DW, driving dynamicBuyMax up to 20c+ and causing charging during the expensive peak.
+  // Also block overnight charging (00:00–06:00): after midnight the cutoff resets to today 16:00,
+  // but overnight prices (15–18c) are still expensive — no grid charging until morning.
   const CHARGE_CUTOFF_HOUR = 16; // Sydney local time — no grid charging after 16:00
+  const CHARGE_START_HOUR  = 6;  // Sydney local time — no grid charging before 06:00 (overnight block)
+  const sydneyHourForWindow = (new Date().getUTCHours() + 11) % 24;
   const chargeCutoffMs = (() => {
     const d = new Date();
     d.setHours(CHARGE_CUTOFF_HOUR, 0, 0, 0);
     return d.getTime();
   })();
-  // If current time is past 16:00, set effectiveHorizon to now (empty forecast window = no charging).
-  // Next-day cheap slots are not relevant for same-evening decisions.
-  const effectiveHorizonMs = Math.min(chargeHorizonMs, chargeCutoffMs);
+  // If current time is past 16:00 OR before 06:00, set effectiveHorizon to now
+  // (empty forecast window = dynamicBuyMax collapses to 9.6c floor = no charging).
+  const inOvernightBlock = sydneyHourForWindow < CHARGE_START_HOUR;
+  const effectiveHorizonMs = (inOvernightBlock)
+    ? nowMs  // empty window → no charging overnight
+    : Math.min(chargeHorizonMs, chargeCutoffMs);
 
   // Forecast window: next 10 hours, non-demand-window slots only, capped at 16:00.
   // chargeHorizonMs already caps at DW start; the demandWindow filter below double-guards.
