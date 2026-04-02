@@ -869,18 +869,30 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   const endOfDayMs = (() => { const d = new Date(); d.setHours(23,30,0,0); return d.getTime(); })();
   const chargeHorizonMs = demandWindowMs ?? endOfDayMs;
 
-  // Forecast window: next 10 hours, non-demand-window slots only.
+  // Hard cap: don't consider slots after 16:00 local time for charging decisions.
+  // Without this, evening peak prices (17–21c) get included in the avg6 window when there's
+  // no DW, driving dynamicBuyMax up to 20c+ and causing charging during the expensive peak.
+  const CHARGE_CUTOFF_HOUR = 16; // Sydney local time — no grid charging after 16:00
+  const chargeCutoffMs = (() => {
+    const d = new Date();
+    d.setHours(CHARGE_CUTOFF_HOUR, 0, 0, 0);
+    // If we're already past 16:00, set cutoff to end-of-day (allow charging overnight/tomorrow)
+    return d.getTime() > nowMs ? d.getTime() : endOfDayMs;
+  })();
+  const effectiveHorizonMs = Math.min(chargeHorizonMs, chargeCutoffMs);
+
+  // Forecast window: next 10 hours, non-demand-window slots only, capped at 16:00.
   // chargeHorizonMs already caps at DW start; the demandWindow filter below double-guards.
   const tenHoursMs = 10 * 60 * 60 * 1000;
   const forecastBuyPrices = forecast
     .filter(p => !p.tariffInformation?.demandWindow)
     .filter(p => {
       const t = new Date(p.startTime).getTime();
-      return t > nowMs && t <= Math.min(nowMs + tenHoursMs, chargeHorizonMs);
+      return t > nowMs && t <= Math.min(nowMs + tenHoursMs, effectiveHorizonMs);
     })
     .map(p => p.perKwh ?? 999);
   // Take the 6 cheapest half-hour slots (≈3h low-valley) and average them.
-  // Multiply by 1.1 — tight buffer so we only charge when price is truly near the valley.
+  // Multiply by 1.3 — buffer so we only charge when price is truly near the valley.
   const sortedBuyPrices = [...forecastBuyPrices].sort((a, b) => a - b);
   const avgWindowN = Math.min(6, sortedBuyPrices.length);
   const forecastMinBuy = avgWindowN > 0
