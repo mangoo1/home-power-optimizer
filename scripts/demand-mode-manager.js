@@ -1026,7 +1026,9 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   // Fix 4: use dynamicBuyMax as the exit threshold instead of the hardcoded EXTREMELY_LOW_MAX (10c).
   //         EXTREMELY_LOW_MAX was too aggressive — it fires at 10c even when dynamicBuyMax allows 13c+.
   //         Exit condition: price > dynamicBuyMax (the same ceiling used for entry).
-  if (state.currentMode === MODE.BACKUP) {
+  // Fix 5: EMERGENCY charge suppresses this exit — when deficit is critical we must not stop charging
+  //         even if the price is above dynamicBuyMax.
+  if (state.currentMode === MODE.BACKUP && !emergencyCharge) {
     const elExitTriggered = currentPrice > dynamicBuyMax || soc >= SOC_MAX_CHARGE;
     const fallbackExit    = false;  // elExitTriggered now covers this case via dynamicBuyMax check
     if (elExitTriggered) {
@@ -1043,6 +1045,9 @@ function decide(ess, pvPower, amber, state, dailySummary) {
     } else {
       state.elExitCount = 0;  // price back below threshold — reset
     }
+  } else if (emergencyCharge && state.currentMode === MODE.BACKUP) {
+    state.elExitCount = 0;  // reset exit counter — emergency overrides exit
+    console.log(`[INFO] Emergency charge active — suppressing elExit despite price ${currentPrice.toFixed(1)}c`);
   }
 
   // ── Priority 5: Sell to grid (high feedIn, sufficient SOC, inverter headroom) ──
