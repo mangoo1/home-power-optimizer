@@ -914,14 +914,14 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   if (cheapEntryOk && (priceCondition || spreadCondition)) {
     const entryCount = (state.chargeEntryCount || 0) + 1;
       const condLabel  = priceCondition ? `buy=${currentPrice.toFixed(2)}c (<=${dynamicBuyMax.toFixed(1)}c dynamic)` : `spread: buy=${currentPrice.toFixed(2)}c + ${SPREAD_MIN}c <= peakFeedIn=${peakFeedIn.toFixed(2)}c`;
-    if (entryCount >= 2) {
+    if (entryCount >= 3) {
       targetMode = MODE.BACKUP;
       reason = `${condLabel} — cheap rate charging (SOC ${soc}% -> ${CHEAP_CHARGE_SOC}%, entryCount=${entryCount})`;
       state.chargeEntryCount = 0;
       return { targetMode, reason, alert };
     } else {
       state.chargeEntryCount = entryCount;
-      console.log(`[INFO] Charge entry buffer: ${condLabel} (count=${entryCount}/2) — waiting one more interval`);
+      console.log(`[INFO] Charge entry buffer: ${condLabel} (count=${entryCount}/3) — waiting 2 more intervals`);
     }
   } else if (state.currentMode !== MODE.BACKUP) {
     // Neither condition met — reset entry counter
@@ -932,14 +932,14 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   if (state.currentMode === MODE.BACKUP && (currentPrice >= CHEAP_EXIT_MIN || soc >= CHEAP_CHARGE_SOC)) {
     if (spotPrice > CHARGE_SPOT_MAX) {
       const overCount = (state.chargeExitCount || 0) + 1;
-      if (soc >= CHEAP_CHARGE_SOC || overCount >= 2) {
+      if (soc >= CHEAP_CHARGE_SOC || overCount >= 3) {
         targetMode = MODE.SELF_USE;
         reason = `cheap rate charging ended (buy=${currentPrice.toFixed(2)}c, SOC=${soc}%, target=${CHEAP_CHARGE_SOC}%, exitCount=${overCount})`;
         state.chargeExitCount = 0;
         return { targetMode, reason, alert };
       } else {
         state.chargeExitCount = overCount;
-        console.log(`[INFO] Charge exit buffer: buy=${currentPrice.toFixed(2)}c over exit threshold ${CHEAP_EXIT_MIN}c (count=${overCount}/2) — waiting one more interval`);
+        console.log(`[INFO] Charge exit buffer: buy=${currentPrice.toFixed(2)}c over exit threshold ${CHEAP_EXIT_MIN}c (count=${overCount}/3) — waiting 2 more intervals`);
       }
     }
   } else if (state.currentMode === MODE.BACKUP) {
@@ -954,14 +954,14 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   const EXTREMELY_LOW_MAX = 10; // c/kWh — relaxed ceiling for extremelyLow periods
   if (gridHeadroomOk && !currentDemand && descriptor === 'extremelyLow' && currentPrice < EXTREMELY_LOW_MAX && soc < SOC_MAX_CHARGE && state.currentMode !== MODE.BACKUP) {
     const elEntryCount = (state.extremelyLowEntryCount || 0) + 1;
-    if (elEntryCount >= 2) {
+    if (elEntryCount >= 3) {
       targetMode = MODE.BACKUP;
       reason = `descriptor=extremelyLow, buy=${currentPrice.toFixed(2)}c (<${EXTREMELY_LOW_MAX}c) — charging (SOC ${soc}% -> ${SOC_MAX_CHARGE}%, entryCount=${elEntryCount})`;
       state.extremelyLowEntryCount = 0;
       return { targetMode, reason, alert };
     } else {
       state.extremelyLowEntryCount = elEntryCount;
-      console.log(`[INFO] ExtremeLow entry buffer: buy=${currentPrice.toFixed(2)}c below threshold (count=${elEntryCount}/2) — waiting one more interval`);
+      console.log(`[INFO] ExtremeLow entry buffer: buy=${currentPrice.toFixed(2)}c below threshold (count=${elEntryCount}/3) — waiting 2 more intervals`);
     }
   } else if (state.currentMode !== MODE.BACKUP) {
     // Not eligible — reset entry counter
@@ -981,14 +981,14 @@ function decide(ess, pvPower, amber, state, dailySummary) {
     const fallbackExit    = false;  // elExitTriggered now covers this case via dynamicBuyMax check
     if (elExitTriggered) {
       const overCount = (state.elExitCount || 0) + 1;
-      if (soc >= SOC_MAX_CHARGE || overCount >= 2) {
+      if (soc >= SOC_MAX_CHARGE || overCount >= 3) {
         targetMode = MODE.SELF_USE;
         reason = `extremelyLow charging ended (buy=${currentPrice.toFixed(2)}c, dynamicBuyMax=${dynamicBuyMax.toFixed(1)}c, SOC=${soc}%, exitCount=${overCount})`;
         state.elExitCount = 0;
         return { targetMode, reason, alert };
       } else {
         state.elExitCount = overCount;
-        console.log(`[INFO] ExtremeLow exit buffer: buy=${currentPrice.toFixed(2)}c over dynamicBuyMax=${dynamicBuyMax.toFixed(1)}c (count=${overCount}/2)`);
+        console.log(`[INFO] ExtremeLow exit buffer: buy=${currentPrice.toFixed(2)}c over dynamicBuyMax=${dynamicBuyMax.toFixed(1)}c (count=${overCount}/3)`);
       }
     } else {
       state.elExitCount = 0;  // price back below threshold — reset
