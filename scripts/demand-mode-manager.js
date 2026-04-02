@@ -919,17 +919,28 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   const spreadOk        = peakFeedIn > 0 && (currentPrice + SPREAD_MIN) <= peakFeedIn;
 
   // ── Emergency charge: predict if battery will run out before tomorrow morning ──
-  // Estimate: tonight consumption (home load) + hot water (06:30) + 35% DW reserve
-  // If projected deficit > 0, allow charging at current price (bypass dynamicBuyMax)
+  // More accurate segmented estimate:
+  //   19:00-23:00 → 1.0kW avg (evening use)
+  //   23:00-06:30 → 0.35kW avg (overnight standby)
+  //   Hot water at 06:30 → 10kWh
+  //   Reserve needed = 12% (morning floor, will recharge from PV/grid during day)
   const sydneyHourForCharge = (new Date().getUTCHours() + 11) % 24;
-  const hoursUntilMorning = sydneyHourForCharge < 9 ? (9 - sydneyHourForCharge) : (24 - sydneyHourForCharge + 9);
-  const estimatedConsumption = hoursUntilMorning * 0.8 + 7.5; // 0.8kW avg overnight + 7.5kWh hot water
+  const HOT_WATER_KWH = 10;
+  const OVERNIGHT_RESERVE_PCT = 12; // morning floor — will top up during day
+  let estimatedConsumption = 0;
+  if (sydneyHourForCharge >= 17 && sydneyHourForCharge < 23) {
+    const eveHours = 23 - sydneyHourForCharge;
+    estimatedConsumption = eveHours * 1.0 + 7.5 * 0.35 + HOT_WATER_KWH; // eve + overnight(7.5h) + HW
+  } else if (sydneyHourForCharge >= 23 || sydneyHourForCharge < 6) {
+    const nightHours = sydneyHourForCharge >= 23 ? (6.5 - (sydneyHourForCharge - 24)) : (6.5 - sydneyHourForCharge);
+    estimatedConsumption = Math.max(0, nightHours) * 0.35 + HOT_WATER_KWH;
+  }
   const socKwh = (soc / 100) * 42;
-  const reserveKwh = (SOC_MIN_SELL_AFTERNOON / 100) * 42; // 35% reserve
+  const reserveKwh = (OVERNIGHT_RESERVE_PCT / 100) * 42;
   const projectedDeficit = estimatedConsumption + reserveKwh - socKwh;
-  const emergencyCharge = projectedDeficit > 3 && !currentDemand && sydneyHourForCharge >= 17; // only trigger in evening
+  const emergencyCharge = projectedDeficit > 2 && !currentDemand && sydneyHourForCharge >= 17 && sydneyHourForCharge < 23;
   if (emergencyCharge) {
-    console.log(`[CHARGE] ⚠️ Emergency: projected deficit=${projectedDeficit.toFixed(1)}kWh (need ${(estimatedConsumption+reserveKwh).toFixed(1)}kWh, have ${socKwh.toFixed(1)}kWh) — charging at current price ${currentPrice.toFixed(1)}c`);
+    console.log(`[CHARGE] ⚠️ Emergency: deficit=${projectedDeficit.toFixed(1)}kWh (consume=${estimatedConsumption.toFixed(1)}kWh + reserve=${reserveKwh.toFixed(1)}kWh - have=${socKwh.toFixed(1)}kWh) — charging at ${currentPrice.toFixed(1)}c`);
   }
 
   // Buffer count: use 4 readings (~20 min) during price transition window (14:00–16:00 Sydney)
