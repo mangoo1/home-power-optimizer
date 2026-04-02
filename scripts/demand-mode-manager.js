@@ -876,9 +876,10 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   const chargeCutoffMs = (() => {
     const d = new Date();
     d.setHours(CHARGE_CUTOFF_HOUR, 0, 0, 0);
-    // If we're already past 16:00, set cutoff to end-of-day (allow charging overnight/tomorrow)
-    return d.getTime() > nowMs ? d.getTime() : endOfDayMs;
+    return d.getTime();
   })();
+  // If current time is past 16:00, set effectiveHorizon to now (empty forecast window = no charging).
+  // Next-day cheap slots are not relevant for same-evening decisions.
   const effectiveHorizonMs = Math.min(chargeHorizonMs, chargeCutoffMs);
 
   // Forecast window: next 10 hours, non-demand-window slots only, capped at 16:00.
@@ -897,7 +898,7 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   const avgWindowN = Math.min(6, sortedBuyPrices.length);
   const forecastMinBuy = avgWindowN > 0
     ? sortedBuyPrices.slice(0, avgWindowN).reduce((s, v) => s + v, 0) / avgWindowN
-    : currentPrice;
+    : 0;  // No forecast slots available (past 16:00 or no data) — set to 0 so dynamicBuyMax falls to floor (9.6c), effectively disabling grid charging
   const dynamicBuyMax = Math.max(9.6, forecastMinBuy * 1.3); // max(avg6×1.3, 9.6c) — floor ensures we catch cheap windows even on low-forecast days
 
   // Peak feedIn until end of selling window (until SELL_STOP_HOUR or demand window)
