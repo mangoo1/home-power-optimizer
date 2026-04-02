@@ -918,41 +918,67 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   const peakFeedIn      = peakFeedInToday ?? 0;
   const spreadOk        = peakFeedIn > 0 && (currentPrice + SPREAD_MIN) <= peakFeedIn;
 
+  // ── Emergency charge: predict if battery will run out before tomorrow morning ──
+  // Estimate: tonight consumption (home load) + hot water (06:30) + 35% DW reserve
+  // If projected deficit > 0, allow charging at current price (bypass dynamicBuyMax)
+  const sydneyHourForCharge = (new Date().getUTCHours() + 11) % 24;
+  const hoursUntilMorning = sydneyHourForCharge < 9 ? (9 - sydneyHourForCharge) : (24 - sydneyHourForCharge + 9);
+  const estimatedConsumption = hoursUntilMorning * 0.8 + 7.5; // 0.8kW avg overnight + 7.5kWh hot water
+  const socKwh = (soc / 100) * 42;
+  const reserveKwh = (SOC_MIN_SELL_AFTERNOON / 100) * 42; // 35% reserve
+  const projectedDeficit = estimatedConsumption + reserveKwh - socKwh;
+  const emergencyCharge = projectedDeficit > 3 && !currentDemand && sydneyHourForCharge >= 17; // only trigger in evening
+  if (emergencyCharge) {
+    console.log(`[CHARGE] ⚠️ Emergency: projected deficit=${projectedDeficit.toFixed(1)}kWh (need ${(estimatedConsumption+reserveKwh).toFixed(1)}kWh, have ${socKwh.toFixed(1)}kWh) — charging at current price ${currentPrice.toFixed(1)}c`);
+  }
+
+  // Buffer count: use 4 readings (~20 min) during price transition window (14:00–16:00 Sydney)
+  // to avoid thrashing at the cheap→peak price crossover point
+  const inTransitionWindow = sydneyHourForCharge >= 14 && sydneyHourForCharge < 16;
+  const requiredEntryCount = inTransitionWindow ? 4 : 3;
+  const requiredExitCount  = inTransitionWindow ? 4 : 3;
+
   const cheapEntryOk    = gridHeadroomOk && !currentDemand && soc < CHEAP_CHARGE_SOC && state.currentMode !== MODE.BACKUP;
-  const priceCondition  = currentPrice <= dynamicBuyMax;
+  const priceCondition  = currentPrice <= dynamicBuyMax || emergencyCharge;
   const spreadCondition = spreadOk;
 
-  console.log(`[CHARGE] dynamicBuyMax=${dynamicBuyMax.toFixed(1)}c (forecastAvg6of10h=${forecastMinBuy.toFixed(1)}c×1.3, n=${avgWindowN}), peakFeedInToday=${peakFeedIn.toFixed(1)}c, spread=${spreadOk?'OK':'NO'}`);
+  console.log(`[CHARGE] dynamicBuyMax=${dynamicBuyMax.toFixed(1)}c (forecastAvg6of10h=${forecastMinBuy.toFixed(1)}c×1.3, n=${avgWindowN}), peakFeedInToday=${peakFeedIn.toFixed(1)}c, spread=${spreadOk?'OK':'NO'}${emergencyCharge?' 🚨EMERGENCY':''}${inTransitionWindow?' [transition 4x buffer]':''}`);
 
   if (cheapEntryOk && (priceCondition || spreadCondition)) {
     const entryCount = (state.chargeEntryCount || 0) + 1;
-      const condLabel  = priceCondition ? `buy=${currentPrice.toFixed(2)}c (<=${dynamicBuyMax.toFixed(1)}c dynamic)` : `spread: buy=${currentPrice.toFixed(2)}c + ${SPREAD_MIN}c <= peakFeedIn=${peakFeedIn.toFixed(2)}c`;
-    if (entryCount >= 3) {
+      const condLabel  = emergencyCharge ? `EMERGENCY buy=${currentPrice.toFixed(2)}c (deficit=${projectedDeficit.toFixed(1)}kWh)` : priceCondition ? `buy=${currentPrice.toFixed(2)}c (<=${dynamicBuyMax.toFixed(1)}c dynamic)` : `spread: buy=${currentPrice.toFixed(2)}c + ${SPREAD_MIN}c <= peakFeedIn=${peakFeedIn.toFixed(2)}c`;
+    if (entryCount >= requiredEntryCount || emergencyCharge) {
       targetMode = MODE.BACKUP;
       reason = `${condLabel} — cheap rate charging (SOC ${soc}% -> ${CHEAP_CHARGE_SOC}%, entryCount=${entryCount})`;
       state.chargeEntryCount = 0;
       return { targetMode, reason, alert };
     } else {
       state.chargeEntryCount = entryCount;
-      console.log(`[INFO] Charge entry buffer: ${condLabel} (count=${entryCount}/3) — waiting 2 more intervals`);
+      console.log(`[INFO] Charge entry buffer: ${condLabel} (count=${entryCount}/${requiredEntryCount}) — waiting more intervals`);
     }
   } else if (state.currentMode !== MODE.BACKUP) {
     // Neither condition met — reset entry counter
     state.chargeEntryCount = 0;
   }
   // Exit cheap-rate charging: SOC full or price rose above exit threshold (asymmetric)
-  // BUFFER: require 2 consecutive over-threshold readings before stopping
+  // BUFFER: require 3 or 4 consecutive over-threshold readings before stopping
   if (state.currentMode === MODE.BACKUP && (currentPrice >= CHEAP_EXIT_MIN || soc >= CHEAP_CHARGE_SOC)) {
     if (spotPrice > CHARGE_SPOT_MAX) {
       const overCount = (state.chargeExitCount || 0) + 1;
-      if (soc >= CHEAP_CHARGE_SOC || overCount >= 3) {
-        targetMode = MODE.SELF_USE;
-        reason = `cheap rate charging ended (buy=${currentPrice.toFixed(2)}c, SOC=${soc}%, target=${CHEAP_CHARGE_SOC}%, exitCount=${overCount})`;
-        state.chargeExitCount = 0;
-        return { targetMode, reason, alert };
+      if (soc >= CHEAP_CHARGE_SOC || overCount >= requiredExitCount) {
+        // Don't exit if emergency charge still needed
+        if (emergencyCharge && soc < CHEAP_CHARGE_SOC) {
+          console.log(`[INFO] Emergency charge active — suppressing exit despite price ${currentPrice.toFixed(1)}c`);
+          state.chargeExitCount = 0;
+        } else {
+          targetMode = MODE.SELF_USE;
+          reason = `cheap rate charging ended (buy=${currentPrice.toFixed(2)}c, SOC=${soc}%, target=${CHEAP_CHARGE_SOC}%, exitCount=${overCount})`;
+          state.chargeExitCount = 0;
+          return { targetMode, reason, alert };
+        }
       } else {
         state.chargeExitCount = overCount;
-        console.log(`[INFO] Charge exit buffer: buy=${currentPrice.toFixed(2)}c over exit threshold ${CHEAP_EXIT_MIN}c (count=${overCount}/3) — waiting 2 more intervals`);
+        console.log(`[INFO] Charge exit buffer: buy=${currentPrice.toFixed(2)}c over exit threshold ${CHEAP_EXIT_MIN}c (count=${overCount}/${requiredExitCount}) — waiting more intervals`);
       }
     }
   } else if (state.currentMode === MODE.BACKUP) {
@@ -1067,7 +1093,12 @@ function decide(ess, pvPower, amber, state, dailySummary) {
       return { targetMode, reason, alert };
     }
     // Don't enter selling after stop hour
-  } else if (feedInPrice >= effectiveSellMin && soc > socMinSell) {
+  } else if (emergencyCharge && state.currentMode === MODE.SELLING) {
+    // Emergency: battery will run out overnight — stop selling immediately, switch to charge
+    targetMode = MODE.BACKUP;
+    reason = `EMERGENCY stop selling — projected deficit ${projectedDeficit.toFixed(1)}kWh, switching to charge at ${currentPrice.toFixed(1)}c`;
+    return { targetMode, reason, alert };
+  } else if (feedInPrice >= effectiveSellMin && soc > socMinSell && !emergencyCharge) {
     const maxSellPower = INVERTER_MAX_DISCHARGE - (homeLoad ?? 0) - 0.3;
     if (maxSellPower > 0.2) {
       targetMode = MODE.SELLING;
