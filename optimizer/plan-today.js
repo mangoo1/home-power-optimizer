@@ -32,7 +32,7 @@ const MAX_DISCHARGE_KW = 5.0;
 const CHARGE_EFF       = 0.95;
 const DISCHARGE_EFF    = 0.95;
 const INTERVAL_H       = 5 / 60;
-const PANEL_KWP        = 13.2;
+const PANEL_KWP        = 4.3;  // actual system size (not inverter nameplate)
 const DEMAND_CHARGE_RATE = 0.6104;  // $/kW/day
 
 // Assumed home load profile (kW) by hour
@@ -60,9 +60,22 @@ function httpsGet(url, token) {
   });
 }
 
+function sydOffsetHours() {
+  const now = new Date();
+  const sydStr = now.toLocaleString('en-AU', { timeZone: 'Australia/Sydney', hour12: false });
+  const timePart = sydStr.split(', ')[1] || sydStr.split(' ')[1];
+  const h = parseInt(timePart.split(':')[0]);
+  const utcH = now.getUTCHours();
+  let offset = h - utcH;
+  if (offset < -12) offset += 24;
+  if (offset > 12)  offset -= 24;
+  return offset;
+}
+const SYD_OFFSET = sydOffsetHours();
+
 function sydHour(nemTimeStr) {
   const t = new Date(nemTimeStr);
-  return ((t.getUTCHours() + 11) % 24);
+  return ((t.getUTCHours() + SYD_OFFSET) % 24 + 24) % 24;
 }
 
 function sydHourLocal(isoLocal) {
@@ -71,7 +84,7 @@ function sydHourLocal(isoLocal) {
 
 function fmtTime(nemTimeStr) {
   const t = new Date(nemTimeStr);
-  const hh = (t.getUTCHours() + 11) % 24;
+  const hh = ((t.getUTCHours() + SYD_OFFSET) % 24 + 24) % 24;
   const mm = t.getUTCMinutes();
   return `${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}`;
 }
@@ -260,7 +273,8 @@ async function main() {
 
   // Solar forecast
   const forecast = JSON.parse(frow.forecast_json);
-  const today = '2026-04-01';
+  const todayDate = new Date();
+  const today = todayDate.toLocaleDateString('en-CA', { timeZone: 'Australia/Sydney' }); // YYYY-MM-DD
   const solarByHour = {};
   forecast.time.forEach((t, i) => {
     if (t.startsWith(today)) {
@@ -269,7 +283,7 @@ async function main() {
     }
   });
 
-  console.log('\n☀️  PV forecast (April 1, Sydney):');
+  console.log(`\n☀️  PV forecast (${today}, Sydney) — SYD UTC+${SYD_OFFSET}:`);
   for (let h = 6; h <= 19; h++) {
     const kw = solarByHour[h] || 0;
     const bar = '█'.repeat(Math.round(kw / 0.5));
@@ -299,7 +313,7 @@ async function main() {
 
   // ── Print Schedule ──────────────────────────────────────────────────────────
   console.log('\n╔═══════════════════════════════════════════════════════════════════════╗');
-  console.log(` LP OPTIMAL SCHEDULE — ${today}  (SOC ${currentSOC}% → target ${SOC_MAX*100}%)`);
+  console.log(` LP OPTIMAL SCHEDULE — ${today} (UTC+${SYD_OFFSET})  SOC ${currentSOC}% → target ${SOC_MAX*100}%`);
   console.log('╚═══════════════════════════════════════════════════════════════════════╝');
   console.log(' Time   Buy¢  Fdin¢  PV kW  Load  GridChg  SelfUse  GridExp  SOC%  Action');
   console.log('───────────────────────────────────────────────────────────────────────');
@@ -435,7 +449,7 @@ async function main() {
 
   // ── Today's Key Recommendations ────────────────────────────────────────────
   console.log('\n╔══════════════════════════════════════════════════════╗');
-  console.log(' 📋 TODAY\'S BATTERY STRATEGY (April 1)');
+  console.log(` 📋 TODAY'S BATTERY STRATEGY (${today})`);
   console.log('╚══════════════════════════════════════════════════════╝');
 
   const morningPrices = priceIntervals.filter(iv => { const h=sydHour(iv.nemTime); return h>=8&&h<15; });
@@ -444,17 +458,28 @@ async function main() {
   const maxBuyDW  = Math.max(...dwPrices.map(x => x.buy));
   const maxFeedDW = Math.max(...dwPrices.map(x => x.feedin||0));
 
-  console.log(`\n  1️⃣  MORNING (08:00–10:00): Grid cloudy (cloud 71–100%), PV minimal`);
+  const pvMornMax = Math.max(...[8,9,10,11,12,13,14].map(h => solarByHour[h]||0));
+  const pvMornLabel = pvMornMax >= 3 ? 'good' : pvMornMax >= 1.5 ? 'moderate/cloudy' : 'low/overcast';
+  console.log(`\n  1️⃣  MORNING (08:00–14:00): PV today is ${pvMornLabel} (peak ~${pvMornMax.toFixed(1)}kW)`);
   console.log(`     → SOC currently ${currentSOC}% — battery is below target`);
   if (cheapMorn.length > 0) {
     console.log(`     → ${cheapMorn.length} intervals with price < 12¢ available (down to ${Math.min(...cheapMorn.map(x=>x.buy)).toFixed(1)}¢)`);
     console.log(`     ✅ Consider grid top-up: charge 3–4 kW when price < 12¢`);
   }
 
-  console.log(`\n  2️⃣  MIDDAY (10:00–15:00): PV peaks 4–7.5kW, prices 6–10¢`);
-  console.log(`     → PV excess will charge battery naturally`);
-  console.log(`     → Battery should reach ~85% by 14:00 from PV alone`);
-  console.log(`     ✅ No grid charging needed — let PV do the work`);
+  const midPvPeak = Math.max(...[10,11,12,13,14].map(h=>solarByHour[h]||0));
+  const avgMornBuy = morningPrices.length ? (morningPrices.reduce((s,x)=>s+x.buy,0)/morningPrices.length).toFixed(1) : '?';
+  console.log(`\n  2️⃣  MIDDAY (10:00–15:00): PV peak ${midPvPeak.toFixed(1)}kW, avg price ${avgMornBuy}¢`);
+  const pvMidEst = [10,11,12,13,14].reduce((s,h)=>(solarByHour[h]||0)+s,0);
+  const socNeedKwh = Math.max(0, (SOC_MAX - currentSOC/100) * BATTERY_CAPACITY_KWH);
+  const pvSufficient = pvMidEst >= socNeedKwh * 0.8;
+  console.log(`     → Est. midday PV: ~${pvMidEst.toFixed(1)} kWh; need ~${socNeedKwh.toFixed(1)} kWh to reach ${SOC_MAX*100}%`);
+  if (pvSufficient) {
+    console.log(`     ✅ PV alone should get you close to target — grid top-up minimal`);
+  } else {
+    const deficit = (socNeedKwh - pvMidEst).toFixed(1);
+    console.log(`     ⚠️  PV deficit ~${deficit} kWh — grid top-up needed (charge when price < 10¢)`);
+  }
 
   console.log(`\n  3️⃣  DEMAND WINDOW (15:00–20:00): price up to ${maxBuyDW.toFixed(1)}¢, feedin ${maxFeedDW.toFixed(1)}¢`);
   console.log(`     → Battery supplies home load (est 1.5kW avg)`);
@@ -466,7 +491,11 @@ async function main() {
   console.log(`     → Battery at ~20–30% after DW discharge (LP predicts)`);
   console.log(`     ✅ Let battery coast until next morning`);
 
-  console.log(`\n  ☀️  SOLAR OUTLOOK: Good day — clear noon, peak 7.5kW at 13:00`);
+  const peakEntry2 = Object.entries(solarByHour).sort((a,b)=>b[1]-a[1])[0];
+  const peakKw2 = peakEntry2 ? +peakEntry2[1].toFixed(1) : 0;
+  const peakH2  = peakEntry2 ? peakEntry2[0] : '?';
+  const outlook2 = peakKw2 >= 3 ? 'Good' : peakKw2 >= 1.5 ? 'Moderate (cloudy)' : 'Poor (overcast)';
+  console.log(`\n  ☀️  SOLAR OUTLOOK: ${outlook2} — peak ${peakKw2}kW at ${peakH2}:00 (${PANEL_KWP}kWp system)`);
   console.log(`     Est. total generation: ${totalPvEst.toFixed(1)} kWh`);
 }
 
