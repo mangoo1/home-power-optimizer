@@ -324,24 +324,34 @@ async function setMode(mode) {
 }
 
 // ── Timed mode helpers (shared by buy and sell) ───────────────────────────────
-// Returns { aest, fmt2, startHHMM, startMinus1HHMM, endHHMM, clockStr, yesterday, tomorrow }
-function timedModeTimeContext() {
+// Returns { aest, fmt2, startHHMM, endHHMM, clockStr, yesterday, tomorrow }
+// endHHMM = demand window start - 5 min, or 21:00 if no DW today.
+// Using a fixed large window instead of rolling 10-min prevents charging from
+// dropping out between cron runs.
+function timedModeTimeContext(nextDemandMinutes) {
   const now = new Date();
-  const aest = new Date(now.getTime() + 11 * 3600 * 1000); // AEST = UTC+11
+  const aest = new Date(now.getTime() + 11 * 3600 * 1000); // UTC+11
   const fmt2 = n => String(n).padStart(2,'0');
 
-  // start = current time - 1 min (so window is already active)
+  // start = now - 1 min (window already active)
   const startDate = new Date(aest.getTime() - 1 * 60 * 1000);
   const startHHMM = fmt2(startDate.getUTCHours()) + fmt2(startDate.getUTCMinutes());
 
-  // end = current time + 10 min rolling window
-  const endDate = new Date(aest.getTime() + 10 * 60 * 1000);
+  // end = demand window start - 5 min buffer, or 21:00 if no DW
+  let endDate;
+  if (nextDemandMinutes != null && nextDemandMinutes > 15) {
+    // Convert nextDemandMinutes (from now in UTC) to AEST end time
+    const endUtc = new Date(now.getTime() + (nextDemandMinutes - 5) * 60 * 1000);
+    endDate = new Date(endUtc.getTime() + 11 * 3600 * 1000);
+  } else {
+    // No demand window today — charge until 21:00 AEST
+    endDate = new Date(aest);
+    endDate.setUTCHours(21, 0, 0, 0);
+    if (endDate <= aest) endDate.setUTCHours(23, 59, 0, 0); // past 21:00 → extend
+  }
   const endHHMM = fmt2(endDate.getUTCHours()) + fmt2(endDate.getUTCMinutes());
 
-  // AEST datetime string for clock sync: "YYYY-MM-DD HH:MM:SS"
   const clockStr = aest.toISOString().replace('T',' ').substring(0,19);
-
-  // Yesterday and tomorrow in AEST
   const fmtDate = d => d.toISOString().substring(0,10);
   const yesterday = fmtDate(new Date(aest.getTime() - 86400000));
   const tomorrow  = fmtDate(new Date(aest.getTime() + 86400000));
@@ -360,13 +370,13 @@ function timedModeTimeContext() {
 //   6. weekdays = all            (0xC0B4)
 //   7. startDate = yesterday     (0xC0B6)
 //   8. endDate = tomorrow        (0xC0B8)
-async function setTimedChargeDischarge({ mode, powerKw, tag }) {
+async function setTimedChargeDischarge({ mode, powerKw, tag, nextDemandMinutes }) {
   // mode: 'sell' | 'charge'
   // powerKw: number — for sell = discharge kW (0xC0BC), for charge = charge kW (0xC0BA)
   // tag: log prefix e.g. '[SELL]' or '[BUY]'
   if (!ESS_TOKEN) { console.log(`[SKIP] No ESS_TOKEN, would set ${tag} Timed mode`); return false; }
 
-  const { startHHMM, endHHMM, clockStr, yesterday, tomorrow } = timedModeTimeContext();
+  const { startHHMM, endHHMM, clockStr, yesterday, tomorrow } = timedModeTimeContext(nextDemandMinutes);
 
   console.log(`${tag} Setting Timed mode (${mode}): ${startHHMM}–${endHHMM} AEST, clock=${clockStr}, dates ${yesterday}–${tomorrow}, power=${powerKw}kW`);
 
@@ -409,8 +419,8 @@ async function setTimedChargeDischarge({ mode, powerKw, tag }) {
 }
 
 // Convenience wrappers
-async function setSellingMode() {
-  return setTimedChargeDischarge({ mode: 'sell', powerKw: 5, tag: '[SELL]' });
+async function setSellingMode(nextDemandMinutes) {
+  return setTimedChargeDischarge({ mode: 'sell', powerKw: 5, tag: '[SELL]', nextDemandMinutes });
 }
 
 // chargeGridKw: dynamic charge power calculation
@@ -431,14 +441,14 @@ function calcChargeKw(homeLoad, pvPower) {
   return parseFloat(chargeKw.toFixed(2));
 }
 
-async function setChargingMode(homeLoad, pvPower) {
+async function setChargingMode(homeLoad, pvPower, nextDemandMinutes) {
   const chargeKw = calcChargeKw(homeLoad, pvPower);
   if (chargeKw < MIN_CHARGE_KW) {
     console.log(`[BUY] chargeKw=${chargeKw.toFixed(2)}kW < ${MIN_CHARGE_KW}kW min — skipping charge`);
     return false;
   }
   console.log(`[BUY] chargeKw=${chargeKw.toFixed(2)}kW (homeLoad=${(homeLoad??0).toFixed(2)}kW, PV=${(pvPower??0).toFixed(2)}kW, gridTarget=${MAX_GRID_TARGET}kW)`);
-  return setTimedChargeDischarge({ mode: 'charge', powerKw: chargeKw, tag: '[BUY]' });
+  return setTimedChargeDischarge({ mode: 'charge', powerKw: chargeKw, tag: '[BUY]', nextDemandMinutes });
 }
 
 // Update rolling end time window for active Selling mode (called each cron run while selling).
@@ -472,7 +482,7 @@ async function getGridPower() {
 // For Charging mode (BACKUP), uses the Timed charge setup with dynamic power calc.
 // Also verifies grid is actually exporting (gridPower > 0) for Selling.
 // Returns true if mode was confirmed, false if all attempts failed.
-async function setModeWithVerify(targetMode, { homeLoad, pvPower } = {}) {
+async function setModeWithVerify(targetMode, { homeLoad, pvPower, nextDemandMinutes } = {}) {
   const label = MODE_LABEL[targetMode] ?? targetMode;
   const isTimed = targetMode === MODE.SELLING || targetMode === MODE.BACKUP;
   const maxAttempts = isTimed ? 2 : 5; // Timed setup: max 2 (multi-step × 2 costly); Self-use/others: up to 5
@@ -484,9 +494,9 @@ async function setModeWithVerify(targetMode, { homeLoad, pvPower } = {}) {
     // Use full Timed mode setup for Selling/Charging; simple setMode for others
     let ok;
     if (targetMode === MODE.SELLING) {
-      ok = await setSellingMode();
+      ok = await setSellingMode(nextDemandMinutes);
     } else if (targetMode === MODE.BACKUP) {
-      ok = await setChargingMode(homeLoad, pvPower);
+      ok = await setChargingMode(homeLoad, pvPower, nextDemandMinutes);
       if (!ok) {
         console.warn(`[WARN] Charging setup skipped or failed (attempt ${attempt}/${maxAttempts})`);
         if (attempt < maxAttempts) await new Promise(r => setTimeout(r, 3000));
@@ -1193,7 +1203,7 @@ async function main() {
   const modeFrom = state.currentMode;  // capture before any switch
   if (targetMode !== null && targetMode !== state.currentMode) {
     console.log(`[ACTION] ${MODE_LABEL[state.currentMode] ?? "unknown"} -> ${MODE_LABEL[targetMode]}: ${reason}`);
-    const ok = await setModeWithVerify(targetMode, { homeLoad: ess.homeLoad, pvPower });
+    const ok = await setModeWithVerify(targetMode, { homeLoad: ess.homeLoad, pvPower, nextDemandMinutes: amber.nextDemandMinutes });
     if (ok) {
       state.currentMode = targetMode;
       state.lastSwitchTime = now.toISOString();
@@ -1216,7 +1226,7 @@ async function main() {
     }
     // Already in Backup (charging) mode: roll the charge end time window forward (+10 min)
     if (state.currentMode === MODE.BACKUP) {
-      const { startHHMM, endHHMM } = timedModeTimeContext();
+      const { startHHMM, endHHMM } = timedModeTimeContext(amber.nextDemandMinutes);
       // Roll charge window
       const startOk = await setParam('0xC014', startHHMM);
       const endOk = await setParam('0xC016', endHHMM);
