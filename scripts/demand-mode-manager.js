@@ -919,21 +919,17 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   const spreadOk        = peakFeedIn > 0 && (currentPrice + SPREAD_MIN) <= peakFeedIn;
 
   // ── Emergency charge: predict if battery will run out before tomorrow morning ──
-  // More accurate segmented estimate:
-  //   19:00-23:00 → 1.0kW avg (evening use)
-  //   23:00-06:30 → 0.35kW avg (overnight standby)
-  //   Hot water at 06:30 → 10kWh
-  //   Reserve needed = 12% (morning floor, will recharge from PV/grid during day)
+  // Hot water heater runs on grid at low price — NOT from battery. Exclude from estimate.
+  // Battery only covers: evening home load + overnight standby + 12% morning reserve.
   const sydneyHourForCharge = (new Date().getUTCHours() + 11) % 24;
-  const HOT_WATER_KWH = 10;
-  const OVERNIGHT_RESERVE_PCT = 12; // morning floor — will top up during day
+  const OVERNIGHT_RESERVE_PCT = 12; // morning floor — will top up from PV/grid during day
   let estimatedConsumption = 0;
   if (sydneyHourForCharge >= 17 && sydneyHourForCharge < 23) {
     const eveHours = 23 - sydneyHourForCharge;
-    estimatedConsumption = eveHours * 1.0 + 7.5 * 0.35 + HOT_WATER_KWH; // eve + overnight(7.5h) + HW
+    estimatedConsumption = eveHours * 1.0 + 7.5 * 0.35; // eve (1kW) + overnight standby (0.35kW)
   } else if (sydneyHourForCharge >= 23 || sydneyHourForCharge < 6) {
     const nightHours = sydneyHourForCharge >= 23 ? (6.5 - (sydneyHourForCharge - 24)) : (6.5 - sydneyHourForCharge);
-    estimatedConsumption = Math.max(0, nightHours) * 0.35 + HOT_WATER_KWH;
+    estimatedConsumption = Math.max(0, nightHours) * 0.35;
   }
   const socKwh = (soc / 100) * 42;
   const reserveKwh = (OVERNIGHT_RESERVE_PCT / 100) * 42;
