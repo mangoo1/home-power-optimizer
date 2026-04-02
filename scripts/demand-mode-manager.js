@@ -1136,7 +1136,17 @@ async function main() {
   // Zero price + zero renewables + no nemTime = bad data. Skip decision to avoid false charging.
   const amberDataValid = general.length > 0 && (currentPrice !== 0 || renewables !== 0 || current.nemTime != null);
   if (!amberDataValid) {
-    console.error("[ERROR] Amber API returned invalid/zero data — skipping decision to avoid false mode switch");
+    console.error("[ERROR] Amber API returned invalid/zero data — applying safety fallback");
+    // Safety: if currently in Timed mode (selling or charging), fall back to Self-use
+    // Timed mode without price data is unsafe — could be selling at wrong price or charging at wrong time
+    const reportedMode = await getReportedMode();
+    if (reportedMode === MODE.TIMED || reportedMode === MODE.SELLING ||
+        state.currentMode === MODE.TIMED || state.currentMode === MODE.SELLING || state.currentMode === MODE.BACKUP) {
+      console.warn("[SAFETY] Amber data unavailable + active Timed/Selling/Backup mode — switching to Self-use");
+      await setModeWithVerify(MODE.SELF_USE, {});
+      state.currentMode = MODE.SELF_USE;
+      saveState(state);
+    }
     console.log(`[DONE]`);
     return;
   }
