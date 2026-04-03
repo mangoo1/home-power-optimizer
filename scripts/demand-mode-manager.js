@@ -1343,7 +1343,7 @@ async function main() {
       }
 
       // Mode verify: after a mode change, re-read reportedMode after 8s and retry if mismatch
-      if (decision && decision.targetMode !== undefined ? decision.targetMode !== modeFrom : targetMode !== modeFrom) {
+      if (targetMode !== modeFrom) {
         await new Promise(r => setTimeout(r, 8000));
         // re-fetch reportedMode
         const verifyEss = await getESSData().catch(() => null);
