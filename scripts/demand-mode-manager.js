@@ -1372,6 +1372,15 @@ async function main() {
   // Load today's summary first (used for avg buy price in sell decision)
   const state = loadState();
 
+  // ── Sync state.currentMode from reportedMode (handles manual inverter changes) ──
+  // If user manually switches inverter mode outside of this script, state.currentMode
+  // will be stale. Sync it so the decision engine sees the correct current mode.
+  if (ess.reportedMode !== null && ess.reportedMode !== undefined &&
+      state.currentMode !== null && ess.reportedMode !== state.currentMode) {
+    console.log(`[SYNC] reportedMode=${ess.reportedMode}(${MODE_LABEL[ess.reportedMode]??ess.reportedMode}) ≠ state=${state.currentMode}(${MODE_LABEL[state.currentMode]??state.currentMode}) — syncing state to reported`);
+    state.currentMode = ess.reportedMode;
+  }
+
   // ── Force mode override ───────────────────────────────────────────────────
   // If state.forceMode is set and forceModeUntil is in the future,
   // skip the decision engine and hold the forced mode.
