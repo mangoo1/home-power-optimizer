@@ -1116,6 +1116,10 @@ function decide(ess, pvPower, amber, state, dailySummary) {
         if (emergencyCharge && soc < CHEAP_CHARGE_SOC) {
           console.log(`[INFO] Emergency charge active — suppressing exit despite price ${currentPrice.toFixed(1)}c`);
           state.chargeExitCount = 0;
+        } else if (todayPlan && inPlanChargeWindow && !pastChargeCutoff && soc < CHEAP_CHARGE_SOC) {
+          // Plan says we're in a charge window — suppress dynamic threshold exit
+          console.log(`[INFO] Plan charge window active (${planSydHour}h in window) — suppressing exit despite price ${currentPrice.toFixed(1)}c > ${CHEAP_EXIT_MIN}c`);
+          state.chargeExitCount = 0;
         } else {
           targetMode = MODE.SELF_USE;
           reason = `cheap rate charging ended (buy=${currentPrice.toFixed(2)}c, SOC=${soc}%, target=${CHEAP_CHARGE_SOC}%, exitCount=${overCount})`;
