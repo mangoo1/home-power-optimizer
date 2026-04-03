@@ -77,6 +77,42 @@ function getDb() {
         buy_start REAL, buy_end REAL,
         sell_start REAL, sell_end REAL
       );
+      CREATE TABLE IF NOT EXISTS daily_plan (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        date TEXT NOT NULL,
+        version INTEGER NOT NULL DEFAULT 1,
+        generated_at TEXT NOT NULL,
+        source TEXT NOT NULL DEFAULT 'lp',
+        created_by TEXT,
+        soc_at_gen REAL,
+        has_demand_window INTEGER NOT NULL DEFAULT 0,
+        demand_window_start INTEGER,
+        demand_window_end INTEGER,
+        charge_cutoff_hour INTEGER NOT NULL DEFAULT 20,
+        pv_forecast_kwh REAL,
+        pv_peak_kw REAL,
+        charge_windows_json TEXT,
+        intervals_json TEXT,
+        notes TEXT,
+        is_active INTEGER NOT NULL DEFAULT 1,
+        UNIQUE(date, version)
+      );
+      CREATE TABLE IF NOT EXISTS plan_execution_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        plan_id INTEGER REFERENCES daily_plan(id),
+        plan_version INTEGER,
+        action TEXT NOT NULL,
+        reason TEXT,
+        soc REAL,
+        buy_price_c REAL,
+        pv_kw REAL,
+        home_load_kw REAL,
+        charge_kw REAL,
+        mode_from INTEGER,
+        mode_to INTEGER,
+        verify_ok INTEGER
+      );
     `);
   } catch (e) {
     console.warn("[DB] better-sqlite3 not available:", e.message);
@@ -187,17 +223,61 @@ function findValStr(items, index) {
 
 function loadTodayPlan() {
   try {
-    if (!fs.existsSync(TODAY_PLAN_PATH)) return null;
-    const plan = JSON.parse(fs.readFileSync(TODAY_PLAN_PATH, 'utf8'));
+    const db = getDb();
+    if (!db) return null;
     const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Australia/Sydney' });
-    if (plan.date !== today) {
-      console.log('[PLAN] today-plan.json is stale (date mismatch), falling back to dynamic threshold');
+    const row = db.prepare(
+      'SELECT * FROM daily_plan WHERE date=? AND is_active=1 ORDER BY version DESC LIMIT 1'
+    ).get(today);
+    if (!row) {
+      console.log('[PLAN] No active plan in DB for today, falling back to dynamic threshold');
       return null;
     }
+    const plan = {
+      date: row.date,
+      version: row.version,
+      source: row.source,
+      generatedAt: row.generated_at,
+      currentSoc: row.soc_at_gen,
+      hasDemandWindow: !!row.has_demand_window,
+      demandWindowStart: row.demand_window_start,
+      demandWindowEnd: row.demand_window_end,
+      chargeCutoffHour: row.charge_cutoff_hour,
+      pvForecastKwh: row.pv_forecast_kwh,
+      pvPeakKw: row.pv_peak_kw,
+      chargeWindows: JSON.parse(row.charge_windows_json || '[]'),
+      intervals: JSON.parse(row.intervals_json || '[]'),
+      notes: row.notes,
+    };
+    console.log(`[PLAN] Loaded v${row.version} from DB (source=${row.source}, date=${today}, hasDW=${plan.hasDemandWindow}, cutoff=${plan.chargeCutoffHour}, windows=${plan.chargeWindows.length})`);
     return plan;
   } catch(e) {
-    console.log('[PLAN] Failed to load today-plan.json:', e.message);
+    console.log('[PLAN] Failed to load plan from DB:', e.message);
     return null;
+  }
+}
+
+function savePlanOverride({ chargeWindows, chargeCutoffHour, hasDemandWindow, notes, createdBy }) {
+  try {
+    const db = getDb();
+    if (!db) return false;
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Australia/Sydney' });
+    db.prepare('UPDATE daily_plan SET is_active=0 WHERE date=? AND is_active=1').run(today);
+    const lastVer = db.prepare('SELECT MAX(version) as v FROM daily_plan WHERE date=?').get(today);
+    const newVersion = (lastVer?.v ?? 0) + 1;
+    const cur = db.prepare('SELECT soc_at_gen FROM daily_plan WHERE date=? ORDER BY version DESC LIMIT 1').get(today);
+    db.prepare(`
+      INSERT INTO daily_plan (date, version, generated_at, source, created_by, soc_at_gen,
+        has_demand_window, charge_cutoff_hour, charge_windows_json, notes, is_active)
+      VALUES (?,?,?,?,?,?,?,?,?,?,1)
+    `).run(today, newVersion, new Date().toISOString(), 'manual', createdBy || 'user',
+      cur?.soc_at_gen ?? null, hasDemandWindow ? 1 : 0, chargeCutoffHour ?? 20,
+      JSON.stringify(chargeWindows || []), notes || null);
+    console.log(`[PLAN] Saved manual override v${newVersion} to DB`);
+    return newVersion;
+  } catch(e) {
+    console.error('[PLAN] savePlanOverride failed:', e.message);
+    return false;
   }
 }
 
