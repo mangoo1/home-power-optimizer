@@ -15,6 +15,7 @@
 'use strict';
 
 const path    = require('path');
+const fs      = require('fs');
 const https   = require('https');
 const solver  = require('javascript-lp-solver');
 const Database = require('better-sqlite3');
@@ -497,6 +498,74 @@ async function main() {
   const outlook2 = peakKw2 >= 3 ? 'Good' : peakKw2 >= 1.5 ? 'Moderate (cloudy)' : 'Poor (overcast)';
   console.log(`\n  ☀️  SOLAR OUTLOOK: ${outlook2} — peak ${peakKw2}kW at ${peakH2}:00 (${PANEL_KWP}kWp system)`);
   console.log(`     Est. total generation: ${totalPvEst.toFixed(1)} kWh`);
+
+  // ── Write today-plan.json ──────────────────────────────────────────────────
+  const hasDemandWindow = priceIntervals.some(iv => iv.demandWindow === true);
+  const dwIntervals = priceIntervals.filter(iv => iv.demandWindow === true);
+  const demandWindowStart = dwIntervals.length > 0 ? sydHour(dwIntervals[0].nemTime) : null;
+  const demandWindowEnd   = dwIntervals.length > 0 ? sydHour(dwIntervals[dwIntervals.length - 1].nemTime) : null;
+  const chargeCutoffHour  = hasDemandWindow ? demandWindowStart : 20;
+
+  // chargeWindows: merge consecutive intervals with buyC <= 12 and not DW
+  const chargeWindows = [];
+  let cwStart = null, cwPrices = [], cwEnd = null;
+  priceIntervals.forEach(iv => {
+    const h = sydHour(iv.nemTime);
+    const inDW = iv.demandWindow === true;
+    if (!inDW && iv.buy <= 12) {
+      if (cwStart === null) { cwStart = h; }
+      cwEnd = h;
+      cwPrices.push(iv.buy);
+    } else {
+      if (cwStart !== null) {
+        chargeWindows.push({ startHour: cwStart, endHour: cwEnd, avgPriceC: parseFloat((cwPrices.reduce((s,v)=>s+v,0)/cwPrices.length).toFixed(2)) });
+        cwStart = null; cwPrices = []; cwEnd = null;
+      }
+    }
+  });
+  if (cwStart !== null) {
+    chargeWindows.push({ startHour: cwStart, endHour: cwEnd, avgPriceC: parseFloat((cwPrices.reduce((s,v)=>s+v,0)/cwPrices.length).toFixed(2)) });
+  }
+
+  // intervals from LP result
+  const planIntervals = priceIntervals.map((iv, i) => {
+    const gc = result[`gc${i}`] || 0;
+    const su = result[`su${i}`] || 0;
+    const ge = result[`ge${i}`] || 0;
+    const h = sydHour(iv.nemTime);
+    const action = gc > 0.005 ? 'charge' : ge > 0.005 ? 'sell' : su > 0.005 ? 'self-use' : 'idle';
+    return {
+      nemTime: iv.nemTime,
+      hour: h,
+      buyC: parseFloat((iv.buy || 0).toFixed(2)),
+      feedinC: parseFloat((iv.feedin || 0).toFixed(2)),
+      pvKw: parseFloat((pvMap[i] || 0).toFixed(3)),
+      action,
+      chargeKw: action === 'charge' ? parseFloat((gc / INTERVAL_H).toFixed(2)) : 0,
+      inDW: iv.demandWindow === true,
+    };
+  });
+
+  const peakEntry = Object.entries(solarByHour).sort((a,b)=>b[1]-a[1])[0];
+  const pvPeakKw = peakEntry ? parseFloat((+peakEntry[1]).toFixed(2)) : 0;
+
+  const todayPlan = {
+    date: today,
+    generatedAt: new Date().toISOString(),
+    currentSoc: currentSOC,
+    hasDemandWindow,
+    demandWindowStart,
+    demandWindowEnd,
+    chargeCutoffHour,
+    pvForecastKwh: parseFloat(totalPvEst.toFixed(2)),
+    pvPeakKw,
+    chargeWindows,
+    intervals: planIntervals,
+  };
+
+  const planPath = path.join(__dirname, '..', 'data', 'today-plan.json');
+  fs.writeFileSync(planPath, JSON.stringify(todayPlan, null, 2));
+  console.log('📁 Plan saved → data/today-plan.json');
 }
 
 main().catch(e => { console.error(e); process.exit(1); });

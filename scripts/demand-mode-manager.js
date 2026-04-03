@@ -1273,6 +1273,7 @@ async function main() {
   if (alert) console.log(`[ALERT] ${alert}`);
 
   let modeChanged = false;
+  let modeVerifyOk = null;
   const modeFrom = state.currentMode;  // capture before any switch
   if (targetMode !== null && targetMode !== state.currentMode) {
     console.log(`[ACTION] ${MODE_LABEL[state.currentMode] ?? "unknown"} -> ${MODE_LABEL[targetMode]}: ${reason}`);
@@ -1287,6 +1288,29 @@ async function main() {
         await createSellingCron();
       } else {
         await deleteSellingCron();
+      }
+
+      // Mode verify: after a mode change, re-read reportedMode after 8s and retry if mismatch
+      if (decision && decision.targetMode !== undefined ? decision.targetMode !== modeFrom : targetMode !== modeFrom) {
+        await new Promise(r => setTimeout(r, 8000));
+        // re-fetch reportedMode
+        const verifyEss = await getESSData().catch(() => null);
+        const verifiedMode = verifyEss?.reportedMode ?? null;
+        const verifyOk = verifiedMode === targetMode;
+        if (!verifyOk && verifiedMode !== null) {
+          console.log(`[MODE VERIFY] Mismatch: set=${targetMode} reported=${verifiedMode}, retrying...`);
+          await setMode(targetMode).catch(e => console.error('[MODE VERIFY] retry failed:', e));
+          await new Promise(r => setTimeout(r, 5000));
+          const verifyEss2 = await getESSData().catch(() => null);
+          const verifiedMode2 = verifyEss2?.reportedMode ?? null;
+          const verifyOk2 = verifiedMode2 === targetMode;
+          if (!verifyOk2) {
+            console.log(`⚠️ Mode verify FAILED after retry: set=${targetMode} reported=${verifiedMode2}`);
+          }
+          modeVerifyOk = verifyOk2 ? 1 : 0;
+        } else {
+          modeVerifyOk = verifyOk ? 1 : null;
+        }
       }
     } else {
       state.lastModeVerifyOk = false;
@@ -1390,7 +1414,7 @@ async function main() {
     // Timed mode charge/discharge power set this interval (null if not in charge/sell mode)
     chargeKw:    state.currentMode === MODE.BACKUP  ? calcChargeKw(ess.homeLoad, pvPower) : null,
     dischargeKw: state.currentMode === MODE.SELLING ? 5.0 : null,
-    mode_verify_ok: modeChanged ? (state.lastModeVerifyOk ? 1 : 0) : null,
+    mode_verify_ok: modeChanged ? (modeVerifyOk !== null ? modeVerifyOk : (state.lastModeVerifyOk ? 1 : 0)) : null,
     mode_from: modeChanged ? modeFrom : null,
     mode_to:   modeChanged ? state.currentMode : null,
     // Solar/weather data from Open-Meteo forecast (populated by solar-forecast.js cron at 07:00)
