@@ -529,11 +529,13 @@ const MAX_GRID_TARGET  = parseFloat(process.env.MAIN_BREAKER_KW ?? '7.7'); // kW
 const MAX_GRID_IMPORT_KW = MAX_GRID_TARGET - 0.2; // hard guard: refuse Backup if grid would exceed this (breaker - 0.2kW headroom)
 const MAX_CHARGE_KW    = 5.0;  // kW inverter max charge rate
 const MIN_CHARGE_KW    = 1.0;  // kW minimum worth charging (below this, skip)
+const CHARGE_SAFETY_BUFFER = 1.0; // kW safety headroom above house load — protects against hot water heater/appliance surge
+const HIGH_LOAD_ABORT_KW  = 3.5; // kW — if homeLoad exceeds this while charging, abort immediately (trip prevention)
 
 function calcChargeKw(homeLoad, pvPower) {
-  // Available grid headroom for charging = target - net house draw
+  // Available grid headroom for charging = target - net house draw - safety buffer
   const netHouseDraw = (homeLoad ?? 0) - (pvPower ?? 0);
-  const available = MAX_GRID_TARGET - netHouseDraw;
+  const available = MAX_GRID_TARGET - netHouseDraw - CHARGE_SAFETY_BUFFER;
   const chargeKw = Math.min(MAX_CHARGE_KW, Math.max(0, available));
   return parseFloat(chargeKw.toFixed(2));
 }
@@ -1468,6 +1470,17 @@ async function main() {
     }
     // Already in Backup (charging) mode: roll the charge end time window forward (+10 min)
     if (state.currentMode === MODE.BACKUP) {
+      // ── High load abort: stop charging immediately if homeLoad spikes ──────
+      // Protects against circuit breaker trip when hot water heater or large appliance starts
+      if (ess.homeLoad != null && ess.homeLoad >= HIGH_LOAD_ABORT_KW) {
+        console.log(`[BUY] ⚠️ HIGH LOAD ABORT: homeLoad=${ess.homeLoad.toFixed(2)}kW >= ${HIGH_LOAD_ABORT_KW}kW — stopping charge to prevent trip`);
+        await setMode(MODE.SELF_USE);
+        state.currentMode = MODE.SELF_USE;
+        state.lastSwitchReason = `high load abort: homeLoad=${ess.homeLoad.toFixed(2)}kW >= ${HIGH_LOAD_ABORT_KW}kW`;
+        saveState(state);
+        console.log(`[INFO] Switched to Self-use due to high load`);
+        return;
+      }
       const { startHHMM, endHHMM } = timedModeTimeContext(amber.nextDemandMinutes);
       // Roll charge window
       const startOk = await setParam('0xC014', startHHMM);
@@ -1480,9 +1493,14 @@ async function main() {
       const chargeKw = calcChargeKw(ess.homeLoad, pvPower);
       if (chargeKw >= MIN_CHARGE_KW) {
         const pwOk = await setParam('0xC0BA', chargeKw);
-        console.log(`[BUY] Updated charge power -> ${chargeKw.toFixed(2)}kW (homeLoad=${(ess.homeLoad??0).toFixed(2)}kW, PV=${(pvPower??0).toFixed(2)}kW) ${pwOk?'OK':'FAILED'}`);
+        console.log(`[BUY] Updated charge power -> ${chargeKw.toFixed(2)}kW (homeLoad=${(ess.homeLoad??0).toFixed(2)}kW, PV=${(pvPower??0).toFixed(2)}kW, buffer=${CHARGE_SAFETY_BUFFER}kW) ${pwOk?'OK':'FAILED'}`);
       } else {
-        console.log(`[BUY] chargeKw=${chargeKw.toFixed(2)}kW < ${MIN_CHARGE_KW}kW — keeping previous power setting`);
+        console.log(`[BUY] chargeKw=${chargeKw.toFixed(2)}kW < ${MIN_CHARGE_KW}kW — stopping charge (insufficient headroom)`);
+        await setMode(MODE.SELF_USE);
+        state.currentMode = MODE.SELF_USE;
+        state.lastSwitchReason = `insufficient headroom: chargeKw=${chargeKw.toFixed(2)}kW < ${MIN_CHARGE_KW}kW`;
+        saveState(state);
+        return;
       }
     }
     console.log(`[INFO] Mode: ${MODE_LABEL[state.currentMode] ?? "none"} (${reason})`);
