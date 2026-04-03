@@ -422,7 +422,8 @@ async function setMode(mode) {
 
 // ── Timed mode helpers (shared by buy and sell) ───────────────────────────────
 // Returns { aest, fmt2, startHHMM, endHHMM, clockStr, yesterday, tomorrow }
-// endHHMM = demand window start - 5 min, or 21:00 if no DW today.
+// endHHMM = demand window start - 5 min, or 18:00 if no DW today.
+// 18:00 default ensures charging always stops before any potential DW (15:00–20:00).
 // Using a fixed large window instead of rolling 10-min prevents charging from
 // dropping out between cron runs.
 function timedModeTimeContext(nextDemandMinutes) {
@@ -441,10 +442,10 @@ function timedModeTimeContext(nextDemandMinutes) {
     const endUtc = new Date(now.getTime() + (nextDemandMinutes - 5) * 60 * 1000);
     endDate = new Date(endUtc.getTime() + 11 * 3600 * 1000);
   } else {
-    // No demand window today — charge until 21:00 AEST
+    // No demand window today — charge until 18:00 AEST (safe buffer before any potential DW)
     endDate = new Date(aest);
-    endDate.setUTCHours(21, 0, 0, 0);
-    if (endDate <= aest) endDate.setUTCHours(23, 59, 0, 0); // past 21:00 → extend
+    endDate.setUTCHours(18, 0, 0, 0);
+    if (endDate <= aest) endDate.setUTCHours(23, 59, 0, 0); // past 18:00 → extend to end of day
   }
   const endHHMM = fmt2(endDate.getUTCHours()) + fmt2(endDate.getUTCMinutes());
 
