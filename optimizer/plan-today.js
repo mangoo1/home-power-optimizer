@@ -598,6 +598,7 @@ async function main() {
 
   db.close();
   console.log(`\n📁 Plan saved → energy.db daily_plan (date=${today}, version=${newVersion}, source=lp)`);
+  // Note: today-plan.json is no longer written. All plan data lives in energy.db (daily_plan table).
 }
 
 main().catch(e => { console.error(e); process.exit(1); });
