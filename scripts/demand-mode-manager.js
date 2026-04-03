@@ -84,6 +84,7 @@ function getDb() {
   return _db;
 }
 const DAILY_SUMMARY = path.join(DATA_DIR, "daily-summary.json");
+const TODAY_PLAN_PATH = path.join(DATA_DIR, 'today-plan.json');
 const STATE_FILE = "/tmp/demand-mode-state.json";
 
 // Inverter modes
@@ -182,6 +183,22 @@ function findValStr(items, index) {
   if (!items) return null;
   const item = Array.isArray(items) ? items.find(i => i.index === index) : items[index];
   return item?.valueStr != null ? parseFloat(item.valueStr) : null;
+}
+
+function loadTodayPlan() {
+  try {
+    if (!fs.existsSync(TODAY_PLAN_PATH)) return null;
+    const plan = JSON.parse(fs.readFileSync(TODAY_PLAN_PATH, 'utf8'));
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Australia/Sydney' });
+    if (plan.date !== today) {
+      console.log('[PLAN] today-plan.json is stale (date mismatch), falling back to dynamic threshold');
+      return null;
+    }
+    return plan;
+  } catch(e) {
+    console.log('[PLAN] Failed to load today-plan.json:', e.message);
+    return null;
+  }
 }
 
 async function getESSData() {
@@ -766,6 +783,20 @@ function updateDailySummary(record) {
 
 // ── Decision engine ───────────────────────────────────────────────────────────
 function decide(ess, pvPower, amber, state, dailySummary) {
+  // Load today's LP plan (primary charge strategy)
+  const todayPlan = loadTodayPlan();
+  const planSydHour = (new Date().getUTCHours() + 11) % 24;
+
+  // Is current hour within a plan charge window?
+  const inPlanChargeWindow = todayPlan?.chargeWindows?.some(w =>
+    planSydHour >= w.startHour && planSydHour < w.endHour
+  ) ?? false;
+
+  // Is current hour past plan's charge cutoff?
+  const pastChargeCutoff = todayPlan ? planSydHour >= todayPlan.chargeCutoffHour : false;
+
+  console.log(`[PLAN] plan=${todayPlan ? 'loaded' : 'none'} inWindow=${inPlanChargeWindow} pastCutoff=${pastChargeCutoff} hour=${planSydHour}`);
+
   const { soc, homeLoad, gridPower, battPower } = ess;
   const { currentDemand, currentPrice, feedInPrice, spotPrice, nextDemandMinutes, descriptor, peakFeedInForecast, forecastGeneral, forecastFeedIn } = amber;
   const forecast = forecastGeneral ?? [];
@@ -812,7 +843,8 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   // On non-demand days (weekends/holidays) nextDemandMinutes is null → this branch is skipped.
   // If SOC >= 60%, the battery is sufficient; let normal price rules apply.
   const PRE_DW_CHARGE_SOC = 60; // % minimum SOC threshold for forced pre-DW charging
-  if (!currentDemand && nextDemandMinutes != null && nextDemandMinutes <= 60 && nextDemandMinutes > 10 && soc < PRE_DW_CHARGE_SOC && gridHeadroomOk) {
+  const hasDWToday = todayPlan ? todayPlan.hasDemandWindow : (nextDemandMinutes != null);
+  if (hasDWToday && !currentDemand && nextDemandMinutes != null && nextDemandMinutes <= 60 && nextDemandMinutes > 10 && soc < PRE_DW_CHARGE_SOC && gridHeadroomOk) {
     targetMode = MODE.BACKUP;
     reason = `demand window in ${nextDemandMinutes.toFixed(0)} min — force charging (SOC ${soc}% < ${PRE_DW_CHARGE_SOC}%)`;
     return { targetMode, reason, alert };
@@ -953,12 +985,25 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   const requiredExitCount  = inTransitionWindow ? 4 : 3;
 
   const cheapEntryOk    = gridHeadroomOk && !currentDemand && soc < CHEAP_CHARGE_SOC && state.currentMode !== MODE.BACKUP;
+
+  // Primary: LP plan says this is a charge window
+  const planSaysCharge = inPlanChargeWindow && !pastChargeCutoff;
+
+  // Secondary: dynamic threshold (original logic, now fallback)
   const priceCondition  = currentPrice <= dynamicBuyMax || emergencyCharge;
   const spreadCondition = spreadOk;
 
+  // Plan overrides: if plan exists and says DON'T charge (past cutoff), suppress dynamic threshold
+  // If plan exists and says DO charge, use plan as primary condition
+  const chargeCondition = todayPlan
+    ? (planSaysCharge || emergencyCharge)                    // plan mode: use plan + allow emergency
+    : (priceCondition || spreadCondition);                   // fallback: original dynamic threshold
+
+  console.log(`[PLAN] planSaysCharge=${planSaysCharge} priceCondition=${priceCondition} final=${chargeCondition} (plan=${todayPlan?'active':'fallback'})`);
+
   console.log(`[CHARGE] dynamicBuyMax=${dynamicBuyMax.toFixed(1)}c (forecastAvg6of10h=${forecastMinBuy.toFixed(1)}c×1.3, n=${avgWindowN}), peakFeedInToday=${peakFeedIn.toFixed(1)}c, spread=${spreadOk?'OK':'NO'}${emergencyCharge?' 🚨EMERGENCY':''}${inTransitionWindow?' [transition 4x buffer]':''}`);
 
-  if (cheapEntryOk && (priceCondition || spreadCondition)) {
+  if (cheapEntryOk && chargeCondition) {
     const entryCount = (state.chargeEntryCount || 0) + 1;
       const condLabel  = emergencyCharge ? `EMERGENCY buy=${currentPrice.toFixed(2)}c (deficit=${projectedDeficit.toFixed(1)}kWh)` : priceCondition ? `buy=${currentPrice.toFixed(2)}c (<=${dynamicBuyMax.toFixed(1)}c dynamic)` : `spread: buy=${currentPrice.toFixed(2)}c + ${SPREAD_MIN}c <= peakFeedIn=${peakFeedIn.toFixed(2)}c`;
     if (entryCount >= requiredEntryCount || emergencyCharge) {
@@ -976,6 +1021,13 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   }
   // Exit cheap-rate charging: SOC full or price rose above exit threshold (asymmetric)
   // BUFFER: require 3 or 4 consecutive over-threshold readings before stopping
+  // Plan-based forced exit: if plan says past cutoff, stop charging
+  if (state.currentMode === MODE.BACKUP && todayPlan && pastChargeCutoff && !emergencyCharge) {
+    targetMode = MODE.SELF_USE;
+    reason = `plan chargeCutoffHour=${todayPlan.chargeCutoffHour} reached (hour=${planSydHour}) — stop charging`;
+    state.chargeExitCount = 0;
+    return { targetMode, reason, alert };
+  }
   if (state.currentMode === MODE.BACKUP && (currentPrice >= CHEAP_EXIT_MIN || soc >= CHEAP_CHARGE_SOC)) {
     if (spotPrice > CHARGE_SPOT_MAX) {
       const overCount = (state.chargeExitCount || 0) + 1;
