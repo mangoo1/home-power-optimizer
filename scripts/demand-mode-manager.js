@@ -1595,7 +1595,7 @@ async function main() {
   // ── Interval cost accounting ──────────────────────────────────────────────
   // gridPower: negative=import(buy), positive=export(sell)
   // intervalHours: 5-min cron=5/60, mode_change=5/60, scheduled(:00/:30)=0.5h
-  const intervalHours = (trigger === 'scheduled') ? 0.5 : (5/60);
+  const intervalHours = (record.recordTrigger === 'scheduled') ? 0.5 : (5/60);
   const intervalImportKwh = ess.gridPower != null && ess.gridPower < 0 ? Math.abs(ess.gridPower) * intervalHours : 0;
   const intervalExportKwh = ess.gridPower != null && ess.gridPower > 0 ? ess.gridPower * intervalHours : 0;
   // Prefer meter_delta for cost if available (more accurate); fall back to power×interval
