@@ -530,7 +530,7 @@ async function setTimedChargeDischarge({ mode, powerKw, tag, nextDemandMinutes }
 
 // Convenience wrappers
 async function setSellingMode(nextDemandMinutes, powerKw = 5) {
-  const clampedPower = Math.min(5, Math.max(0.5, powerKw));
+  const clampedPower = Math.min(5, Math.max(0, powerKw));
   console.log(`[SELL] discharge power=${clampedPower.toFixed(2)}kW (requested=${powerKw.toFixed(2)}kW)`);
   return setTimedChargeDischarge({ mode: 'sell', powerKw: clampedPower, tag: '[SELL]', nextDemandMinutes });
 }
@@ -1267,7 +1267,7 @@ function decide(ess, pvPower, amber, state, dailySummary) {
     return { targetMode, reason, alert };
   } else if (feedInPrice >= effectiveSellMin && soc > socMinSell && !emergencyCharge) {
     const maxSellPower = INVERTER_MAX_DISCHARGE - (homeLoad ?? 0) - 0.3;
-    if (maxSellPower > 0.2) {
+    if (maxSellPower > 0) {
       targetMode = MODE.SELLING;
       reason = `feedIn=${feedInPrice.toFixed(1)}c (>=${effectiveSellMin.toFixed(1)}c, ${sellMinLabel}), SOC ${soc}% (>${socMinSell}% ${sydneyHourNow < SOC_MIN_SELL_CUTOFF_HOUR ? "morning" : "afternoon"}), headroom ${maxSellPower.toFixed(1)}kW`;
       alert = { ...alert, sellPowerKw: parseFloat(maxSellPower.toFixed(2)) };
