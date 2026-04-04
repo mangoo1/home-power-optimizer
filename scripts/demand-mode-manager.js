@@ -961,14 +961,22 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   const availableChargeKw = MAX_GRID_TARGET - netHouseDraw;
   const gridHeadroomOk = (homeLoad == null) || availableChargeKw >= MIN_CHARGE_KW;
   if (!gridHeadroomOk) {
-    // No headroom for charging — stay/go Self-use, let inverter manage house load naturally.
-    // Do NOT use Backup with fake 0.1kW: that causes instability on this inverter.
-    if (state.currentMode === MODE.BACKUP) {
-      targetMode = MODE.SELF_USE;
-      reason = `no grid headroom: homeLoad=${homeLoadVal.toFixed(2)}kW PV=${pvPowerVal.toFixed(2)}kW → Self-use`;
+    // No headroom for charging — but if we're in a cheap-price charging window,
+    // use Timed discharge to balance the breaker (supply the excess homeLoad from battery)
+    // dischargeKw = netHouseDraw - BREAKER (just enough to keep grid under limit)
+    const breakerBalanceKw = parseFloat(Math.min(INVERTER_MAX_DISCHARGE, Math.max(0, netHouseDraw - MAX_GRID_TARGET)).toFixed(2));
+    if (breakerBalanceKw > 0) {
+      targetMode = MODE.SELLING; // Timed mode, discharge only (no sell window needed — just balance)
+      reason = `no charge headroom: homeLoad=${homeLoadVal.toFixed(2)}kW netDraw=${netHouseDraw.toFixed(2)}kW > breaker=${MAX_GRID_TARGET}kW — Timed discharge ${breakerBalanceKw.toFixed(2)}kW to balance`;
+      alert = { ...alert, sellPowerKw: breakerBalanceKw };
       return { targetMode, reason, alert };
     }
-    // Not in Backup — skip all charging branches, fall through to sell/self-use logic
+    // netHouseDraw <= BREAKER but still < MIN_CHARGE_KW headroom — Self-use is fine
+    if (state.currentMode === MODE.BACKUP) {
+      targetMode = MODE.SELF_USE;
+      reason = `no charge headroom: homeLoad=${homeLoadVal.toFixed(2)}kW PV=${pvPowerVal.toFixed(2)}kW → Self-use`;
+      return { targetMode, reason, alert };
+    }
   }
 
   // ── Priority 3: Free/negative-price charging (spot <= 0) ─────────────────
@@ -1267,11 +1275,26 @@ function decide(ess, pvPower, amber, state, dailySummary) {
     reason = `EMERGENCY stop selling — projected deficit ${projectedDeficit.toFixed(1)}kWh, switching to charge at ${currentPrice.toFixed(1)}c`;
     return { targetMode, reason, alert };
   } else if (feedInPrice >= effectiveSellMin && soc > socMinSell && !emergencyCharge) {
-    const maxSellPower = INVERTER_MAX_DISCHARGE - (homeLoad ?? 0) - 0.3;
+    // Max sell power = inverter cap minus home load (no buffer — user confirmed)
+    const maxSellPower = Math.min(INVERTER_MAX_DISCHARGE, INVERTER_MAX_DISCHARGE - (homeLoad ?? 0));
     if (maxSellPower > 0) {
-      targetMode = MODE.SELLING;
-      reason = `feedIn=${feedInPrice.toFixed(1)}c (>=${effectiveSellMin.toFixed(1)}c, ${sellMinLabel}), SOC ${soc}% (>${socMinSell}% ${sydneyHourNow < SOC_MIN_SELL_CUTOFF_HOUR ? "morning" : "afternoon"}), headroom ${maxSellPower.toFixed(1)}kW`;
-      alert = { ...alert, sellPowerKw: parseFloat(maxSellPower.toFixed(2)) };
+      // If projected deficit tonight, scale down sell power proportionally to preserve battery
+      let sellPower = maxSellPower;
+      if (projectedDeficit > 0) {
+        // Reduce sell power so we don't drain below what's needed tonight
+        // Scale: sellPower = maxSellPower * (socKwh - reserveKwh - estimatedConsumption) / socKwh
+        // Simpler: reduce proportionally to how tight the deficit is (cap at maxSellPower)
+        const safeDischargeKwh = socKwh - reserveKwh - estimatedConsumption;
+        const safeRatio = Math.max(0, safeDischargeKwh / Math.max(socKwh, 1));
+        sellPower = parseFloat(Math.max(0.1, maxSellPower * safeRatio).toFixed(2));
+      }
+      if (sellPower > 0) {
+        targetMode = MODE.SELLING;
+        reason = `feedIn=${feedInPrice.toFixed(1)}c (>=${effectiveSellMin.toFixed(1)}c, ${sellMinLabel}), SOC ${soc}% (>${socMinSell}%${projectedDeficit > 0 ? `, deficit=${projectedDeficit.toFixed(1)}kWh → reduced power` : ''}), sellPower=${sellPower.toFixed(2)}kW`;
+        alert = { ...alert, sellPowerKw: sellPower };
+      } else {
+        reason = `feedIn high but deficit=${projectedDeficit.toFixed(1)}kWh — not enough battery for tonight, skip selling`;
+      }
     } else {
       reason = `feedIn high but home load ${homeLoad?.toFixed(1)}kW saturates inverter — no selling (${sellMinLabel})`;
     }
