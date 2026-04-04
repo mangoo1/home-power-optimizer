@@ -1061,131 +1061,115 @@ function decide(ess, pvPower, amber, state, dailySummary) {
     console.log(`[CHARGE] ⚠️ Emergency: deficit=${projectedDeficit.toFixed(1)}kWh (consume=${estimatedConsumption.toFixed(1)}kWh + reserve=${reserveKwh.toFixed(1)}kWh - have=${socKwh.toFixed(1)}kWh) — charging at ${currentPrice.toFixed(1)}c`);
   }
 
-  // Buffer count: use 4 readings (~20 min) during price transition window (14:00–16:00 Sydney)
-  // to avoid thrashing at the cheap→peak price crossover point
-  const inTransitionWindow = sydneyHourForCharge >= 14 && sydneyHourForCharge < 16;
-  const requiredEntryCount = inTransitionWindow ? 4 : 3;
-  const requiredExitCount  = inTransitionWindow ? 4 : 3;
+  const cheapEntryOk = gridHeadroomOk && !currentDemand && soc < CHEAP_CHARGE_SOC && state.currentMode !== MODE.BACKUP;
 
-  const cheapEntryOk    = gridHeadroomOk && !currentDemand && soc < CHEAP_CHARGE_SOC && state.currentMode !== MODE.BACKUP;
-
-  // Primary: LP plan says this is a charge window
+  // ── Plan-driven charge decision ────────────────────────────────────────────
+  // Step 1: plan's charge_windows defines WHEN to charge (no price buffer needed)
+  // Step 2: cron only handles HOW MUCH power (dynamic, based on homeLoad/PV)
+  // Emergency charge bypasses window check when SOC is critically low.
   const planSaysCharge = inPlanChargeWindow && !pastChargeCutoff;
-
-  // Secondary: dynamic threshold (original logic, now fallback)
-  const priceCondition  = currentPrice <= dynamicBuyMax || emergencyCharge;
-  const spreadCondition = spreadOk;
-
-  // Plan overrides: if plan exists and says DON'T charge (past cutoff), suppress dynamic threshold
-  // If plan exists and says DO charge, use plan as primary condition
   const chargeCondition = todayPlan
-    ? (planSaysCharge || emergencyCharge)                    // plan mode: use plan + allow emergency
-    : (priceCondition || spreadCondition);                   // fallback: original dynamic threshold
+    ? (planSaysCharge || emergencyCharge)   // plan mode: window-driven
+    : (currentPrice <= dynamicBuyMax || emergencyCharge); // no plan: fallback price threshold
 
-  console.log(`[PLAN] planSaysCharge=${planSaysCharge} priceCondition=${priceCondition} final=${chargeCondition} (plan=${todayPlan?'active':'fallback'})`);
-
-  console.log(`[CHARGE] dynamicBuyMax=${dynamicBuyMax.toFixed(1)}c (forecastAvg6of10h=${forecastMinBuy.toFixed(1)}c×1.3, n=${avgWindowN}), peakFeedInToday=${peakFeedIn.toFixed(1)}c, spread=${spreadOk?'OK':'NO'}${emergencyCharge?' 🚨EMERGENCY':''}${inTransitionWindow?' [transition 4x buffer]':''}`);
+  console.log(`[PLAN] planSaysCharge=${planSaysCharge} inWindow=${inPlanChargeWindow} pastCutoff=${pastChargeCutoff} final=${chargeCondition} (plan=${todayPlan ? 'active' : 'fallback'}) price=${currentPrice.toFixed(1)}c`);
 
   if (cheapEntryOk && chargeCondition) {
-    const entryCount = (state.chargeEntryCount || 0) + 1;
-      const condLabel  = emergencyCharge ? `EMERGENCY buy=${currentPrice.toFixed(2)}c (deficit=${projectedDeficit.toFixed(1)}kWh)` : priceCondition ? `buy=${currentPrice.toFixed(2)}c (<=${dynamicBuyMax.toFixed(1)}c dynamic)` : `spread: buy=${currentPrice.toFixed(2)}c + ${SPREAD_MIN}c <= peakFeedIn=${peakFeedIn.toFixed(2)}c`;
-    if (entryCount >= requiredEntryCount || emergencyCharge) {
+    // Plan mode: no entry buffer — act immediately on window signal
+    // Fallback (no plan): keep 1-interval confirmation to avoid single-spike noise
+    const entryCount = todayPlan ? 3 : (state.chargeEntryCount || 0) + 1;
+    const condLabel = emergencyCharge
+      ? `EMERGENCY SOC=${soc}% deficit=${projectedDeficit.toFixed(1)}kWh`
+      : planSaysCharge
+        ? `plan window ${inPlanChargeWindow ? 'active' : '?'} buy=${currentPrice.toFixed(1)}c`
+        : `buy=${currentPrice.toFixed(1)}c (<=${dynamicBuyMax.toFixed(1)}c fallback)`;
+    if (entryCount >= 3 || emergencyCharge) {
       targetMode = MODE.BACKUP;
-      reason = `${condLabel} — cheap rate charging (SOC ${soc}% -> ${CHEAP_CHARGE_SOC}%, entryCount=${entryCount})`;
+      reason = `${condLabel} — charging (SOC ${soc}% → ${CHEAP_CHARGE_SOC}%)`;
       state.chargeEntryCount = 0;
       return { targetMode, reason, alert };
     } else {
       state.chargeEntryCount = entryCount;
-      console.log(`[INFO] Charge entry buffer: ${condLabel} (count=${entryCount}/${requiredEntryCount}) — waiting more intervals`);
+      console.log(`[INFO] Charge entry buffer (fallback): ${condLabel} (count=${entryCount}/3)`);
     }
   } else if (state.currentMode !== MODE.BACKUP) {
-    // Neither condition met — reset entry counter
     state.chargeEntryCount = 0;
   }
-  // Exit cheap-rate charging: SOC full or price rose above exit threshold (asymmetric)
-  // BUFFER: require 3 or 4 consecutive over-threshold readings before stopping
-  // Plan-based forced exit: if plan says past cutoff, stop charging
-  if (state.currentMode === MODE.BACKUP && todayPlan && pastChargeCutoff && !emergencyCharge) {
-    targetMode = MODE.SELF_USE;
-    reason = `plan chargeCutoffHour=${todayPlan.chargeCutoffHour} reached (hour=${planSydHour}) — stop charging`;
-    state.chargeExitCount = 0;
-    return { targetMode, reason, alert };
-  }
-  if (state.currentMode === MODE.BACKUP && (currentPrice >= CHEAP_EXIT_MIN || soc >= CHEAP_CHARGE_SOC)) {
-    if (spotPrice > CHARGE_SPOT_MAX) {
+
+  // Exit charging: plan window ended, SOC full, or cutoff reached
+  if (state.currentMode === MODE.BACKUP && !emergencyCharge) {
+    const windowEnded = todayPlan && !inPlanChargeWindow;
+    const cutoffHit   = todayPlan && pastChargeCutoff;
+    const socFull     = soc >= CHEAP_CHARGE_SOC;
+
+    if (cutoffHit) {
+      targetMode = MODE.SELF_USE;
+      reason = `plan cutoff hour=${todayPlan.chargeCutoffHour} reached — stop charging (SOC ${soc}%)`;
+      state.chargeExitCount = 0;
+      return { targetMode, reason, alert };
+    }
+    if (socFull) {
+      targetMode = MODE.SELF_USE;
+      reason = `SOC target ${CHEAP_CHARGE_SOC}% reached (SOC ${soc}%) — stop charging`;
+      state.chargeExitCount = 0;
+      return { targetMode, reason, alert };
+    }
+    if (windowEnded) {
+      // Plan window closed — exit immediately (no buffer needed, plan is authoritative)
+      targetMode = MODE.SELF_USE;
+      reason = `plan charge window ended (hour=${planSydHour}, buy=${currentPrice.toFixed(1)}c) — stop charging`;
+      state.chargeExitCount = 0;
+      return { targetMode, reason, alert };
+    }
+    // No plan: keep a 3-interval exit buffer to avoid thrashing
+    if (!todayPlan && currentPrice > dynamicBuyMax) {
       const overCount = (state.chargeExitCount || 0) + 1;
-      if (soc >= CHEAP_CHARGE_SOC || overCount >= requiredExitCount) {
-        // Don't exit if emergency charge still needed
-        if (emergencyCharge && soc < CHEAP_CHARGE_SOC) {
-          console.log(`[INFO] Emergency charge active — suppressing exit despite price ${currentPrice.toFixed(1)}c`);
-          state.chargeExitCount = 0;
-        } else if (todayPlan && inPlanChargeWindow && !pastChargeCutoff && soc < CHEAP_CHARGE_SOC) {
-          // Plan says we're in a charge window — suppress dynamic threshold exit
-          console.log(`[INFO] Plan charge window active (${planSydHour}h in window) — suppressing exit despite price ${currentPrice.toFixed(1)}c > ${CHEAP_EXIT_MIN}c`);
-          state.chargeExitCount = 0;
-        } else {
-          targetMode = MODE.SELF_USE;
-          reason = `cheap rate charging ended (buy=${currentPrice.toFixed(2)}c, SOC=${soc}%, target=${CHEAP_CHARGE_SOC}%, exitCount=${overCount})`;
-          state.chargeExitCount = 0;
-          return { targetMode, reason, alert };
-        }
+      if (overCount >= 3) {
+        targetMode = MODE.SELF_USE;
+        reason = `price ${currentPrice.toFixed(1)}c > ${dynamicBuyMax.toFixed(1)}c (fallback exit, count=${overCount})`;
+        state.chargeExitCount = 0;
+        return { targetMode, reason, alert };
       } else {
         state.chargeExitCount = overCount;
-        console.log(`[INFO] Charge exit buffer: buy=${currentPrice.toFixed(2)}c over exit threshold ${CHEAP_EXIT_MIN}c (count=${overCount}/${requiredExitCount}) — waiting more intervals`);
+        console.log(`[INFO] Fallback exit buffer: ${currentPrice.toFixed(1)}c > ${dynamicBuyMax.toFixed(1)}c (count=${overCount}/3)`);
       }
+    } else {
+      state.chargeExitCount = 0;
     }
-  } else if (state.currentMode === MODE.BACKUP) {
-    // Price back below exit threshold — reset exit counter
-    state.chargeExitCount = 0;
-  }
+  } // end exit-charging block
 
-  // ── Priority 4b: extremelyLow descriptor charging (buy < 10c) ─────────────
-  // When Amber rates the price as extremelyLow, allow charging up to 10c/kWh.
-  // Priorities 1/2/2.5 guarantee we are outside the demand window here.
-  // ENTRY BUFFER: require 2 consecutive readings before starting
-  const EXTREMELY_LOW_MAX = 10; // c/kWh — relaxed ceiling for extremelyLow periods
+  // ── extremelyLow opportunistic charging (no plan / outside window) ─────────
+  // Only fires when no plan active OR plan says idle but price is extremely cheap.
+  // Uses 2-interval buffer to avoid single-spike noise.
+  const EXTREMELY_LOW_MAX = 10; // c/kWh
   if (gridHeadroomOk && !currentDemand && descriptor === 'extremelyLow' && currentPrice < EXTREMELY_LOW_MAX && soc < SOC_MAX_CHARGE && state.currentMode !== MODE.BACKUP) {
     const elEntryCount = (state.extremelyLowEntryCount || 0) + 1;
-    if (elEntryCount >= 3) {
+    if (elEntryCount >= 2) {
       targetMode = MODE.BACKUP;
-      reason = `descriptor=extremelyLow, buy=${currentPrice.toFixed(2)}c (<${EXTREMELY_LOW_MAX}c) — charging (SOC ${soc}% -> ${SOC_MAX_CHARGE}%, entryCount=${elEntryCount})`;
+      reason = `extremelyLow buy=${currentPrice.toFixed(1)}c — opportunistic charge (SOC ${soc}%)`;
       state.extremelyLowEntryCount = 0;
       return { targetMode, reason, alert };
     } else {
       state.extremelyLowEntryCount = elEntryCount;
-      console.log(`[INFO] ExtremeLow entry buffer: buy=${currentPrice.toFixed(2)}c below threshold (count=${elEntryCount}/3) — waiting 2 more intervals`);
+      console.log(`[INFO] ExtremeLow entry buffer: ${currentPrice.toFixed(1)}c (count=${elEntryCount}/2)`);
     }
   } else if (state.currentMode !== MODE.BACKUP) {
-    // Not eligible — reset entry counter
     state.extremelyLowEntryCount = 0;
   }
-  // Exit extremelyLow charging.
-  // Fix 1: use a dedicated counter (elExitCount) — avoids interference with chargeExitCount from
-  //         the cheap-rate exit block above, which was resetting the counter on every price dip.
-  // Fix 2: remove `descriptor === 'extremelyLow'` guard — once we are in Backup via this path,
-  //         exit must fire regardless of current descriptor (Amber can hold the label while price rises).
-  // Fix 3 (fallback): also exit immediately if price > dynamicBuyMax regardless of how we entered Backup.
-  // Fix 4: use dynamicBuyMax as the exit threshold instead of the hardcoded EXTREMELY_LOW_MAX (10c).
-  //         EXTREMELY_LOW_MAX was too aggressive — it fires at 10c even when dynamicBuyMax allows 13c+.
-  //         Exit condition: price > dynamicBuyMax (the same ceiling used for entry).
-  // Fix 5: EMERGENCY charge suppresses this exit — when deficit is critical we must not stop charging
-  //         even if the price is above dynamicBuyMax.
   if (state.currentMode === MODE.BACKUP && !emergencyCharge) {
-    const elExitTriggered = currentPrice > dynamicBuyMax || soc >= SOC_MAX_CHARGE;
-    const fallbackExit    = false;  // elExitTriggered now covers this case via dynamicBuyMax check
-    if (elExitTriggered) {
+    if (currentPrice > dynamicBuyMax || soc >= SOC_MAX_CHARGE) {
       const overCount = (state.elExitCount || 0) + 1;
       if (soc >= SOC_MAX_CHARGE || overCount >= 3) {
         targetMode = MODE.SELF_USE;
-        reason = `extremelyLow charging ended (buy=${currentPrice.toFixed(2)}c, dynamicBuyMax=${dynamicBuyMax.toFixed(1)}c, SOC=${soc}%, exitCount=${overCount})`;
+        reason = `extremelyLow ended buy=${currentPrice.toFixed(1)}c dynamicMax=${dynamicBuyMax.toFixed(1)}c SOC=${soc}%`;
         state.elExitCount = 0;
         return { targetMode, reason, alert };
       } else {
         state.elExitCount = overCount;
-        console.log(`[INFO] ExtremeLow exit buffer: buy=${currentPrice.toFixed(2)}c over dynamicBuyMax=${dynamicBuyMax.toFixed(1)}c (count=${overCount}/3)`);
+        console.log(`[INFO] ExtremeLow exit buffer: ${currentPrice.toFixed(1)}c > ${dynamicBuyMax.toFixed(1)}c (count=${overCount}/3)`);
       }
     } else {
-      state.elExitCount = 0;  // price back below threshold — reset
+      state.elExitCount = 0;
     }
   } else if (emergencyCharge && state.currentMode === MODE.BACKUP) {
     state.elExitCount = 0;  // reset exit counter — emergency overrides exit
