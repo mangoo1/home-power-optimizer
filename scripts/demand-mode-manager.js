@@ -545,7 +545,10 @@ const MAX_GRID_IMPORT_KW = MAX_GRID_TARGET - 0.2; // hard guard: refuse Backup i
 const MAX_CHARGE_KW    = 5.0;  // kW inverter max charge rate
 const MIN_CHARGE_KW    = 1.0;  // kW minimum worth charging (below this, skip)
 const CHARGE_SAFETY_BUFFER = 1.0; // kW safety headroom above house load — protects against hot water heater/appliance surge
-const HIGH_LOAD_ABORT_KW  = 3.5; // kW — if homeLoad exceeds this while charging, abort immediately (trip prevention)
+// HIGH_LOAD_ABORT_KW: hard trip-protection ceiling. If homeLoad >= this AND calcChargeKw < MIN_CHARGE_KW,
+// stop charging. Set to MAX_GRID_TARGET - 0.5 so calcChargeKw() (which already accounts for buffer) is the
+// real dynamic controller; this is only a last-resort hard stop.
+const HIGH_LOAD_ABORT_KW  = MAX_GRID_TARGET - 0.5; // kW — hard abort only when truly no headroom left
 
 function calcChargeKw(homeLoad, pvPower) {
   // Available grid headroom for charging = target - net house draw - safety buffer
@@ -1481,10 +1484,12 @@ async function main() {
     }
     // Already in Backup (charging) mode: roll the charge end time window forward (+10 min)
     if (state.currentMode === MODE.BACKUP) {
-      // ── High load abort: stop charging immediately if homeLoad spikes ──────
-      // Protects against circuit breaker trip when hot water heater or large appliance starts
-      if (ess.homeLoad != null && ess.homeLoad >= HIGH_LOAD_ABORT_KW) {
-        console.log(`[BUY] ⚠️ HIGH LOAD ABORT: homeLoad=${ess.homeLoad.toFixed(2)}kW >= ${HIGH_LOAD_ABORT_KW}kW — stopping charge to prevent trip`);
+      // ── High load abort: stop charging immediately if no headroom remains ──
+      // calcChargeKw() already does dynamic power calculation; this is a hard safety net.
+      // Abort only when homeLoad is so high that even calcChargeKw returns < MIN_CHARGE_KW.
+      const abortChargeKw = calcChargeKw(ess.homeLoad, pvPower);
+      if (ess.homeLoad != null && ess.homeLoad >= HIGH_LOAD_ABORT_KW && abortChargeKw < MIN_CHARGE_KW) {
+        console.log(`[BUY] ⚠️ HIGH LOAD ABORT: homeLoad=${ess.homeLoad.toFixed(2)}kW >= ${HIGH_LOAD_ABORT_KW}kW, headroom=${abortChargeKw.toFixed(2)}kW < ${MIN_CHARGE_KW}kW — stopping charge to prevent trip`);
         await setMode(MODE.SELF_USE);
         state.currentMode = MODE.SELF_USE;
         state.lastSwitchReason = `high load abort: homeLoad=${ess.homeLoad.toFixed(2)}kW >= ${HIGH_LOAD_ABORT_KW}kW`;
