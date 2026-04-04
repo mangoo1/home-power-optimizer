@@ -558,7 +558,13 @@ function calcChargeKw(homeLoad, pvPower) {
   return parseFloat(chargeKw.toFixed(2));
 }
 
-async function setChargingMode(homeLoad, pvPower, nextDemandMinutes) {
+async function setChargingMode(homeLoad, pvPower, nextDemandMinutes, minPowerOnly = false) {
+  if (minPowerOnly) {
+    // High load, no headroom — enter Backup at minimum power to lock discharge=0
+    // Grid will supply house; battery stays idle (not discharging)
+    console.log(`[BUY] minPowerOnly — battery idle, discharge=0, grid supplies house`);
+    return setTimedChargeDischarge({ mode: 'charge', powerKw: 0.1, tag: '[BUY-IDLE]', nextDemandMinutes });
+  }
   const chargeKw = calcChargeKw(homeLoad, pvPower);
   if (chargeKw < MIN_CHARGE_KW) {
     console.log(`[BUY] chargeKw=${chargeKw.toFixed(2)}kW < ${MIN_CHARGE_KW}kW min — skipping charge`);
@@ -599,7 +605,7 @@ async function getGridPower() {
 // For Charging mode (BACKUP), uses the Timed charge setup with dynamic power calc.
 // Also verifies grid is actually exporting (gridPower > 0) for Selling.
 // Returns true if mode was confirmed, false if all attempts failed.
-async function setModeWithVerify(targetMode, { homeLoad, pvPower, nextDemandMinutes, sellPowerKw } = {}) {
+async function setModeWithVerify(targetMode, { homeLoad, pvPower, nextDemandMinutes, sellPowerKw, minPowerOnly } = {}) {
   const label = MODE_LABEL[targetMode] ?? targetMode;
   const isTimed = targetMode === MODE.SELLING || targetMode === MODE.BACKUP;
   const maxAttempts = isTimed ? 2 : 5; // Timed setup: max 2 (multi-step × 2 costly); Self-use/others: up to 5
@@ -613,7 +619,7 @@ async function setModeWithVerify(targetMode, { homeLoad, pvPower, nextDemandMinu
     if (targetMode === MODE.SELLING) {
       ok = await setSellingMode(nextDemandMinutes, sellPowerKw);
     } else if (targetMode === MODE.BACKUP) {
-      ok = await setChargingMode(homeLoad, pvPower, nextDemandMinutes);
+      ok = await setChargingMode(homeLoad, pvPower, nextDemandMinutes, minPowerOnly);
       if (!ok) {
         console.warn(`[WARN] Charging setup skipped or failed (attempt ${attempt}/${maxAttempts})`);
         if (attempt < maxAttempts) await new Promise(r => setTimeout(r, 3000));
@@ -965,20 +971,27 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   const availableChargeKw = MAX_GRID_TARGET - netHouseDraw;
   const gridHeadroomOk = (homeLoad == null) || availableChargeKw >= MIN_CHARGE_KW;
   if (!gridHeadroomOk) {
-    // Stay in self-use / exit backup if currently charging
+    // No headroom to charge. If in Backup mode, signal caller to update power to minimum.
+    // (actual setParam calls must happen in the async caller, not here)
     if (state.currentMode === MODE.BACKUP) {
-      targetMode = MODE.SELF_USE;
-      reason = `no grid headroom: homeLoad=${homeLoadVal.toFixed(2)}kW PV=${pvPowerVal.toFixed(2)}kW netDraw=${netHouseDraw.toFixed(2)}kW → available=${availableChargeKw.toFixed(2)}kW < ${MIN_CHARGE_KW}kW min`;
-      return { targetMode, reason, alert };
+      reason = `high load, no charge headroom: homeLoad=${homeLoadVal.toFixed(2)}kW → grid supplies house, battery idle (discharge=0)`;
+      alert = { ...alert, minPowerOnly: true, updatePowerOnly: true };
+      return { targetMode: null, reason, alert };
     }
-    // Skip all charging branches below
+    // Not in Backup: fall through — charging branches below are guarded by cheapEntryOk
   }
 
   // ── Priority 3: Free/negative-price charging (spot <= 0) ─────────────────
   // Guard: never charge during demand window (handled in priority 1)
-  if (gridHeadroomOk && !currentDemand && spotPrice <= CHARGE_SPOT_MAX && soc < SOC_MAX_CHARGE) {
+  if (!currentDemand && spotPrice <= CHARGE_SPOT_MAX && soc < SOC_MAX_CHARGE) {
     targetMode = MODE.BACKUP;
-    reason = `spot=${spotPrice.toFixed(2)}c (<=0) — free charging (SOC ${soc}% -> ${SOC_MAX_CHARGE}%)`;
+    // If no headroom, enter Backup at minimum power (discharge=0, grid supplies house)
+    if (!gridHeadroomOk) {
+      alert = { ...alert, minPowerOnly: true };
+      reason = `spot=${spotPrice.toFixed(2)}c (<=0) — high load, battery idle (discharge=0, grid supplies house)`;
+    } else {
+      reason = `spot=${spotPrice.toFixed(2)}c (<=0) — free charging (SOC ${soc}% -> ${SOC_MAX_CHARGE}%)`;
+    }
     return { targetMode, reason, alert };
   }
   if (!currentDemand && spotPrice <= CHARGE_SPOT_MAX && soc >= SOC_MAX_CHARGE) {
@@ -1082,7 +1095,9 @@ function decide(ess, pvPower, amber, state, dailySummary) {
     console.log(`[CHARGE] ⚠️ Emergency: deficit=${projectedDeficit.toFixed(1)}kWh (consume=${estimatedConsumption.toFixed(1)}kWh + reserve=${reserveKwh.toFixed(1)}kWh - have=${socKwh.toFixed(1)}kWh) — charging at ${currentPrice.toFixed(1)}c`);
   }
 
-  const cheapEntryOk = gridHeadroomOk && !currentDemand && soc < CHEAP_CHARGE_SOC && state.currentMode !== MODE.BACKUP;
+  const cheapEntryOk = !currentDemand && soc < CHEAP_CHARGE_SOC && state.currentMode !== MODE.BACKUP;
+  // Separate flag: headroom available for actual charging power
+  const cheapEntryWithHeadroom = cheapEntryOk && gridHeadroomOk;
 
   // ── Plan-driven charge decision ────────────────────────────────────────────
   // Step 1: plan's charge_windows defines WHEN to charge (no price buffer needed)
@@ -1113,7 +1128,13 @@ function decide(ess, pvPower, amber, state, dailySummary) {
         : `buy=${currentPrice.toFixed(1)}c (<=${dynamicBuyMax.toFixed(1)}c fallback)`;
     if (entryCount >= 3 || emergencyCharge) {
       targetMode = MODE.BACKUP;
-      reason = `${condLabel} — charging (SOC ${soc}% → ${CHEAP_CHARGE_SOC}%)`;
+      if (!cheapEntryWithHeadroom) {
+        // Price is cheap but load is high — enter Backup at min power so discharge=0
+        alert = { ...alert, minPowerOnly: true };
+        reason = `${condLabel} — high load, battery idle (discharge=0, grid supplies house)`;
+      } else {
+        reason = `${condLabel} — charging (SOC ${soc}% → ${CHEAP_CHARGE_SOC}%)`;
+      }
       state.chargeEntryCount = 0;
       return { targetMode, reason, alert };
     } else {
@@ -1436,9 +1457,17 @@ async function main() {
   let modeChanged = false;
   let modeVerifyOk = null;
   const modeFrom = state.currentMode;  // capture before any switch
-  if (targetMode !== null && targetMode !== state.currentMode) {
+
+  // Handle updatePowerOnly: already in Backup but load is high — just update power, no mode switch
+  if (alert?.updatePowerOnly && state.currentMode === MODE.BACKUP) {
+    console.log(`[BUY-IDLE] ${reason}`);
+    await setParam('0xC0BA', 0.1);
+    await setParam('0xC0BC', 0);
+    state.minPowerOnly = true;
+    saveState(state);
+  } else if (targetMode !== null && targetMode !== state.currentMode) {
     console.log(`[ACTION] ${MODE_LABEL[state.currentMode] ?? "unknown"} -> ${MODE_LABEL[targetMode]}: ${reason}`);
-    const ok = await setModeWithVerify(targetMode, { homeLoad: ess.homeLoad, pvPower, nextDemandMinutes: amber.nextDemandMinutes, sellPowerKw: alert?.sellPowerKw });
+    const ok = await setModeWithVerify(targetMode, { homeLoad: ess.homeLoad, pvPower, nextDemandMinutes: amber.nextDemandMinutes, sellPowerKw: alert?.sellPowerKw, minPowerOnly: alert?.minPowerOnly });
     if (ok) {
       state.currentMode = targetMode;
       state.lastSwitchTime = now.toISOString();
@@ -1507,17 +1536,18 @@ async function main() {
       await setParam('0xC01A', '0000');
       await setParam('0xC0BC', 0); // ensure discharge power is zero while charging
       // Recalculate and update charge power based on current load/PV
+      // If in minPowerOnly mode (high load, battery idle), keep power at minimum
       const chargeKw = calcChargeKw(ess.homeLoad, pvPower);
-      if (chargeKw >= MIN_CHARGE_KW) {
+      const isMinPowerMode = state.minPowerOnly || chargeKw < MIN_CHARGE_KW;
+      if (isMinPowerMode) {
+        // Still no headroom (or explicitly idle) — keep battery at minimum, discharge=0
+        await setParam('0xC0BA', 0.1);
+        state.minPowerOnly = true;
+        console.log(`[BUY-IDLE] High load / no headroom — battery idle at 0.1kW, discharge=0`);
+      } else {
+        state.minPowerOnly = false; // headroom restored, back to normal charging
         const pwOk = await setParam('0xC0BA', chargeKw);
         console.log(`[BUY] Updated charge power -> ${chargeKw.toFixed(2)}kW (homeLoad=${(ess.homeLoad??0).toFixed(2)}kW, PV=${(pvPower??0).toFixed(2)}kW, buffer=${CHARGE_SAFETY_BUFFER}kW) ${pwOk?'OK':'FAILED'}`);
-      } else {
-        console.log(`[BUY] chargeKw=${chargeKw.toFixed(2)}kW < ${MIN_CHARGE_KW}kW — stopping charge (insufficient headroom)`);
-        await setMode(MODE.SELF_USE);
-        state.currentMode = MODE.SELF_USE;
-        state.lastSwitchReason = `insufficient headroom: chargeKw=${chargeKw.toFixed(2)}kW < ${MIN_CHARGE_KW}kW`;
-        saveState(state);
-        return;
       }
     }
     console.log(`[INFO] Mode: ${MODE_LABEL[state.currentMode] ?? "none"} (${reason})`);
