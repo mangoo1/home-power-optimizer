@@ -124,8 +124,8 @@ const TODAY_PLAN_PATH = path.join(DATA_DIR, 'today-plan.json');
 const STATE_FILE = "/tmp/demand-mode-state.json";
 
 // Inverter modes
-const MODE = { SELF_USE: 0, TIMED: 1, PV_PRIORITY: 5, SELLING: 6, BACKUP: 3 };
-const MODE_LABEL = { 0: "Self-use", 1: "Timed", 3: "Backup", 5: "PV-Priority", 6: "Selling", 7: "Voltage-Reg" };
+const MODE = { SELF_USE: 0, TIMED: 1, PV_PRIORITY: 5, SELLING: 6, BACKUP: 1 };
+const MODE_LABEL = { 0: "Self-use", 1: "Timed/Charging", 3: "Backup(unused)", 5: "PV-Priority", 6: "Selling", 7: "Voltage-Reg" };
 
 // Strategy parameters
 const SOC_MAX_CHARGE = 85;        // Target SOC for backup/charge modes (%)
