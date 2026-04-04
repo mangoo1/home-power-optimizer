@@ -152,6 +152,28 @@ const ESS_HEADERS = {
   Origin: "https://euapp.ess-link.com", Referer: "https://euapp.ess-link.com/",
 };
 
+// ── Timezone helper — always use Australia/Sydney (handles DST automatically) ──
+function getSydneyHour() {
+  return parseInt(new Date().toLocaleString('en-AU', { timeZone: 'Australia/Sydney', hour: 'numeric', hour12: false }), 10);
+}
+function getSydneyDate(d = new Date()) {
+  // Returns a Date object shifted to Sydney local time (for getUTC* calls to give Sydney values)
+  const sydStr = d.toLocaleString('en-CA', { timeZone: 'Australia/Sydney',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+  return new Date(sydStr.replace(',', ''));
+}
+function getSydneyOffsetMs(d = new Date()) {
+  // Returns Sydney UTC offset in ms (e.g. +10h = 36000000, +11h = 39600000)
+  const utcMs = d.getTime();
+  const sydHour = parseInt(d.toLocaleString('en-AU', { timeZone: 'Australia/Sydney', hour: 'numeric', hour12: false }), 10);
+  const utcHour = d.getUTCHours();
+  let diff = sydHour - utcHour;
+  if (diff < -12) diff += 24;
+  if (diff > 12) diff -= 24;
+  return diff * 3600 * 1000;
+}
+
 // ── HTTP helpers ──────────────────────────────────────────────────────────────
 function httpsGet(url, headers = {}) {
   return new Promise((resolve, reject) => {
@@ -440,7 +462,7 @@ async function setMode(mode) {
 // dropping out between cron runs.
 function timedModeTimeContext(nextDemandMinutes) {
   const now = new Date();
-  const aest = new Date(now.getTime() + 11 * 3600 * 1000); // UTC+11
+  const aest = new Date(now.getTime() + getSydneyOffsetMs(now)); // DST-aware Sydney time
   const fmt2 = n => String(n).padStart(2,'0');
 
   // start = now - 1 min (window already active)
@@ -452,7 +474,7 @@ function timedModeTimeContext(nextDemandMinutes) {
   if (nextDemandMinutes != null && nextDemandMinutes > 15) {
     // Convert nextDemandMinutes (from now in UTC) to AEST end time
     const endUtc = new Date(now.getTime() + (nextDemandMinutes - 5) * 60 * 1000);
-    endDate = new Date(endUtc.getTime() + 11 * 3600 * 1000);
+    endDate = new Date(endUtc.getTime() + getSydneyOffsetMs(endUtc));
   } else {
     // No demand window today — charge until 18:00 AEST (safe buffer before any potential DW)
     endDate = new Date(aest);
@@ -570,7 +592,8 @@ async function setChargingMode(homeLoad, pvPower, nextDemandMinutes) {
 
 // Update rolling end time window for active Selling mode (called each cron run while selling).
 async function updateSellingEndTime() {
-  const aest = new Date(Date.now() + 11 * 3600 * 1000);
+  const now = new Date();
+  const aest = new Date(now.getTime() + getSydneyOffsetMs(now));
   const end = new Date(aest.getTime() + 10 * 60 * 1000);
   const endHHMM = String(end.getUTCHours()).padStart(2,'0') + String(end.getUTCMinutes()).padStart(2,'0');
   const ok = await setParam('0xC01A', endHHMM);
@@ -687,7 +710,7 @@ function getCurrentSolarData() {
     const db = getDb();
     if (!db) return { solar_wm2: null, cloud_cover_pct: null };
     const now = new Date();
-    const sydneyNow = new Date(now.getTime() + 11 * 3600 * 1000);
+    const sydneyNow = new Date(now.getTime() + getSydneyOffsetMs(now));
     const today = sydneyNow.toISOString().substring(0, 10);
     const hour  = sydneyNow.getUTCHours();
     const target = `${today}T${String(hour).padStart(2, '0')}:00`;
@@ -889,7 +912,7 @@ function updateDailySummary(record) {
 function decide(ess, pvPower, amber, state, dailySummary) {
   // Load today's LP plan (primary charge strategy)
   const todayPlan = loadTodayPlan();
-  const planSydHour = (new Date().getUTCHours() + 11) % 24;
+  const planSydHour = getSydneyHour();
 
   // Is current hour within a plan charge window?
   const inPlanChargeWindow = todayPlan?.chargeWindows?.some(w =>
@@ -1017,7 +1040,7 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   // but overnight prices (15–18c) are still expensive — no grid charging until morning.
   const CHARGE_CUTOFF_HOUR = 16; // Sydney local time — no grid charging after 16:00
   const CHARGE_START_HOUR  = 6;  // Sydney local time — no grid charging before 06:00 (overnight block)
-  const sydneyHourForWindow = (new Date().getUTCHours() + 11) % 24;
+  const sydneyHourForWindow = getSydneyHour();
   const chargeCutoffMs = (() => {
     const d = new Date();
     d.setHours(CHARGE_CUTOFF_HOUR, 0, 0, 0);
@@ -1069,7 +1092,7 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   // ── Emergency charge: predict if battery will run out before tomorrow morning ──
   // Hot water heater runs on grid at low price — NOT from battery. Exclude from estimate.
   // Battery only covers: evening home load + overnight standby + 12% morning reserve.
-  const sydneyHourForCharge = (new Date().getUTCHours() + 11) % 24;
+  const sydneyHourForCharge = getSydneyHour();
   const OVERNIGHT_RESERVE_PCT = 12; // morning floor — will top up from PV/grid during day
   let estimatedConsumption = 0;
   if (sydneyHourForCharge >= 17 && sydneyHourForCharge < 23) {
@@ -1154,6 +1177,21 @@ function decide(ess, pvPower, amber, state, dailySummary) {
       reason = `plan charge window ended (hour=${planSydHour}, buy=${currentPrice.toFixed(1)}c) — stop charging`;
       state.chargeExitCount = 0;
       return { targetMode, reason, alert };
+    }
+    // In window but price exceeded ceiling — exit charging (price too high)
+    if (todayPlan && inPlanChargeWindow && !priceOkInWindow && !emergencyCharge) {
+      const overCount = (state.chargeExitCount || 0) + 1;
+      if (overCount >= 2) {
+        targetMode = MODE.SELF_USE;
+        reason = `price ${currentPrice.toFixed(1)}c > ceiling ${PLAN_CHARGE_MAX_C}c in plan window — stop charging`;
+        state.chargeExitCount = 0;
+        return { targetMode, reason, alert };
+      } else {
+        state.chargeExitCount = overCount;
+        console.log(`[INFO] Price over ceiling in window (count=${overCount}/2): ${currentPrice.toFixed(1)}c > ${PLAN_CHARGE_MAX_C}c`);
+      }
+    } else {
+      state.chargeExitCount = 0;
     }
     // No plan: keep a 3-interval exit buffer to avoid thrashing
     if (!todayPlan && currentPrice > dynamicBuyMax) {
@@ -1251,10 +1289,7 @@ function decide(ess, pvPower, amber, state, dailySummary) {
 
   // ── Priority 5: Sell to grid ─────────────────────────────────────────────
   // Hard stop: no selling after SELL_STOP_HOUR (Sydney time) — reserve battery overnight
-  const sydneyHourNow = (() => {
-    const now = new Date();
-    return (now.getUTCHours() + 11) % 24;
-  })();
+  const sydneyHourNow = getSydneyHour();
   const afterSellStopHour = sydneyHourNow >= SELL_STOP_HOUR;
 
   // Time-dependent SOC floor: morning allows lower reserve (can recharge before demand window)
