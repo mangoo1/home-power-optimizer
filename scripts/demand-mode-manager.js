@@ -1502,9 +1502,10 @@ async function main() {
       const startOk = await setParam('0xC014', startHHMM);
       const endOk = await setParam('0xC016', endHHMM);
       console.log(`[BUY] Rolling charge window -> ${startHHMM}–${endHHMM} start=${startOk?'OK':'FAILED'} end=${endOk?'OK':'FAILED'}`);
-      // Keep sell window collapsed (mutual exclusion)
+      // Keep sell window collapsed (mutual exclusion) and discharge power = 0
       await setParam('0xC018', '0000');
       await setParam('0xC01A', '0000');
+      await setParam('0xC0BC', 0); // ensure discharge power is zero while charging
       // Recalculate and update charge power based on current load/PV
       const chargeKw = calcChargeKw(ess.homeLoad, pvPower);
       if (chargeKw >= MIN_CHARGE_KW) {
