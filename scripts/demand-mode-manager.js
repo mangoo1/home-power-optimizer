@@ -529,8 +529,10 @@ async function setTimedChargeDischarge({ mode, powerKw, tag, nextDemandMinutes }
 }
 
 // Convenience wrappers
-async function setSellingMode(nextDemandMinutes) {
-  return setTimedChargeDischarge({ mode: 'sell', powerKw: 5, tag: '[SELL]', nextDemandMinutes });
+async function setSellingMode(nextDemandMinutes, powerKw = 5) {
+  const clampedPower = Math.min(5, Math.max(0.5, powerKw));
+  console.log(`[SELL] discharge power=${clampedPower.toFixed(2)}kW (requested=${powerKw.toFixed(2)}kW)`);
+  return setTimedChargeDischarge({ mode: 'sell', powerKw: clampedPower, tag: '[SELL]', nextDemandMinutes });
 }
 
 // chargeGridKw: dynamic charge power calculation
@@ -594,7 +596,7 @@ async function getGridPower() {
 // For Charging mode (BACKUP), uses the Timed charge setup with dynamic power calc.
 // Also verifies grid is actually exporting (gridPower > 0) for Selling.
 // Returns true if mode was confirmed, false if all attempts failed.
-async function setModeWithVerify(targetMode, { homeLoad, pvPower, nextDemandMinutes } = {}) {
+async function setModeWithVerify(targetMode, { homeLoad, pvPower, nextDemandMinutes, sellPowerKw } = {}) {
   const label = MODE_LABEL[targetMode] ?? targetMode;
   const isTimed = targetMode === MODE.SELLING || targetMode === MODE.BACKUP;
   const maxAttempts = isTimed ? 2 : 5; // Timed setup: max 2 (multi-step × 2 costly); Self-use/others: up to 5
@@ -606,7 +608,7 @@ async function setModeWithVerify(targetMode, { homeLoad, pvPower, nextDemandMinu
     // Use full Timed mode setup for Selling/Charging; simple setMode for others
     let ok;
     if (targetMode === MODE.SELLING) {
-      ok = await setSellingMode(nextDemandMinutes);
+      ok = await setSellingMode(nextDemandMinutes, sellPowerKw);
     } else if (targetMode === MODE.BACKUP) {
       ok = await setChargingMode(homeLoad, pvPower, nextDemandMinutes);
       if (!ok) {
@@ -1268,6 +1270,7 @@ function decide(ess, pvPower, amber, state, dailySummary) {
     if (maxSellPower > 0.2) {
       targetMode = MODE.SELLING;
       reason = `feedIn=${feedInPrice.toFixed(1)}c (>=${effectiveSellMin.toFixed(1)}c, ${sellMinLabel}), SOC ${soc}% (>${socMinSell}% ${sydneyHourNow < SOC_MIN_SELL_CUTOFF_HOUR ? "morning" : "afternoon"}), headroom ${maxSellPower.toFixed(1)}kW`;
+      alert = { ...alert, sellPowerKw: parseFloat(maxSellPower.toFixed(2)) };
     } else {
       reason = `feedIn high but home load ${homeLoad?.toFixed(1)}kW saturates inverter — no selling (${sellMinLabel})`;
     }
@@ -1432,7 +1435,7 @@ async function main() {
   const modeFrom = state.currentMode;  // capture before any switch
   if (targetMode !== null && targetMode !== state.currentMode) {
     console.log(`[ACTION] ${MODE_LABEL[state.currentMode] ?? "unknown"} -> ${MODE_LABEL[targetMode]}: ${reason}`);
-    const ok = await setModeWithVerify(targetMode, { homeLoad: ess.homeLoad, pvPower, nextDemandMinutes: amber.nextDemandMinutes });
+    const ok = await setModeWithVerify(targetMode, { homeLoad: ess.homeLoad, pvPower, nextDemandMinutes: amber.nextDemandMinutes, sellPowerKw: alert?.sellPowerKw });
     if (ok) {
       state.currentMode = targetMode;
       state.lastSwitchTime = now.toISOString();
