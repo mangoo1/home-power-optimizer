@@ -1078,14 +1078,21 @@ function decide(ess, pvPower, amber, state, dailySummary) {
 
   // ── Plan-driven charge decision ────────────────────────────────────────────
   // Step 1: plan's charge_windows defines WHEN to charge (no price buffer needed)
-  // Step 2: cron only handles HOW MUCH power (dynamic, based on homeLoad/PV)
+  // Step 2: cron handles HOW MUCH power (dynamic, based on homeLoad/PV)
+  // Step 3: price ceiling guard — even inside window, stop if price > PLAN_CHARGE_MAX_C
   // Emergency charge bypasses window check when SOC is critically low.
-  const planSaysCharge = inPlanChargeWindow && !pastChargeCutoff;
+  const PLAN_CHARGE_MAX_C = 10.0; // c/kWh — hard ceiling inside plan window
+  const priceOkInWindow = currentPrice <= PLAN_CHARGE_MAX_C;
+  const planSaysCharge = inPlanChargeWindow && !pastChargeCutoff && priceOkInWindow;
   const chargeCondition = todayPlan
-    ? (planSaysCharge || emergencyCharge)   // plan mode: window-driven
+    ? (planSaysCharge || emergencyCharge)   // plan mode: window-driven + price ceiling
     : (currentPrice <= dynamicBuyMax || emergencyCharge); // no plan: fallback price threshold
 
-  console.log(`[PLAN] planSaysCharge=${planSaysCharge} inWindow=${inPlanChargeWindow} pastCutoff=${pastChargeCutoff} final=${chargeCondition} (plan=${todayPlan ? 'active' : 'fallback'}) price=${currentPrice.toFixed(1)}c`);
+  if (inPlanChargeWindow && !pastChargeCutoff && !priceOkInWindow && !emergencyCharge) {
+    console.log(`[PLAN] In window but price ${currentPrice.toFixed(1)}c > ceiling ${PLAN_CHARGE_MAX_C}c — suppressing charge`);
+  }
+
+  console.log(`[PLAN] planSaysCharge=${planSaysCharge} inWindow=${inPlanChargeWindow} priceOk=${priceOkInWindow}(≤${PLAN_CHARGE_MAX_C}c) pastCutoff=${pastChargeCutoff} final=${chargeCondition} (plan=${todayPlan ? 'active' : 'fallback'}) price=${currentPrice.toFixed(1)}c`);
 
   if (cheapEntryOk && chargeCondition) {
     // Plan mode: no entry buffer — act immediately on window signal
