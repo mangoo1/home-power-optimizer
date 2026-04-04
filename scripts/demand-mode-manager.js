@@ -821,7 +821,7 @@ function updateDailySummary(record) {
           cost_aud, earnings_aud, demand_peak_kw, demand_charge_est, avg_soc, min_soc, max_soc,
           meter_buy_start, meter_buy_end, meter_sell_start, meter_sell_end,
           pv_kwh, charge_grid_kwh, discharge_kwh, mode_changes, sell_sessions, charge_sessions)
-        VALUES (@date, 1, @homeToday, 0, 0, @cost, @earn, @peak, @peakCharge, @soc, @soc, @soc,
+        VALUES (@date, 1, @homeToday, 0, 0, COALESCE(@meterCost,0), COALESCE(@meterEarn,0), @peak, @peakCharge, @soc, @soc, @soc,
           @meterBuy, @meterBuy, @meterSell, @meterSell,
           @pvToday, @chargeGrid, @discharge, @modeChange, @sellSess, @chargeSess)
         ON CONFLICT(date) DO UPDATE SET
@@ -829,8 +829,8 @@ function updateDailySummary(record) {
           home_kwh         = COALESCE(@homeToday, home_kwh),
           grid_buy_kwh     = CASE WHEN @meterBuy IS NOT NULL AND meter_buy_start IS NOT NULL THEN ROUND(@meterBuy - meter_buy_start, 3) ELSE grid_buy_kwh END,
           grid_sell_kwh    = CASE WHEN @meterSell IS NOT NULL AND meter_sell_start IS NOT NULL THEN ROUND(@meterSell - meter_sell_start, 3) ELSE grid_sell_kwh END,
-          cost_aud         = cost_aud + @cost,
-          earnings_aud     = earnings_aud + @earn,
+          cost_aud         = cost_aud + COALESCE(@meterCost, 0),
+          earnings_aud     = earnings_aud + COALESCE(@meterEarn, 0),
           demand_peak_kw   = MAX(demand_peak_kw, @peak),
           demand_charge_est = MAX(demand_peak_kw, @peak) * 0.6104,
           avg_soc          = (avg_soc * intervals + @soc) / (intervals + 1),
@@ -848,9 +848,12 @@ function updateDailySummary(record) {
           charge_sessions  = charge_sessions + @chargeSess
       `).run({
         date: today,
-        homeToday: record.todayHomeKwh  ?? null,   // ESS cumulative today (authoritative)
-        pvToday:   record.todayPvKwh    ?? null,   // ESS cumulative PV today
-        home:   (record.homeLoad || 0) * 0.5,      // kept for cost calc only
+        homeToday: record.todayHomeKwh  ?? null,
+        pvToday:   record.todayPvKwh    ?? null,
+        home:   (record.homeLoad || 0) * 0.5,      // kept for reference
+        // Cost/earn: use meter_delta × price (accurate), fall back to interval estimate
+        meterCost: record.meterBuyDelta  != null ? record.meterBuyDelta  * (record.buyPrice  || 0) / 100 : null,
+        meterEarn: record.meterSellDelta != null ? record.meterSellDelta * (record.feedInPrice|| 0) / 100 : null,
         buy:    record.gridPower < 0 ? Math.abs(record.gridPower) * 0.5 : 0,
         sell:   record.gridPower > 0 ? record.gridPower * 0.5 : 0,
         cost:   record.gridPower < 0 ? Math.abs(record.gridPower) * 0.5 * (record.buyPrice || 0) / 100 : 0,
@@ -1591,10 +1594,12 @@ async function main() {
 
   // ── Interval cost accounting ──────────────────────────────────────────────
   // gridPower: negative=import(buy), positive=export(sell)
-  // Scheduled records use 0.5h window; mode-change records use 5-min window.
-  const intervalHours = modeChanged ? (5/60) : 0.5;
+  // intervalHours: 5-min cron=5/60, mode_change=5/60, scheduled(:00/:30)=0.5h
+  const intervalHours = (trigger === 'scheduled') ? 0.5 : (5/60);
   const intervalImportKwh = ess.gridPower != null && ess.gridPower < 0 ? Math.abs(ess.gridPower) * intervalHours : 0;
   const intervalExportKwh = ess.gridPower != null && ess.gridPower > 0 ? ess.gridPower * intervalHours : 0;
+  // Prefer meter_delta for cost if available (more accurate); fall back to power×interval
+  // intervalBuyAud is used for per-interval logging; daily_summary uses meter_delta sum
   record.intervalBuyAud  = parseFloat((intervalImportKwh * currentPrice / 100).toFixed(6));
   record.intervalSellAud = parseFloat((intervalExportKwh * feedInPrice  / 100).toFixed(6));
   record.intervalNetAud  = parseFloat((record.intervalBuyAud - record.intervalSellAud).toFixed(6));
