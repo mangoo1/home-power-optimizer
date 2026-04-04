@@ -809,14 +809,14 @@ function updateDailySummary(record) {
           cost_aud, earnings_aud, demand_peak_kw, demand_charge_est, avg_soc, min_soc, max_soc,
           meter_buy_start, meter_buy_end, meter_sell_start, meter_sell_end,
           pv_kwh, charge_grid_kwh, discharge_kwh, mode_changes, sell_sessions, charge_sessions)
-        VALUES (@date, 1, @home, @buy, @sell, @cost, @earn, @peak, @peakCharge, @soc, @soc, @soc,
+        VALUES (@date, 1, @homeToday, 0, 0, @cost, @earn, @peak, @peakCharge, @soc, @soc, @soc,
           @meterBuy, @meterBuy, @meterSell, @meterSell,
-          @pv, @chargeGrid, @discharge, @modeChange, @sellSess, @chargeSess)
+          @pvToday, @chargeGrid, @discharge, @modeChange, @sellSess, @chargeSess)
         ON CONFLICT(date) DO UPDATE SET
           intervals        = intervals + 1,
-          home_kwh         = home_kwh + @home,
-          grid_buy_kwh     = grid_buy_kwh + @buy,
-          grid_sell_kwh    = grid_sell_kwh + @sell,
+          home_kwh         = COALESCE(@homeToday, home_kwh),
+          grid_buy_kwh     = CASE WHEN @meterBuy IS NOT NULL AND meter_buy_start IS NOT NULL THEN ROUND(@meterBuy - meter_buy_start, 3) ELSE grid_buy_kwh END,
+          grid_sell_kwh    = CASE WHEN @meterSell IS NOT NULL AND meter_sell_start IS NOT NULL THEN ROUND(@meterSell - meter_sell_start, 3) ELSE grid_sell_kwh END,
           cost_aud         = cost_aud + @cost,
           earnings_aud     = earnings_aud + @earn,
           demand_peak_kw   = MAX(demand_peak_kw, @peak),
@@ -828,7 +828,7 @@ function updateDailySummary(record) {
           meter_sell_end   = COALESCE(@meterSell, meter_sell_end),
           meter_buy_start  = COALESCE(meter_buy_start, @meterBuy),
           meter_sell_start = COALESCE(meter_sell_start, @meterSell),
-          pv_kwh           = pv_kwh + @pv,
+          pv_kwh           = COALESCE(@pvToday, pv_kwh),
           charge_grid_kwh  = charge_grid_kwh + @chargeGrid,
           discharge_kwh    = discharge_kwh + @discharge,
           mode_changes     = mode_changes + @modeChange,
@@ -836,7 +836,9 @@ function updateDailySummary(record) {
           charge_sessions  = charge_sessions + @chargeSess
       `).run({
         date: today,
-        home:   (record.homeLoad || 0) * 0.5,
+        homeToday: record.todayHomeKwh  ?? null,   // ESS cumulative today (authoritative)
+        pvToday:   record.todayPvKwh    ?? null,   // ESS cumulative PV today
+        home:   (record.homeLoad || 0) * 0.5,      // kept for cost calc only
         buy:    record.gridPower < 0 ? Math.abs(record.gridPower) * 0.5 : 0,
         sell:   record.gridPower > 0 ? record.gridPower * 0.5 : 0,
         cost:   record.gridPower < 0 ? Math.abs(record.gridPower) * 0.5 * (record.buyPrice || 0) / 100 : 0,
@@ -846,7 +848,6 @@ function updateDailySummary(record) {
         soc:    record.soc || 0,
         meterBuy:  record.meterBuyTotal  ?? null,
         meterSell: record.meterSellTotal ?? null,
-        pv:         (record.pvPower || 0) * 0.5,
         chargeGrid: isCharging  ? (record.chargeKw  || 0) * 0.5 : 0,
         discharge:  isSelling   ? (record.dischargeKw || 0) * 0.5 : 0,
         modeChange: isModeChange,
