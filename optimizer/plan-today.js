@@ -482,15 +482,34 @@ async function main() {
     console.log(`     ⚠️  PV deficit ~${deficit} kWh — grid top-up needed (charge when price < 10¢)`);
   }
 
-  console.log(`\n  3️⃣  DEMAND WINDOW (15:00–20:00): price up to ${maxBuyDW.toFixed(1)}¢, feedin ${maxFeedDW.toFixed(1)}¢`);
-  console.log(`     → Battery supplies home load (est 1.5kW avg)`);
-  console.log(`     → Grid export attractive at ${maxFeedDW.toFixed(1)}¢ if SOC high`);
-  console.log(`     ✅ Discharge: self-use first, then export any surplus`);
-  console.log(`     ⛔ NO grid charging during 15:00–20:00`);
+  // Section 3: DW or afternoon strategy — based on actual Amber API data
+  const dwIntervalsFwd = priceIntervals.filter(iv => iv.demandWindow === true);
+  if (dwIntervalsFwd.length > 0) {
+    const dwH1 = Math.min(...dwIntervalsFwd.map(iv => sydHour(iv.nemTime)));
+    const dwH2 = Math.max(...dwIntervalsFwd.map(iv => sydHour(iv.nemTime))) + 1;
+    const maxBuyDW2  = Math.max(...dwIntervalsFwd.map(x => x.buy));
+    const maxFeedDW2 = Math.max(...dwIntervalsFwd.map(x => x.feedin || 0));
+    console.log(`\n  3️⃣  DEMAND WINDOW (${dwH1}:00–${dwH2}:00, from Amber API): price up to ${maxBuyDW2.toFixed(1)}¢, feedin ${maxFeedDW2.toFixed(1)}¢`);
+    console.log(`     → Battery supplies home load during DW`);
+    console.log(`     → Grid export attractive at ${maxFeedDW2.toFixed(1)}¢ if SOC high`);
+    console.log(`     ✅ Discharge: self-use first, then export surplus`);
+    console.log(`     ⛔ NO grid charging during DW`);
+  } else {
+    // No DW today — show afternoon price trend
+    const aftIntervals = priceIntervals.filter(iv => { const h=sydHour(iv.nemTime); return h>=15&&h<20; });
+    const maxAft = aftIntervals.length ? Math.max(...aftIntervals.map(x=>x.buy)) : 0;
+    const minAft = aftIntervals.length ? Math.min(...aftIntervals.map(x=>x.buy)) : 0;
+    console.log(`\n  3️⃣  AFTERNOON (15:00–20:00): no demand window today`);
+    console.log(`     → Price range: ${minAft.toFixed(1)}–${maxAft.toFixed(1)}¢ (offPeak)`);
+    if (maxAft > 10) {
+      console.log(`     ⚠️  Price rising after 15:00 — stop charging before prices exceed 10¢`);
+    } else {
+      console.log(`     ✅ Prices stay reasonable — can continue charging if needed`);
+    }
+  }
 
-  console.log(`\n  4️⃣  EVENING (20:00+): prices ~21¢, PV done`);
-  console.log(`     → Battery at ~20–30% after DW discharge (LP predicts)`);
-  console.log(`     ✅ Let battery coast until next morning`);
+  console.log(`\n  4️⃣  EVENING (20:00+): prices typically 12–15¢, PV done`);
+  console.log(`     ✅ Let battery discharge for home use, coast until next morning`);
 
   const peakEntry2 = Object.entries(solarByHour).sort((a,b)=>b[1]-a[1])[0];
   const peakKw2 = peakEntry2 ? +peakEntry2[1].toFixed(1) : 0;
