@@ -404,6 +404,18 @@ async function setParam(index, data) {
   } catch { return false; }
 }
 
+async function setWeekParam(index, data) {
+  if (!ESS_TOKEN) return false;
+  try {
+    const r = await httpsPost(
+      "https://eu.ess-link.com/api/app/deviceInfo/setDeviceWeekParam",
+      { data, macHex: MAC_HEX, index },
+      { Authorization: ESS_TOKEN, ...ESS_HEADERS }
+    );
+    return r.code === 200;
+  } catch { return false; }
+}
+
 async function setDateParam(index, data) {
   if (!ESS_TOKEN) return false;
   try {
@@ -488,7 +500,7 @@ async function setTimedChargeDischarge({ mode, powerKw, tag, nextDemandMinutes }
     { label: 'chargeStart=0000',       fn: () => setParam('0xC014', '0000') }, // collapse charge window
     { label: 'chargeEnd=0000',         fn: () => setParam('0xC016', '0000') }, // collapse charge window
     { label: 'otherMode=0',            fn: () => setParam('0x314E', 0) },
-    { label: 'weekdays=all',           fn: () => setParam('0xC0B4', 127) },  // bitmask 0x7F = all 7 days
+    { label: 'weekdays=all',           fn: () => setWeekParam('0xC0B4', [1,2,3,4,5,6,0]) },
     { label: `startDate=${yesterday}`, fn: () => setDateParam('0xC0B6', yesterday) },
     { label: `endDate=${tomorrow}`,    fn: () => setDateParam('0xC0B8', tomorrow) },
   ] : [
@@ -502,7 +514,7 @@ async function setTimedChargeDischarge({ mode, powerKw, tag, nextDemandMinutes }
     { label: 'sellStart=0000',           fn: () => setParam('0xC018', '0000') }, // collapse sell window
     { label: 'sellEnd=0000',             fn: () => setParam('0xC01A', '0000') }, // collapse sell window
     { label: 'otherMode=0',              fn: () => setParam('0x314E', 0) },
-    { label: 'weekdays=all',             fn: () => setParam('0xC0B4', 127) },  // bitmask 0x7F = all 7 days
+    { label: 'weekdays=all',             fn: () => setWeekParam('0xC0B4', [1,2,3,4,5,6,0]) },
     { label: `startDate=${yesterday}`,   fn: () => setDateParam('0xC0B6', yesterday) },
     { label: `endDate=${tomorrow}`,      fn: () => setDateParam('0xC0B8', tomorrow) },
   ];
