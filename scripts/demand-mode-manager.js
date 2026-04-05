@@ -582,14 +582,16 @@ function calcChargeKw(homeLoad, pvPower) {
   return parseFloat(chargeKw.toFixed(2));
 }
 
-async function setChargingMode(homeLoad, pvPower, nextDemandMinutes) {
-  const chargeKw = calcChargeKw(homeLoad, pvPower);
-  if (chargeKw < MIN_CHARGE_KW) {
-    console.log(`[BUY] chargeKw=${chargeKw.toFixed(2)}kW < ${MIN_CHARGE_KW}kW min — skipping charge`);
+async function setChargingMode(homeLoad, pvPower, nextDemandMinutes, throttled = false) {
+  let chargeKw = throttled ? THROTTLE_CHARGE_KW : calcChargeKw(homeLoad, pvPower);
+  const minKw = throttled ? 0.1 : MIN_CHARGE_KW; // throttle mode uses lower min (0.1kW)
+  if (chargeKw < minKw) {
+    console.log(`[BUY] chargeKw=${chargeKw.toFixed(2)}kW < ${minKw}kW min — skipping charge`);
     return false;
   }
-  console.log(`[BUY] chargeKw=${chargeKw.toFixed(2)}kW (homeLoad=${(homeLoad??0).toFixed(2)}kW, PV=${(pvPower??0).toFixed(2)}kW, gridTarget=${MAX_GRID_TARGET}kW)`);
-  return setTimedChargeDischarge({ mode: 'charge', powerKw: chargeKw, tag: '[BUY]', nextDemandMinutes });
+  const tag = throttled ? '[BUY-THROTTLE]' : '[BUY]';
+  console.log(`${tag} chargeKw=${chargeKw.toFixed(2)}kW (homeLoad=${(homeLoad??0).toFixed(2)}kW, PV=${(pvPower??0).toFixed(2)}kW, gridTarget=${MAX_GRID_TARGET}kW${throttled ? ', throttled=true' : ''})`);
+  return setTimedChargeDischarge({ mode: 'charge', powerKw: chargeKw, tag, nextDemandMinutes });
 }
 
 // Update rolling end time window for active Selling mode (called each cron run while selling).
@@ -638,7 +640,7 @@ async function setModeWithVerify(targetMode, { homeLoad, pvPower, nextDemandMinu
     if (targetMode === MODE.SELLING) {
       ok = await setSellingMode(nextDemandMinutes, sellPowerKw);
     } else if (targetMode === MODE.BACKUP) {
-      ok = await setChargingMode(homeLoad, pvPower, nextDemandMinutes);
+      ok = await setChargingMode(homeLoad, pvPower, nextDemandMinutes, chargeThrottled);
       if (!ok) {
         console.warn(`[WARN] Charging setup skipped or failed (attempt ${attempt}/${maxAttempts})`);
         if (attempt < maxAttempts) await new Promise(r => setTimeout(r, 3000));
@@ -1073,6 +1075,21 @@ function decide(ess, pvPower, amber, state, dailySummary) {
     ? sortedBuyPrices.slice(0, avgWindowN).reduce((s, v) => s + v, 0) / avgWindowN
     : 0;  // No forecast slots available (past 16:00 or no data) — set to 0 so dynamicBuyMax falls to floor (9.6c), effectively disabling grid charging
   const dynamicBuyMax = Math.max(9.6, forecastMinBuy * 1.3); // max(avg6×1.3, 9.6c) — floor ensures we catch cheap windows even on low-forecast days
+
+  // Future min price in next 2 hours (for charge throttling)
+  // If a significantly cheaper slot is coming soon, throttle charge to 0.5kW to preserve battery capacity
+  const twoHoursMs = 2 * 60 * 60 * 1000;
+  const futureMinPrice = forecast
+    .filter(p => !p.tariffInformation?.demandWindow)
+    .filter(p => { const t = new Date(p.startTime).getTime(); return t > nowMs && t <= nowMs + twoHoursMs; })
+    .reduce((min, p) => Math.min(min, p.perKwh ?? 999), 999);
+  // Throttle if upcoming price is ≥15% cheaper than current price
+  const THROTTLE_RATIO = 0.85;
+  const chargeThrottled = futureMinPrice < 999 && futureMinPrice < currentPrice * THROTTLE_RATIO;
+  const THROTTLE_CHARGE_KW = 0.5; // kW — trickle charge when cheaper slot is coming
+  if (chargeThrottled) {
+    console.log(`[THROTTLE] Future min price ${futureMinPrice.toFixed(1)}c < current ${currentPrice.toFixed(1)}c × ${THROTTLE_RATIO} — throttling charge to ${THROTTLE_CHARGE_KW}kW`);
+  }
 
   // Peak feedIn until end of selling window (until SELL_STOP_HOUR or demand window)
   const sellStopMs = (() => { const d = new Date(); d.setHours(SELL_STOP_HOUR,0,0,0); return d.getTime(); })();
@@ -1527,13 +1544,15 @@ async function main() {
       await setParam('0xC018', '0000');
       await setParam('0xC01A', '0000');
       await setParam('0xC0BC', 0); // ensure discharge power is zero while charging
-      // Recalculate and update charge power based on current load/PV
-      const chargeKw = calcChargeKw(ess.homeLoad, pvPower);
-      if (chargeKw >= MIN_CHARGE_KW) {
+      // Recalculate and update charge power based on current load/PV (throttle if cheaper slot coming)
+      const chargeKw = chargeThrottled ? THROTTLE_CHARGE_KW : calcChargeKw(ess.homeLoad, pvPower);
+      const minKwForUpdate = chargeThrottled ? 0.1 : MIN_CHARGE_KW;
+      const buyTag = chargeThrottled ? '[BUY-THROTTLE]' : '[BUY]';
+      if (chargeKw >= minKwForUpdate) {
         const pwOk = await setParam('0xC0BA', chargeKw);
-        console.log(`[BUY] Updated charge power -> ${chargeKw.toFixed(2)}kW (homeLoad=${(ess.homeLoad??0).toFixed(2)}kW, PV=${(pvPower??0).toFixed(2)}kW, buffer=${CHARGE_SAFETY_BUFFER}kW) ${pwOk?'OK':'FAILED'}`);
+        console.log(`${buyTag} Updated charge power -> ${chargeKw.toFixed(2)}kW (homeLoad=${(ess.homeLoad??0).toFixed(2)}kW, PV=${(pvPower??0).toFixed(2)}kW, buffer=${CHARGE_SAFETY_BUFFER}kW${chargeThrottled ? ', throttled=future min='+futureMinPrice.toFixed(1)+'c' : ''}) ${pwOk?'OK':'FAILED'}`);
       } else {
-        console.log(`[BUY] chargeKw=${chargeKw.toFixed(2)}kW < ${MIN_CHARGE_KW}kW — stopping charge (no headroom), switching to Self-use`);
+        console.log(`${buyTag} chargeKw=${chargeKw.toFixed(2)}kW < ${minKwForUpdate}kW — stopping charge (no headroom), switching to Self-use`);
         await setMode(MODE.SELF_USE);
         state.currentMode = MODE.SELF_USE;
         state.lastSwitchReason = `no headroom: chargeKw=${chargeKw.toFixed(2)}kW < ${MIN_CHARGE_KW}kW`;
@@ -1613,7 +1632,7 @@ async function main() {
     reportedMode:      ess.reportedMode      ?? null,
     recordTrigger: modeChanged ? "mode_change" : isScheduledInterval ? "scheduled" : "5min",
     // Timed mode charge/discharge power set this interval (null if not in charge/sell mode)
-    chargeKw:    state.currentMode === MODE.BACKUP  ? calcChargeKw(ess.homeLoad, pvPower) : null,
+    chargeKw:    state.currentMode === MODE.BACKUP  ? (chargeThrottled ? THROTTLE_CHARGE_KW : calcChargeKw(ess.homeLoad, pvPower)) : null,
     dischargeKw: state.currentMode === MODE.SELLING ? 5.0 : null,
     mode_verify_ok: modeChanged ? (modeVerifyOk !== null ? modeVerifyOk : (state.lastModeVerifyOk ? 1 : 0)) : null,
     mode_from: modeChanged ? modeFrom : null,
