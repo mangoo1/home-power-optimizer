@@ -258,9 +258,9 @@ function buildLP(intervals, pvMap, initSOC_kwh) {
 // ── Main ──────────────────────────────────────────────────────────────────────
 async function main() {
   const now = new Date();
-  const sydH = (now.getUTCHours() + 11) % 24;
+  const sydH = (now.getUTCHours() + SYD_OFFSET + 24) % 24;
   const sydM = now.getUTCMinutes();
-  console.log(`\n🕐 Sydney time: ${String(sydH).padStart(2,'0')}:${String(sydM).padStart(2,'0')}`);
+  console.log(`\n🕐 Sydney time: ${String(sydH).padStart(2,'0')}:${String(sydM).padStart(2,'0')} (UTC+${SYD_OFFSET})`);
 
   // Current SOC
   const roDb = new Database(DB_PATH, { readonly: true });

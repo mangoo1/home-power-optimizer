@@ -1116,23 +1116,14 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   const cheapEntryOk = gridHeadroomOk && !currentDemand && soc < CHEAP_CHARGE_SOC && state.currentMode !== MODE.BACKUP;
 
 
-  // ── Plan-driven charge decision ────────────────────────────────────────────
-  // Step 1: plan's charge_windows defines WHEN to charge (no price buffer needed)
-  // Step 2: cron handles HOW MUCH power (dynamic, based on homeLoad/PV)
-  // Step 3: price ceiling guard — even inside window, stop if price > PLAN_CHARGE_MAX_C
-  // Emergency charge bypasses window check when SOC is critically low.
-  const PLAN_CHARGE_MAX_C = 10.0; // c/kWh — hard ceiling inside plan window
-  const priceOkInWindow = currentPrice <= PLAN_CHARGE_MAX_C;
-  const planSaysCharge = inPlanChargeWindow && !pastChargeCutoff && priceOkInWindow;
-  const chargeCondition = todayPlan
-    ? (planSaysCharge || emergencyCharge)   // plan mode: window-driven + price ceiling
-    : (currentPrice <= dynamicBuyMax || emergencyCharge); // no plan: fallback price threshold
+  // ── Charge decision (price-threshold only) ────────────────────────────────
+  // LP plan is for reference/calibration only — does NOT drive charge execution.
+  // All charge decisions are made purely on real-time price vs dynamicBuyMax.
+  // Emergency charge bypasses price check when SOC is critically low.
+  const planSaysCharge = false; // LP plan disabled for execution
+  const chargeCondition = currentPrice <= dynamicBuyMax || emergencyCharge;
 
-  if (inPlanChargeWindow && !pastChargeCutoff && !priceOkInWindow && !emergencyCharge) {
-    console.log(`[PLAN] In window but price ${currentPrice.toFixed(1)}c > ceiling ${PLAN_CHARGE_MAX_C}c — suppressing charge`);
-  }
-
-  console.log(`[PLAN] planSaysCharge=${planSaysCharge} inWindow=${inPlanChargeWindow} priceOk=${priceOkInWindow}(≤${PLAN_CHARGE_MAX_C}c) pastCutoff=${pastChargeCutoff} final=${chargeCondition} (plan=${todayPlan ? 'active' : 'fallback'}) price=${currentPrice.toFixed(1)}c`);
+  console.log(`[PLAN] plan=${todayPlan ? 'loaded(ref-only)' : 'none'} inWindow=${inPlanChargeWindow}(ignored) price=${currentPrice.toFixed(1)}c dynamicBuyMax=${dynamicBuyMax.toFixed(1)}c chargeCondition=${chargeCondition}`);
 
   if (cheapEntryOk && chargeCondition) {
     // Plan mode: no entry buffer — act immediately on window signal
@@ -1156,48 +1147,18 @@ function decide(ess, pvPower, amber, state, dailySummary) {
     state.chargeEntryCount = 0;
   }
 
-  // Exit charging: plan window ended, SOC full, or cutoff reached
+  // Exit charging: SOC full or price too high (plan windows no longer used for execution)
   if (state.currentMode === MODE.BACKUP && !emergencyCharge) {
-    const windowEnded = todayPlan && !inPlanChargeWindow;
-    const cutoffHit   = todayPlan && pastChargeCutoff;
-    const socFull     = soc >= CHEAP_CHARGE_SOC;
+    const socFull = soc >= CHEAP_CHARGE_SOC;
 
-    if (cutoffHit) {
-      targetMode = MODE.SELF_USE;
-      reason = `plan cutoff hour=${todayPlan.chargeCutoffHour} reached — stop charging (SOC ${soc}%)`;
-      state.chargeExitCount = 0;
-      return { targetMode, reason, alert };
-    }
     if (socFull) {
       targetMode = MODE.SELF_USE;
       reason = `SOC target ${CHEAP_CHARGE_SOC}% reached (SOC ${soc}%) — stop charging`;
       state.chargeExitCount = 0;
       return { targetMode, reason, alert };
     }
-    if (windowEnded) {
-      // Plan window closed — exit immediately (no buffer needed, plan is authoritative)
-      targetMode = MODE.SELF_USE;
-      reason = `plan charge window ended (hour=${planSydHour}, buy=${currentPrice.toFixed(1)}c) — stop charging`;
-      state.chargeExitCount = 0;
-      return { targetMode, reason, alert };
-    }
-    // In window but price exceeded ceiling — exit charging (price too high)
-    if (todayPlan && inPlanChargeWindow && !priceOkInWindow && !emergencyCharge) {
-      const overCount = (state.chargeExitCount || 0) + 1;
-      if (overCount >= 2) {
-        targetMode = MODE.SELF_USE;
-        reason = `price ${currentPrice.toFixed(1)}c > ceiling ${PLAN_CHARGE_MAX_C}c in plan window — stop charging`;
-        state.chargeExitCount = 0;
-        return { targetMode, reason, alert };
-      } else {
-        state.chargeExitCount = overCount;
-        console.log(`[INFO] Price over ceiling in window (count=${overCount}/2): ${currentPrice.toFixed(1)}c > ${PLAN_CHARGE_MAX_C}c`);
-      }
-    } else {
-      state.chargeExitCount = 0;
-    }
-    // No plan: keep a 3-interval exit buffer to avoid thrashing
-    if (!todayPlan && currentPrice > dynamicBuyMax) {
+    // Exit when price rises above threshold — 3-interval buffer to avoid thrashing
+    if (currentPrice > dynamicBuyMax) {
       const overCount = (state.chargeExitCount || 0) + 1;
       if (overCount >= 3) {
         targetMode = MODE.SELF_USE;
