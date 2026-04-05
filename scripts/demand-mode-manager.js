@@ -1076,19 +1076,13 @@ function decide(ess, pvPower, amber, state, dailySummary) {
     : 0;  // No forecast slots available (past 16:00 or no data) — set to 0 so dynamicBuyMax falls to floor (9.6c), effectively disabling grid charging
   const dynamicBuyMax = Math.max(9.6, forecastMinBuy * 1.3); // max(avg6×1.3, 9.6c) — floor ensures we catch cheap windows even on low-forecast days
 
-  // Future min price in next 2 hours (for charge throttling)
-  // If a significantly cheaper slot is coming soon, throttle charge to 0.5kW to preserve battery capacity
-  const twoHoursMs = 2 * 60 * 60 * 1000;
-  const futureMinPrice = forecast
-    .filter(p => !p.tariffInformation?.demandWindow)
-    .filter(p => { const t = new Date(p.startTime).getTime(); return t > nowMs && t <= nowMs + twoHoursMs; })
-    .reduce((min, p) => Math.min(min, p.perKwh ?? 999), 999);
-  // Throttle if upcoming price is ≥15% cheaper than current price
-  const THROTTLE_RATIO = 0.85;
-  const chargeThrottled = futureMinPrice < 999 && futureMinPrice < currentPrice * THROTTLE_RATIO;
-  const THROTTLE_CHARGE_KW = 0.5; // kW — trickle charge when cheaper slot is coming
+  // High-load throttle: when homeLoad is large (e.g. hot water heater), charge at 0.5kW only.
+  // When homeLoad is small, Self-use mode lets solar charge the battery naturally — no grid charge needed.
+  const HIGH_LOAD_THRESHOLD_KW = 3.5; // kW — above this = big appliance running
+  const THROTTLE_CHARGE_KW = 0.5;     // kW — trickle charge during high load
+  const chargeThrottled = (ess.homeLoad ?? 0) >= HIGH_LOAD_THRESHOLD_KW;
   if (chargeThrottled) {
-    console.log(`[THROTTLE] Future min price ${futureMinPrice.toFixed(1)}c < current ${currentPrice.toFixed(1)}c × ${THROTTLE_RATIO} — throttling charge to ${THROTTLE_CHARGE_KW}kW`);
+    console.log(`[THROTTLE] homeLoad=${(ess.homeLoad??0).toFixed(2)}kW >= ${HIGH_LOAD_THRESHOLD_KW}kW — throttling charge to ${THROTTLE_CHARGE_KW}kW`);
   }
 
   // Peak feedIn until end of selling window (until SELL_STOP_HOUR or demand window)
@@ -1550,7 +1544,7 @@ async function main() {
       const buyTag = chargeThrottled ? '[BUY-THROTTLE]' : '[BUY]';
       if (chargeKw >= minKwForUpdate) {
         const pwOk = await setParam('0xC0BA', chargeKw);
-        console.log(`${buyTag} Updated charge power -> ${chargeKw.toFixed(2)}kW (homeLoad=${(ess.homeLoad??0).toFixed(2)}kW, PV=${(pvPower??0).toFixed(2)}kW, buffer=${CHARGE_SAFETY_BUFFER}kW${chargeThrottled ? ', throttled=future min='+futureMinPrice.toFixed(1)+'c' : ''}) ${pwOk?'OK':'FAILED'}`);
+        console.log(`${buyTag} Updated charge power -> ${chargeKw.toFixed(2)}kW (homeLoad=${(ess.homeLoad??0).toFixed(2)}kW, PV=${(pvPower??0).toFixed(2)}kW, buffer=${CHARGE_SAFETY_BUFFER}kW${chargeThrottled ? ', high-load throttle' : ''}) ${pwOk?'OK':'FAILED'}`);
       } else {
         console.log(`${buyTag} chargeKw=${chargeKw.toFixed(2)}kW < ${minKwForUpdate}kW — stopping charge (no headroom), switching to Self-use`);
         await setMode(MODE.SELF_USE);
