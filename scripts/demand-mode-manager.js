@@ -1006,12 +1006,12 @@ function decide(ess, pvPower, amber, state, dailySummary) {
 
   // ── Priority 3: Free/negative-price charging (spot <= 0) ─────────────────
   // Guard: never charge during demand window (handled in priority 1)
-  if (gridHeadroomOk && !currentDemand && spotPrice <= CHARGE_SPOT_MAX && soc < SOC_MAX_CHARGE) {
+  if (gridHeadroomOk && !currentDemand && spotPrice <= CHARGE_SPOT_MAX && soc < CHEAP_CHARGE_SOC) {
     targetMode = MODE.BACKUP;
     reason = `spot=${spotPrice.toFixed(2)}c (<=0) — free charging (SOC ${soc}% -> ${SOC_MAX_CHARGE}%)`;
     return { targetMode, reason, alert };
   }
-  if (!currentDemand && spotPrice <= CHARGE_SPOT_MAX && soc >= SOC_MAX_CHARGE) {
+  if (!currentDemand && spotPrice <= CHARGE_SPOT_MAX && soc >= CHEAP_CHARGE_SOC) {
     // Battery full — exit Backup
     if (state.currentMode === MODE.BACKUP) {
       targetMode = MODE.SELF_USE;
@@ -1217,7 +1217,7 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   // Only fires when no plan active OR plan says idle but price is extremely cheap.
   // Uses 2-interval buffer to avoid single-spike noise.
   const EXTREMELY_LOW_MAX = 10; // c/kWh
-  if (gridHeadroomOk && !currentDemand && descriptor === 'extremelyLow' && currentPrice < EXTREMELY_LOW_MAX && soc < SOC_MAX_CHARGE && state.currentMode !== MODE.BACKUP) {
+  if (gridHeadroomOk && !currentDemand && descriptor === 'extremelyLow' && currentPrice < EXTREMELY_LOW_MAX && soc < CHEAP_CHARGE_SOC && state.currentMode !== MODE.BACKUP) {
     const elEntryCount = (state.extremelyLowEntryCount || 0) + 1;
     if (elEntryCount >= 2) {
       targetMode = MODE.BACKUP;
@@ -1232,9 +1232,9 @@ function decide(ess, pvPower, amber, state, dailySummary) {
     state.extremelyLowEntryCount = 0;
   }
   if (state.currentMode === MODE.BACKUP && !emergencyCharge) {
-    if (currentPrice > dynamicBuyMax || soc >= SOC_MAX_CHARGE) {
+    if (currentPrice > dynamicBuyMax || soc >= CHEAP_CHARGE_SOC) {
       const overCount = (state.elExitCount || 0) + 1;
-      if (soc >= SOC_MAX_CHARGE || overCount >= 3) {
+      if (soc >= CHEAP_CHARGE_SOC || overCount >= 3) {
         targetMode = MODE.SELF_USE;
         reason = `extremelyLow ended buy=${currentPrice.toFixed(1)}c dynamicMax=${dynamicBuyMax.toFixed(1)}c SOC=${soc}%`;
         state.elExitCount = 0;
