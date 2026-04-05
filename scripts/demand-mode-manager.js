@@ -572,7 +572,9 @@ const CHARGE_SAFETY_BUFFER = 1.0; // kW safety headroom above house load — pro
 // HIGH_LOAD_ABORT_KW: hard trip-protection ceiling. If homeLoad >= this AND calcChargeKw < MIN_CHARGE_KW,
 // stop charging. Set to MAX_GRID_TARGET - 0.5 so calcChargeKw() (which already accounts for buffer) is the
 // real dynamic controller; this is only a last-resort hard stop.
-const HIGH_LOAD_ABORT_KW  = MAX_GRID_TARGET - 0.5; // kW — hard abort only when truly no headroom left
+const HIGH_LOAD_ABORT_KW      = MAX_GRID_TARGET - 0.5; // kW — hard abort only when truly no headroom left
+const HIGH_LOAD_THRESHOLD_KW  = 3.5; // kW — above this = big appliance running (e.g. hot water heater)
+const THROTTLE_CHARGE_KW      = 0.5; // kW — trickle charge when high load detected
 
 function calcChargeKw(homeLoad, pvPower) {
   // Available grid headroom for charging = target - net house draw - safety buffer
@@ -626,7 +628,7 @@ async function getGridPower() {
 // For Charging mode (BACKUP), uses the Timed charge setup with dynamic power calc.
 // Also verifies grid is actually exporting (gridPower > 0) for Selling.
 // Returns true if mode was confirmed, false if all attempts failed.
-async function setModeWithVerify(targetMode, { homeLoad, pvPower, nextDemandMinutes, sellPowerKw } = {}) {
+async function setModeWithVerify(targetMode, { homeLoad, pvPower, nextDemandMinutes, sellPowerKw, throttled = false } = {}) {
   const label = MODE_LABEL[targetMode] ?? targetMode;
   const isTimed = targetMode === MODE.SELLING || targetMode === MODE.BACKUP;
   const maxAttempts = isTimed ? 2 : 5; // Timed setup: max 2 (multi-step × 2 costly); Self-use/others: up to 5
@@ -640,7 +642,7 @@ async function setModeWithVerify(targetMode, { homeLoad, pvPower, nextDemandMinu
     if (targetMode === MODE.SELLING) {
       ok = await setSellingMode(nextDemandMinutes, sellPowerKw);
     } else if (targetMode === MODE.BACKUP) {
-      ok = await setChargingMode(homeLoad, pvPower, nextDemandMinutes, chargeThrottled);
+      ok = await setChargingMode(homeLoad, pvPower, nextDemandMinutes, throttled);
       if (!ok) {
         console.warn(`[WARN] Charging setup skipped or failed (attempt ${attempt}/${maxAttempts})`);
         if (attempt < maxAttempts) await new Promise(r => setTimeout(r, 3000));
@@ -828,7 +830,7 @@ function appendLog(record) {
       recordTrigger:   record.recordTrigger   ?? null,
       chargeKw:        record.chargeKw        ?? null,
       dischargeKw:     record.dischargeKw     ?? null,
-      modeVerifyOk:    record.mode_verify_ok  ?? null,
+      modeVerifyOk:    record.mode_verify_ok  != null ? (record.mode_verify_ok ? 1 : 0) : null,
       modeFrom:        record.mode_from       ?? null,
       modeTo:          record.mode_to         ?? null,
       solarWm2:        record.solar_wm2       ?? null,
@@ -1078,8 +1080,6 @@ function decide(ess, pvPower, amber, state, dailySummary) {
 
   // High-load throttle: when homeLoad is large (e.g. hot water heater), charge at 0.5kW only.
   // When homeLoad is small, Self-use mode lets solar charge the battery naturally — no grid charge needed.
-  const HIGH_LOAD_THRESHOLD_KW = 3.5; // kW — above this = big appliance running
-  const THROTTLE_CHARGE_KW = 0.5;     // kW — trickle charge during high load
   const chargeThrottled = (ess.homeLoad ?? 0) >= HIGH_LOAD_THRESHOLD_KW;
   if (chargeThrottled) {
     console.log(`[THROTTLE] homeLoad=${(ess.homeLoad??0).toFixed(2)}kW >= ${HIGH_LOAD_THRESHOLD_KW}kW — throttling charge to ${THROTTLE_CHARGE_KW}kW`);
@@ -1325,7 +1325,7 @@ function decide(ess, pvPower, amber, state, dailySummary) {
     reason = "initialising — default to Self-use";
   }
 
-  return { targetMode, reason, alert };
+  return { targetMode, reason, alert, chargeThrottled };
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -1460,7 +1460,7 @@ async function main() {
       return _db.prepare("SELECT * FROM daily_summary WHERE date=?").get(today) || {};
     } catch { return {}; }
   })();
-  const { targetMode, reason, alert } = decide(ess, pvPower, amber, state, todaySummary);
+  const { targetMode, reason, alert, chargeThrottled } = decide(ess, pvPower, amber, state, todaySummary);
 
   if (alert) console.log(`[ALERT] ${alert}`);
 
@@ -1470,7 +1470,7 @@ async function main() {
 
   if (targetMode !== null && targetMode !== state.currentMode) {
     console.log(`[ACTION] ${MODE_LABEL[state.currentMode] ?? "unknown"} -> ${MODE_LABEL[targetMode]}: ${reason}`);
-    const ok = await setModeWithVerify(targetMode, { homeLoad: ess.homeLoad, pvPower, nextDemandMinutes: amber.nextDemandMinutes, sellPowerKw: alert?.sellPowerKw });
+    const ok = await setModeWithVerify(targetMode, { homeLoad: ess.homeLoad, pvPower, nextDemandMinutes: amber.nextDemandMinutes, sellPowerKw: alert?.sellPowerKw, throttled: chargeThrottled });
     if (ok) {
       state.currentMode = targetMode;
       state.lastSwitchTime = now.toISOString();
