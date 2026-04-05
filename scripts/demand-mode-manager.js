@@ -128,7 +128,9 @@ const MODE = { SELF_USE: 0, TIMED: 1, PV_PRIORITY: 5, SELLING: 6, BACKUP: 1 };
 const MODE_LABEL = { 0: "Self-use", 1: "Timed/Charging", 3: "Backup(unused)", 5: "PV-Priority", 6: "Selling", 7: "Voltage-Reg" };
 
 // Strategy parameters
-const SOC_MAX_CHARGE = 85;        // Target SOC for backup/charge modes (%)
+const SOC_MAX_CHARGE = 90;        // Target SOC default — may be overridden dynamically below
+const SOC_MAX_CHARGE_ULTRACHEAP = 100; // % — charge to 100% when price <= this threshold
+const ULTRACHEAP_PRICE_C = 7.0;   // ¢ — "ultra cheap" threshold
                                   // 85% chosen: above this BMS throttles charge rate,
                                   // PV surplus only earns ~2.8c feedIn — not worth grid charging
 // SOC_MIN_SELL is time-dependent (see getSocMinSell() below):
@@ -1084,7 +1086,8 @@ function decide(ess, pvPower, amber, state, dailySummary) {
 
   const CHEAP_EXIT_MIN  = 13.0;  // c/kWh — exit threshold (asymmetric: hold charge longer)
   const SPREAD_MIN      = 7.0;   // c/kWh — minimum buy→sell spread to justify charging
-  const CHEAP_CHARGE_SOC = SOC_MAX_CHARGE;
+  // Dynamic SOC target: charge to 100% when price is ultra-cheap (<=7¢), else 90%
+  const CHEAP_CHARGE_SOC = currentPrice <= ULTRACHEAP_PRICE_C ? SOC_MAX_CHARGE_ULTRACHEAP : SOC_MAX_CHARGE;
 
   const peakFeedIn      = peakFeedInToday ?? 0;
   const spreadOk        = peakFeedIn > 0 && (currentPrice + SPREAD_MIN) <= peakFeedIn;
