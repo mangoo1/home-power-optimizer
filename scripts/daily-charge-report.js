@@ -24,7 +24,7 @@ const CHARGE_BUFFER = 1.0;   // kW 空开安全余量
 const MAX_CH        = 5.0;   // kW 最大充电
 const MAX_DIS       = 5.0;   // kW 最大放电
 const CHARGE_MAX_C  = 10.0;  // ¢ 充电买价上限
-const SELL_MIN_C    = 5.0;   // ¢ 卖电最低 feedIn
+const SELL_MIN_C    = 8.0;   // ¢ 卖电最低 feedIn（低于此卖电不划算）
 const SOC_MIN_PCT   = 20;    // % 最低余量保留
 const SOC_TARGET    = 85;    // % 充电目标
 
@@ -125,26 +125,21 @@ async function main() {
   const raw = await fetchAmberPrices();
   if (!Array.isArray(raw)) throw new Error('Amber API error: ' + JSON.stringify(raw).slice(0,100));
 
-  // 按半小时聚合
+  // 按半小时聚合 — 只取今天 Sydney 日期的数据
+  const todaySyd = new Date().toLocaleDateString('en-CA', { timeZone: 'Australia/Sydney' }); // YYYY-MM-DD
   const priceSlots = {};
   raw.forEach(p => {
-    const t    = new Date(p.startTime);
-    // Convert to Sydney time properly
-    const sydStr = t.toLocaleString('en-AU', {
-      timeZone: 'Australia/Sydney',
-      year:'numeric', month:'2-digit', day:'2-digit',
-      hour:'2-digit', minute:'2-digit', hour12: false
-    });
-    const parts = sydStr.match(/(\d+)\/(\d+)\/(\d+),\s*(\d+):(\d+)/);
-    if (!parts) return;
-    const [, dd, mm, yyyy, hh, min] = parts;
-    const todaySyd = sydNow.toISOString().slice(0,10).split('-').reverse().join('/');
-    // only today
-    if (`${dd}/${mm}/${yyyy}` !== todaySyd.split('-').reverse().join('/') &&
-        `${dd}/${mm}/${yyyy}` !== `${String(sydNow.getUTCDate()).padStart(2,'0')}/${String(sydNow.getUTCMonth()+1).padStart(2,'0')}/${sydNow.getUTCFullYear()}`) return;
+    const t      = new Date(p.startTime);
+    const dateSyd = t.toLocaleDateString('en-CA', { timeZone: 'Australia/Sydney' });
+    if (dateSyd !== todaySyd) return; // 只要今天
 
-    const slotMin = parseInt(min) < 30 ? 0 : 30;
-    const key     = hh + ':' + String(slotMin).padStart(2,'0');
+    const timeSyd = t.toLocaleTimeString('en-AU', {
+      timeZone: 'Australia/Sydney', hour:'2-digit', minute:'2-digit', hour12: false
+    });
+    const [hh, min] = timeSyd.split(':');
+    const slotMin = parseInt(min) < 30 ? '00' : '30';
+    const key = hh + ':' + slotMin;
+
     if (!priceSlots[key]) priceSlots[key] = { buyN:0, buyS:0, fiS:0, dw:false };
     if (p.channelType === 'general') { priceSlots[key].buyS += p.perKwh; priceSlots[key].buyN++; }
     if (p.channelType === 'feedIn')  priceSlots[key].fiS += Math.abs(p.perKwh);
