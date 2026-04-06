@@ -79,6 +79,11 @@
     <div class="unit">kW</div>
   </div>
   <div class="stat">
+    <div class="label">Solar PV</div>
+    <div class="value yellow" id="pv">--</div>
+    <div class="unit">kW</div>
+  </div>
+  <div class="stat">
     <div class="label">Grid</div>
     <div class="value" id="grid">--</div>
     <div class="unit">kW</div>
@@ -226,7 +231,7 @@ function getFmtFn() {
 
 async function loadStats() {
   // Latest record
-  const latest = await query('SELECT ts, soc, batt_power, home_load, grid_power, buy_price, feedin_price, mode FROM energy_log ORDER BY ts DESC LIMIT 1');
+  const latest = await query('SELECT ts, soc, batt_power, home_load, grid_power, buy_price, feedin_price, mode, pv_power FROM energy_log ORDER BY ts DESC LIMIT 1');
   if (latest.length > 0) {
     const r = latest[0];
     const soc  = parseFloat(v(r[1]) || 0);
@@ -235,6 +240,7 @@ async function loadStats() {
     const grid = parseFloat(v(r[4]) || 0);
     const buy  = parseFloat(v(r[5]) || 0);
     const fi   = parseFloat(v(r[6]) || 0);
+    const pv   = parseFloat(v(r[8]) || 0);
 
     document.getElementById('soc').textContent   = soc.toFixed(0);
     document.getElementById('soc').className     = 'value ' + (soc > 60 ? 'green' : soc > 30 ? 'yellow' : 'red');
@@ -244,6 +250,7 @@ async function loadStats() {
     document.getElementById('grid').className    = 'value ' + (grid < 0 ? 'green' : grid > 0.5 ? 'red' : '');
     document.getElementById('buy').textContent   = buy.toFixed(2);
     document.getElementById('feedin').textContent = fi.toFixed(2);
+    document.getElementById('pv').textContent    = pv.toFixed(2);
   }
 
   // Today summary
@@ -267,7 +274,7 @@ async function loadCharts() {
   const fmtFn  = getFmtFn();
 
   const hist = await query(`SELECT ts, soc, batt_power, home_load, grid_power, buy_price, feedin_price,
-    meter_buy_total, meter_sell_total, record_trigger
+    meter_buy_total, meter_sell_total, record_trigger, pv_power
     FROM energy_log WHERE ${where} ORDER BY ts`);
 
   const labels  = hist.map(r => fmtFn(v(r[0])));
@@ -277,6 +284,7 @@ async function loadCharts() {
   const grids   = hist.map(r => parseFloat(v(r[4]) || 0));
   const buys    = hist.map(r => parseFloat(v(r[5]) || 0));
   const feedins = hist.map(r => parseFloat(v(r[6]) || 0));
+  const pvs     = hist.map(r => parseFloat(v(r[10]) || 0));
 
   // Cost chart — always use daily_summary (only reliable cost source)
   if (costChartObj) { costChartObj.destroy(); costChartObj = null; }
@@ -309,7 +317,8 @@ async function loadCharts() {
   powerChartObj = new Chart(document.getElementById('powerChart'), {
     type: 'line',
     data: { labels, datasets: [
-      { label: 'Home Load', data: loads, borderColor: '#fbbf24', tension: 0.3, pointRadius: 0 },
+      { label: 'Solar PV',  data: pvs,   borderColor: '#facc15', backgroundColor: 'rgba(250,204,21,0.08)', fill: true, tension: 0.3, pointRadius: 0 },
+      { label: 'Home Load', data: loads, borderColor: '#fb923c', tension: 0.3, pointRadius: 0 },
       { label: 'Battery',   data: batts, borderColor: '#60a5fa', tension: 0.3, pointRadius: 0 },
       { label: 'Grid',      data: grids, borderColor: '#f87171', tension: 0.3, pointRadius: 0 }
     ]},
