@@ -310,7 +310,8 @@ async function main() {
         socKwh -= drawKwh;
       }
 
-    } else if (buyC <= buyThresholdC && socKwh < socMaxKwh && h >= 6 && h < 17) {
+    } else if (buyC <= buyThresholdC && socKwh < socMaxKwh - 0.1 && h >= 6 && h < 16) {
+      // Cheap price window: charge from grid (stop by 16:00 — prepare for evening sell)
       // Cheap price window: charge from grid
       // Dynamic charge power: limited by breaker headroom after hot water + home load
       const netHouseDraw = load - pv;  // includes hot water if active

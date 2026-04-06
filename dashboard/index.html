@@ -523,7 +523,7 @@ async function loadPlan() {
       reason = `卖价${feedRange}c，放电卖网`;
     } else {
       actionLabel = `🔄 自用${hwTag}`; actionClass = 'action-self';
-      reason = b.inHW ? `热水器运行，PV+电网直供` : `买卖价差不划算，自用`;
+      reason = b.inHW ? `热水器运行，空开余量不足充电，PV+电网直供` : `买卖价差不划算，自用`;
     }
 
     tr.innerHTML = `
