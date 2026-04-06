@@ -23,6 +23,20 @@
   canvas { max-height: 200px; }
   .footer { text-align: center; font-size: 0.7rem; color: #555; margin-top: 14px; }
 
+  /* Plan panel */
+  .plan-card { background: #1a1d27; border-radius: 12px; padding: 14px; margin-bottom: 14px; }
+  .plan-card h2 { font-size: 0.9rem; color: #aaa; margin-bottom: 10px; }
+  .plan-meta { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; font-size: 0.75rem; color: #888; }
+  .plan-meta span { background: #0f1117; border-radius: 6px; padding: 3px 8px; }
+  .plan-table { width: 100%; border-collapse: collapse; font-size: 0.75rem; }
+  .plan-table th { color: #666; font-weight: 500; text-align: left; padding: 4px 6px; border-bottom: 1px solid #222; }
+  .plan-table td { padding: 4px 6px; border-bottom: 1px solid #1a1d27; }
+  .plan-table tr:hover td { background: #22263a; }
+  .action-charge { color: #60a5fa; font-weight: 600; }
+  .action-sell   { color: #4ade80; font-weight: 600; }
+  .action-self   { color: #888; }
+  .now-row td { background: #2a2d3a !important; }
+
   /* Time range selector */
   .timerange { display: flex; gap: 8px; justify-content: center; margin-bottom: 16px; flex-wrap: wrap; }
   .timerange button {
@@ -107,6 +121,20 @@
 <div class="chart-card">
   <h2>💵 当天累计电费 (AUD)</h2>
   <canvas id="costChart"></canvas>
+</div>
+
+<!-- Today's charge/sell plan -->
+<div class="plan-card">
+  <h2>📋 今日充放电计划</h2>
+  <div class="plan-meta" id="plan-meta">加载中...</div>
+  <div style="overflow-x:auto">
+    <table class="plan-table">
+      <thead><tr>
+        <th>时间</th><th>买¢</th><th>卖¢</th><th>行动</th><th>原因</th>
+      </tr></thead>
+      <tbody id="plan-body"></tbody>
+    </table>
+  </div>
 </div>
 
 <div class="footer" id="updated">Loading...</div>
@@ -308,7 +336,7 @@ async function loadCharts() {
 
 async function load() {
   try {
-    await Promise.all([loadStats(), loadCharts()]);
+    await Promise.all([loadStats(), loadCharts(), loadPlan()]);
   } catch(e) {
     document.getElementById('updated').textContent = 'Error: ' + e.message;
     console.error(e);
@@ -317,6 +345,119 @@ async function load() {
 
 load();
 setInterval(load, 5 * 60 * 1000);
+
+async function loadPlan() {
+  // Get today's active plan (highest version)
+  const planRows = await query(
+    `SELECT date, version, generated_at, soc_at_gen, has_demand_window,
+            charge_cutoff_hour, pv_forecast_kwh, pv_peak_kw,
+            charge_windows_json, intervals_json
+     FROM daily_plan WHERE is_active=1 ORDER BY generated_at DESC LIMIT 1`
+  );
+  if (!planRows.length) {
+    document.getElementById('plan-meta').textContent = '暂无计划数据';
+    return;
+  }
+  const p = planRows[0];
+  const date        = v(p[0]);
+  const ver         = v(p[1]);
+  const genAt       = v(p[2]);
+  const socAtGen    = parseFloat(v(p[3]) || 0);
+  const hasDW       = parseInt(v(p[4]) || 0);
+  const cutoff      = v(p[5]);
+  const pvKwh       = parseFloat(v(p[6]) || 0);
+  const pvPeak      = parseFloat(v(p[7]) || 0);
+  const chargeWins  = JSON.parse(v(p[8]) || '[]');
+  const intervals   = JSON.parse(v(p[9]) || '[]');
+
+  // Meta info
+  const genSyd = toSydney(genAt);
+  const genStr = genSyd.toLocaleTimeString('en-AU', { timeZone: 'Australia/Sydney', hour: '2-digit', minute: '2-digit' });
+  const cwStr  = chargeWins.map(w => `${w.startHour}:00–${w.endHour}:00 avg${w.avgPriceC?.toFixed(1)}c`).join(', ') || '无充电窗口';
+  document.getElementById('plan-meta').innerHTML =
+    `<span>📅 ${date} v${ver}</span>` +
+    `<span>⏱ 生成于 ${genStr}</span>` +
+    `<span>🔋 生成时SOC ${socAtGen}%</span>` +
+    `<span>☀️ PV预测 ${pvKwh.toFixed(1)}kWh (峰值${pvPeak.toFixed(1)}kW)</span>` +
+    `<span>${hasDW ? '⚠️ 有Demand Window' : '✅ 无Demand Window'}</span>` +
+    `<span>⚡ 充电窗口: ${cwStr}</span>` +
+    `<span>🛑 截止充电: ${cutoff}:00</span>`;
+
+  // Current Sydney time for highlighting
+  const nowSyd = new Date(new Date().getTime() + SYD_OFF * 3600 * 1000);
+  const nowHH  = nowSyd.getUTCHours();
+  const nowMM  = nowSyd.getUTCMinutes();
+  const nowMins = nowHH * 60 + nowMM;
+
+  // Action reason helper
+  function actionReason(interval) {
+    if (interval.action === 'charge') {
+      return `买价${interval.buyC}c 低于充电上限，充电划算`;
+    } else if (interval.action === 'sell') {
+      const margin = (interval.feedinC - interval.buyC).toFixed(1);
+      return `卖价${interval.feedinC}c，收益可观`;
+    }
+    return `买${interval.buyC}c 卖${interval.feedinC}c，维持自用`;
+  }
+
+  const tbody = document.getElementById('plan-body');
+  tbody.innerHTML = '';
+
+  // Group consecutive same-action intervals into blocks
+  let blocks = [];
+  let cur = null;
+  for (const iv of intervals) {
+    const dt   = new Date(iv.nemTime);
+    const syd  = new Date(dt.getTime() + SYD_OFF * 3600 * 1000);
+    const hhmm = syd.getUTCHours() * 60 + syd.getUTCMinutes();
+    const timeStr = syd.getUTCHours().toString().padStart(2,'0') + ':' + syd.getUTCMinutes().toString().padStart(2,'0');
+
+    if (!cur || cur.action !== iv.action) {
+      if (cur) blocks.push(cur);
+      cur = { action: iv.action, startTime: timeStr, startMins: hhmm, endTime: timeStr,
+              minBuy: iv.buyC, maxBuy: iv.buyC, minFeed: iv.feedinC, maxFeed: iv.feedinC, count: 1 };
+    } else {
+      cur.endTime = timeStr;
+      cur.minBuy  = Math.min(cur.minBuy, iv.buyC);
+      cur.maxBuy  = Math.max(cur.maxBuy, iv.buyC);
+      cur.minFeed = Math.min(cur.minFeed, iv.feedinC);
+      cur.maxFeed = Math.max(cur.maxFeed, iv.feedinC);
+      cur.count++;
+    }
+  }
+  if (cur) blocks.push(cur);
+
+  for (const b of blocks) {
+    const isNow = nowMins >= b.startMins && nowMins < (b.startMins + b.count * 5);
+    const tr = document.createElement('tr');
+    if (isNow) tr.className = 'now-row';
+
+    const buyRange  = b.minBuy === b.maxBuy ? b.minBuy.toFixed(1) : `${b.minBuy.toFixed(1)}–${b.maxBuy.toFixed(1)}`;
+    const feedRange = b.minFeed === b.maxFeed ? b.minFeed.toFixed(1) : `${b.minFeed.toFixed(1)}–${b.maxFeed.toFixed(1)}`;
+
+    let actionLabel, actionClass, reason;
+    if (b.action === 'charge') {
+      actionLabel = '⚡ 充电'; actionClass = 'action-charge';
+      reason = `买价低(${buyRange}c)，从电网充电`;
+    } else if (b.action === 'sell') {
+      actionLabel = '💰 卖电'; actionClass = 'action-sell';
+      const avgFeed = ((b.minFeed + b.maxFeed) / 2).toFixed(1);
+      reason = `卖价${feedRange}c，放电卖给电网`;
+    } else {
+      actionLabel = '🔄 自用'; actionClass = 'action-self';
+      reason = `买${buyRange}c 卖${feedRange}c，太阳能自用`;
+    }
+
+    const timeStr = b.startTime === b.endTime ? b.startTime : `${b.startTime}–${b.endTime}`;
+    tr.innerHTML = `
+      <td>${timeStr}${isNow ? ' ◀' : ''}</td>
+      <td>${buyRange}</td>
+      <td>${feedRange}</td>
+      <td class="${actionClass}">${actionLabel}</td>
+      <td style="color:#777;font-size:0.7rem">${reason}</td>`;
+    tbody.appendChild(tr);
+  }
+}
 </script>
 </body>
 </html>

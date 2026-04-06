@@ -34,9 +34,13 @@ async function main() {
   `).all(since);
 
   const dailyRows = db.prepare(`SELECT * FROM daily_summary ORDER BY date DESC LIMIT 7`).all();
+  const planRows  = db.prepare(`SELECT date, version, generated_at, source, soc_at_gen,
+    has_demand_window, charge_cutoff_hour, pv_forecast_kwh, pv_peak_kw,
+    charge_windows_json, intervals_json, notes, is_active
+    FROM daily_plan ORDER BY generated_at DESC LIMIT 14`).all();
   db.close();
 
-  console.log(`[turso-sync] Syncing ${rows.length} energy_log + ${dailyRows.length} daily_summary rows...`);
+  console.log(`[turso-sync] Syncing ${rows.length} energy_log + ${dailyRows.length} daily_summary + ${planRows.length} daily_plan rows...`);
 
   // Sync energy_log in batches of 50
   for (let i = 0; i < rows.length; i += 50) {
@@ -67,6 +71,27 @@ async function main() {
              r.earnings_aud, r.demand_peak_kw, r.demand_charge_est, r.avg_soc,
              r.min_soc, r.max_soc, r.meter_buy_start, r.meter_buy_end,
              r.meter_sell_start, r.meter_sell_end]
+    }));
+    await client.batch(batch, 'write');
+  }
+
+  // Sync daily_plan (ensure table exists first)
+  await client.execute(`CREATE TABLE IF NOT EXISTS daily_plan (
+    date TEXT, version INTEGER, generated_at TEXT, source TEXT, soc_at_gen REAL,
+    has_demand_window INTEGER, charge_cutoff_hour INTEGER,
+    pv_forecast_kwh REAL, pv_peak_kw REAL,
+    charge_windows_json TEXT, intervals_json TEXT, notes TEXT, is_active INTEGER,
+    PRIMARY KEY (date, version))`);
+  if (planRows.length > 0) {
+    const batch = planRows.map(r => ({
+      sql: `INSERT OR REPLACE INTO daily_plan
+        (date,version,generated_at,source,soc_at_gen,has_demand_window,charge_cutoff_hour,
+         pv_forecast_kwh,pv_peak_kw,charge_windows_json,intervals_json,notes,is_active)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      args: [r.date, r.version, r.generated_at, r.source, r.soc_at_gen,
+             r.has_demand_window||0, r.charge_cutoff_hour, r.pv_forecast_kwh,
+             r.pv_peak_kw, r.charge_windows_json, r.intervals_json,
+             r.notes, r.is_active||0]
     }));
     await client.batch(batch, 'write');
   }
