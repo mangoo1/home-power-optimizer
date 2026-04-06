@@ -1,0 +1,42 @@
+---
+# Add /power path to betterscore ingress (non-destructive patch)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: betterscore
+  namespace: betterscore
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+spec:
+  ingressClassName: traefik
+  rules:
+  - http:
+      paths:
+      - backend:
+          service:
+            name: betterscore-backend
+            port:
+              number: 3001
+        path: /api
+        pathType: Prefix
+      - backend:
+          service:
+            name: betterscore-backend
+            port:
+              number: 3001
+        path: /ws
+        pathType: Prefix
+      - backend:
+          service:
+            name: power-dashboard
+            port:
+              number: 80
+        path: /power
+        pathType: Prefix
+      - backend:
+          service:
+            name: betterscore-frontend
+            port:
+              number: 80
+        path: /
+        pathType: Prefix

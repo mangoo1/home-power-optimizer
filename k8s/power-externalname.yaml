@@ -1,0 +1,13 @@
+---
+# ExternalName service in betterscore namespace pointing to power-dashboard in monitoring
+apiVersion: v1
+kind: Service
+metadata:
+  name: power-dashboard
+  namespace: betterscore
+spec:
+  type: ExternalName
+  externalName: power-dashboard.monitoring.svc.cluster.local
+  ports:
+    - port: 80
+      targetPort: 80

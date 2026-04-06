@@ -1,0 +1,82 @@
+---
+# Simple static dashboard served by nginx
+# Reads directly from Turso cloud — zero local SSD reads
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dashboard-html
+  namespace: monitoring
+data:
+  index.html: |
+    PLACEHOLDER
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: power-dashboard
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: power-dashboard
+  template:
+    metadata:
+      labels:
+        app: power-dashboard
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:alpine
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              memory: 16Mi
+              cpu: 10m
+            limits:
+              memory: 32Mi
+              cpu: 100m
+          volumeMounts:
+            - name: html
+              mountPath: /usr/share/nginx/html
+      volumes:
+        - name: html
+          configMap:
+            name: dashboard-html
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: power-dashboard
+  namespace: monitoring
+spec:
+  selector:
+    app: power-dashboard
+  ports:
+    - port: 80
+      targetPort: 80
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: power-dashboard
+  namespace: monitoring
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: power.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: power-dashboard
+                port:
+                  number: 80

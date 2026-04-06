@@ -1,0 +1,48 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: power-dashboard
+  namespace: betterscore
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: power-dashboard
+  template:
+    metadata:
+      labels:
+        app: power-dashboard
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:alpine
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              memory: 16Mi
+              cpu: 10m
+            limits:
+              memory: 32Mi
+              cpu: 100m
+          volumeMounts:
+            - name: html
+              mountPath: /usr/share/nginx/html
+      volumes:
+        - name: html
+          configMap:
+            name: power-dashboard-html
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: power-dashboard
+  namespace: betterscore
+spec:
+  selector:
+    app: power-dashboard
+  ports:
+    - port: 80
+      targetPort: 80

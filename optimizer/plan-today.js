@@ -21,7 +21,7 @@ const solver  = require('javascript-lp-solver');
 const Database = require('better-sqlite3');
 
 const DB_PATH = path.join(__dirname, '..', 'data', 'energy.db');
-const AMBER_TOKEN   = process.env.AMBER_API_TOKEN || 'psk_c654897f6caa055fda06e83369936242';
+const AMBER_TOKEN   = process.env.AMBER_API_TOKEN || process.env.AMBER_TOKEN;
 const AMBER_SITE_ID = process.env.AMBER_SITE_ID   || '01KMN0H71HS5SYAE5P3E9WDGCD';
 
 // ── System config ─────────────────────────────────────────────────────────────
