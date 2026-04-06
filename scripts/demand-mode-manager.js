@@ -586,9 +586,18 @@ function calcChargeKw(homeLoad, pvPower) {
   return parseFloat(chargeKw.toFixed(2));
 }
 
-async function setChargingMode(homeLoad, pvPower, nextDemandMinutes, throttled = false) {
-  let chargeKw = throttled ? THROTTLE_CHARGE_KW : calcChargeKw(homeLoad, pvPower);
-  const minKw = throttled ? 0.1 : MIN_CHARGE_KW; // throttle mode uses lower min (0.1kW)
+async function setChargingMode(homeLoad, pvPower, nextDemandMinutes, throttled = false, planOverrideKw = null) {
+  let chargeKw;
+  if (planOverrideKw !== null && planOverrideKw > 0) {
+    // Plan pre-calculated the charge power (e.g. derated for hot water heater)
+    chargeKw = Math.min(MAX_CHARGE_KW, planOverrideKw);
+    console.log(`[BUY] chargeKw=${chargeKw.toFixed(2)}kW (from plan, hot-water-aware)`);
+  } else if (throttled) {
+    chargeKw = THROTTLE_CHARGE_KW;
+  } else {
+    chargeKw = calcChargeKw(homeLoad, pvPower);
+  }
+  const minKw = throttled ? 0.1 : MIN_CHARGE_KW;
   if (chargeKw < minKw) {
     console.log(`[BUY] chargeKw=${chargeKw.toFixed(2)}kW < ${minKw}kW min — skipping charge`);
     return false;
@@ -630,7 +639,7 @@ async function getGridPower() {
 // For Charging mode (BACKUP), uses the Timed charge setup with dynamic power calc.
 // Also verifies grid is actually exporting (gridPower > 0) for Selling.
 // Returns true if mode was confirmed, false if all attempts failed.
-async function setModeWithVerify(targetMode, { homeLoad, pvPower, nextDemandMinutes, sellPowerKw, throttled = false } = {}) {
+async function setModeWithVerify(targetMode, { homeLoad, pvPower, nextDemandMinutes, sellPowerKw, throttled = false, planChargeKw = null } = {}) {
   const label = MODE_LABEL[targetMode] ?? targetMode;
   const isTimed = targetMode === MODE.SELLING || targetMode === MODE.BACKUP;
   const maxAttempts = isTimed ? 2 : 5; // Timed setup: max 2 (multi-step × 2 costly); Self-use/others: up to 5
@@ -644,7 +653,7 @@ async function setModeWithVerify(targetMode, { homeLoad, pvPower, nextDemandMinu
     if (targetMode === MODE.SELLING) {
       ok = await setSellingMode(nextDemandMinutes, sellPowerKw);
     } else if (targetMode === MODE.BACKUP) {
-      ok = await setChargingMode(homeLoad, pvPower, nextDemandMinutes, throttled);
+      ok = await setChargingMode(homeLoad, pvPower, nextDemandMinutes, throttled, planChargeKw);
       if (!ok) {
         console.warn(`[WARN] Charging setup skipped or failed (attempt ${attempt}/${maxAttempts})`);
         if (attempt < maxAttempts) await new Promise(r => setTimeout(r, 3000));
@@ -1166,8 +1175,10 @@ function decide(ess, pvPower, amber, state, dailySummary) {
             || todayPlan.intervals.find(iv => iv.key && slotKey.startsWith(iv.key.substring(0, 15)));
   }
 
-  const planAction       = planSlot?.action ?? null;   // 'charge' | 'sell' | 'self-use'
+  const planAction       = planSlot?.action ?? null;   // 'charge' | 'sell' | 'self-use' | 'charge+hw'
   const planSlotBuyC     = planSlot?.buyC   ?? null;   // this slot's buy price from plan
+  const planSlotChargeKw = planSlot?.chargeKw ?? null; // pre-calculated charge power (accounts for hot water)
+  const planSlotInHW     = planSlot?.inHW    ?? false; // hot water heater active this slot
   const planSaysCharge   = planAction === 'charge';
   const planSaysSell     = planAction === 'sell';
 
@@ -1514,7 +1525,7 @@ async function main() {
 
   if (targetMode !== null && targetMode !== state.currentMode) {
     console.log(`[ACTION] ${MODE_LABEL[state.currentMode] ?? "unknown"} -> ${MODE_LABEL[targetMode]}: ${reason}`);
-    const ok = await setModeWithVerify(targetMode, { homeLoad: ess.homeLoad, pvPower, nextDemandMinutes: amber.nextDemandMinutes, sellPowerKw: alert?.sellPowerKw, throttled: chargeThrottled });
+    const ok = await setModeWithVerify(targetMode, { homeLoad: ess.homeLoad, pvPower, nextDemandMinutes: amber.nextDemandMinutes, sellPowerKw: alert?.sellPowerKw, throttled: chargeThrottled, planChargeKw: planSlotChargeKw });
     if (ok) {
       state.currentMode = targetMode;
       state.lastSwitchTime = now.toISOString();

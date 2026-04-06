@@ -45,7 +45,19 @@ const SELL_MIN_C       = 13.5;   // c/kWh absolute floor
 const BUY_MULT         = 1.30;
 const BUY_HARD_MAX_C   = 12.0;   // never buy above this regardless
 
-// Home load profile (kW) by Sydney hour
+// ── Hot water heater config ───────────────────────────────────────────────────
+// Two heaters, ~5kW total, need 2 hours. Planner picks the best 2h window
+// (cheapest price + strongest PV) between HOT_WATER_EARLIEST and HOT_WATER_LATEST.
+// During that window homeLoad is inflated by HOT_WATER_KW, and charge power is
+// reduced accordingly so total grid draw never exceeds BREAKER_KW.
+const HOT_WATER_KW      = 5.0;   // combined load of both heaters
+const HOT_WATER_HOURS   = 2;     // duration needed
+const HOT_WATER_EARLIEST = 9;    // not before 09:00 (PV needs to be up)
+const HOT_WATER_LATEST   = 16;   // must finish by 16:00 (before evening peak)
+const BREAKER_KW         = 7.7;
+const BREAKER_BUFFER_KW  = 1.0;  // safety headroom
+
+// Home load profile (kW) by Sydney hour — excludes hot water heater
 function homeLoadKw(hour) {
   if (hour >= 6  && hour < 9)  return 1.2;  // morning routine
   if (hour >= 9  && hour < 12) return 0.5;  // quiet day
@@ -54,6 +66,27 @@ function homeLoadKw(hour) {
   if (hour >= 17 && hour < 21) return 1.5;  // evening peak
   if (hour >= 21 && hour < 23) return 0.8;  // winding down
   return 0.35;                               // overnight standby
+}
+
+// Pick best 2h hot water window: score = PV - buyC (more PV + cheaper = better)
+function pickHotWaterWindow(slots, pvByHour) {
+  const candidates = [];
+  const slotCount = HOT_WATER_HOURS * 2; // 30-min slots needed
+  for (let i = 0; i <= slots.length - slotCount; i++) {
+    const window = slots.slice(i, i + slotCount);
+    const startH = window[0].hour;
+    const endH   = window[slotCount - 1].hour + 1;
+    if (startH < HOT_WATER_EARLIEST || endH > HOT_WATER_LATEST) continue;
+    if (window.some(s => s.demandWindow)) continue;
+    const avgBuy = window.reduce((s, v) => s + v.buyC, 0) / window.length;
+    const avgPv  = window.reduce((s, v) => s + (pvByHour[v.hour] || 0), 0) / window.length;
+    // Score: lower buy price = better, higher PV = better (offsets heater load)
+    const score = avgPv - avgBuy * 0.5;
+    candidates.push({ startH, endH, avgBuy, avgPv, score, slots: window });
+  }
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates[0];
 }
 
 // ── Timezone helpers ──────────────────────────────────────────────────────────
@@ -212,6 +245,18 @@ async function main() {
   console.log(`   Buy threshold: ≤ ${buyThresholdC.toFixed(1)}c/kWh`);
   console.log(`   Sell threshold: ≥ ${SELL_MIN_C}c/kWh`);
 
+  // ── Hot water window selection ──────────────────────────────────────────────
+  const hwWindow = pickHotWaterWindow(slots.filter(s => s.key.startsWith(today)), pvByHour);
+  if (hwWindow) {
+    console.log(`\n🚿 Hot water window: ${String(hwWindow.startH).padStart(2,'0')}:00–${String(hwWindow.endH).padStart(2,'0')}:00`);
+    console.log(`   Avg buy: ${hwWindow.avgBuy.toFixed(1)}c  Avg PV: ${hwWindow.avgPv.toFixed(2)}kW`);
+    console.log(`   During this window: homeLoad +${HOT_WATER_KW}kW, charge power auto-reduced`);
+  } else {
+    console.log(`\n🚿 Hot water: no suitable window found (no gap in ${HOT_WATER_EARLIEST}:00–${HOT_WATER_LATEST}:00)`);
+  }
+  const hwStartH = hwWindow?.startH ?? null;
+  const hwEndH   = hwWindow?.endH   ?? null;
+
   // ── 4. Walk slots and build plan ────────────────────────────────────────────
   console.log('\n Time    Buy¢  FdIn¢  PV kW  Load kW  NetKwh  SOC%  Action      ChargeKw');
   console.log('─────────────────────────────────────────────────────────────────────────');
@@ -230,9 +275,11 @@ async function main() {
 
   for (const slot of slots) {
     const h       = slot.hour;
-    const load    = homeLoadKw(h);
+    const inHW    = hwStartH !== null && h >= hwStartH && h < hwEndH;
+    const baseLoad = homeLoadKw(h);
+    const load    = baseLoad + (inHW ? HOT_WATER_KW : 0);  // total load incl. hot water
     const pv      = pvByHour[h] ?? 0;
-    const netKwh  = (pv - load) * INTERVAL_H;   // positive = PV surplus, negative = deficit
+    const netKwh  = (pv - load) * INTERVAL_H;
     const inDW    = slot.demandWindow;
     const buyC    = slot.buyC;
     const feedinC = slot.feedinC;
@@ -265,16 +312,15 @@ async function main() {
 
     } else if (buyC <= buyThresholdC && socKwh < socMaxKwh && h >= 6 && h < 17) {
       // Cheap price window: charge from grid
-      // Dynamic charge power: min(maxCharge, breaker headroom - homeLoad)
-      const BREAKER_KW = 7.7;
-      const BUFFER_KW  = 1.0;
-      const available  = BREAKER_KW - load - BUFFER_KW;
+      // Dynamic charge power: limited by breaker headroom after hot water + home load
+      const netHouseDraw = load - pv;  // includes hot water if active
+      const available    = BREAKER_KW - netHouseDraw - BREAKER_BUFFER_KW;
       chargeKw  = Math.min(MAX_CHARGE_KW, Math.max(0, available));
       chargeKwh = chargeKw * INTERVAL_H * CHARGE_EFF;
       const canCharge = Math.min(chargeKwh, socMaxKwh - socKwh);
       socKwh   += canCharge;
       action    = chargeKw > 0 ? 'charge' : 'self-use';
-      chargeKw  = chargeKw;
+      if (inHW && chargeKw > 0) action = 'charge+hw';  // mark hot water overlap
 
     } else if (feedinC >= SELL_MIN_C && h < SELL_STOP_HOUR) {
       // High feedIn: sell
@@ -314,6 +360,8 @@ async function main() {
       feedinC:  parseFloat(feedinC.toFixed(2)),
       pvKw:     parseFloat(pv.toFixed(3)),
       loadKw:   parseFloat(load.toFixed(2)),
+      baseLoadKw: parseFloat(baseLoad.toFixed(2)),
+      inHW:     inHW,
       action,
       chargeKw: parseFloat(chargeKw.toFixed(2)),
       inDW:     inDW,
@@ -355,7 +403,14 @@ async function main() {
     pv_forecast_kwh, pv_peak_kw,
     JSON.stringify(chargeWindow),
     JSON.stringify(intervals),
-    JSON.stringify({ buyThresholdC, sellMinC: SELL_MIN_C, pvDiscount: PV_DISCOUNT }),
+    JSON.stringify({
+      buyThresholdC,
+      sellMinC: SELL_MIN_C,
+      pvDiscount: PV_DISCOUNT,
+      hotWater: hwWindow
+        ? { startH: hwWindow.startH, endH: hwWindow.endH, avgBuyC: parseFloat(hwWindow.avgBuy.toFixed(1)), avgPvKw: parseFloat(hwWindow.avgPv.toFixed(2)) }
+        : null,
+    }),
   );
 
   console.log(`\n✅ Plan v${newVersion} saved to DB (source=rules, hasDW=${hasDW}, chargeWindows=${chargeWindow.length})`);
