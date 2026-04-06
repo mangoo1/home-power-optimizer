@@ -40,9 +40,10 @@ async function main() {
     has_demand_window, charge_cutoff_hour, pv_forecast_kwh, pv_peak_kw,
     charge_windows_json, intervals_json, notes, is_active
     FROM daily_plan ORDER BY generated_at DESC LIMIT 14`).all();
+  const reportRows = db.prepare(`SELECT * FROM daily_plan_report ORDER BY date DESC LIMIT 7`).all();
   db.close();
 
-  console.log(`[turso-sync] Syncing ${rows.length} energy_log + ${dailyRows.length} daily_summary + ${planRows.length} daily_plan rows...`);
+  console.log(`[turso-sync] Syncing ${rows.length} energy_log + ${dailyRows.length} daily_summary + ${planRows.length} daily_plan + ${reportRows.length} daily_plan_report rows...`);
 
   // Sync energy_log in batches of 50
   for (let i = 0; i < rows.length; i += 50) {
@@ -103,6 +104,35 @@ async function main() {
   }
 
   const result = await client.execute('SELECT COUNT(*) as cnt FROM energy_log');
+
+  // Sync daily_plan_report
+  await client.execute(`CREATE TABLE IF NOT EXISTS daily_plan_report (
+    date TEXT PRIMARY KEY, generated_at TEXT,
+    current_soc REAL, current_kwh REAL, target_soc REAL, target_kwh REAL,
+    floor_soc REAL, floor_kwh REAL, needed_kwh REAL, pv_forecast_kwh REAL,
+    charge_window TEXT, charge_hours REAL, avg_charge_kw REAL,
+    total_charge_kwh REAL, surplus_kwh REAL,
+    hw_start_h INTEGER, hw_end_h INTEGER, hw_avg_buy_c REAL,
+    sell_window TEXT, avg_sell_feedin_c REAL, sell_slot_count INTEGER,
+    buy_threshold_c REAL, notes TEXT)`);
+  if (reportRows.length > 0) {
+    const batch = reportRows.map(r => ({
+      sql: `INSERT OR REPLACE INTO daily_plan_report
+        (date,generated_at,current_soc,current_kwh,target_soc,target_kwh,
+         floor_soc,floor_kwh,needed_kwh,pv_forecast_kwh,
+         charge_window,charge_hours,avg_charge_kw,total_charge_kwh,surplus_kwh,
+         hw_start_h,hw_end_h,hw_avg_buy_c,
+         sell_window,avg_sell_feedin_c,sell_slot_count,buy_threshold_c,notes)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      args: [r.date, r.generated_at, r.current_soc, r.current_kwh, r.target_soc, r.target_kwh,
+             r.floor_soc, r.floor_kwh, r.needed_kwh, r.pv_forecast_kwh,
+             r.charge_window, r.charge_hours, r.avg_charge_kw, r.total_charge_kwh, r.surplus_kwh,
+             r.hw_start_h, r.hw_end_h, r.hw_avg_buy_c,
+             r.sell_window, r.avg_sell_feedin_c, r.sell_slot_count, r.buy_threshold_c, r.notes]
+    }));
+    await client.batch(batch, 'write');
+  }
+
   console.log(`\n[turso-sync] Done ✓ (${result.rows[0].cnt} rows in Turso)`);
 }
 
