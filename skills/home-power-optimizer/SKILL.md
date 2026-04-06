@@ -32,6 +32,41 @@ mcporter call ess-inverter-mcp ess_get_battery_details '{}' # battery kWh today
 mcporter call ess-inverter-mcp ess_set_mode '{"mode": "backup"}'
 ```
 
+### tuya (Smart Home Devices)
+
+Config: `~/.openclaw/workspace/config/mcporter.json` — entry `tuya`
+Credentials: `TUYA_ACCESS_ID=tru75gfuhh75sw4dddtn`, endpoint=`openapi.tuyaeu.com`
+
+```bash
+# List all devices
+mcporter call tuya.tuya_list_devices --output json
+
+# EV Breaker (electric vehicle charger circuit breaker)
+# Device ID: bf4192662978bb188czjco
+mcporter call tuya.tuya_get_device_status device_id=bf4192662978bb188czjco --output json
+mcporter call tuya.tuya_turn_on_device  device_id=bf4192662978bb188czjco switch_code=switch --output json
+mcporter call tuya.tuya_turn_off_device device_id=bf4192662978bb188czjco switch_code=switch --output json
+
+# Hot water heater (pending — device not yet linked to Tuya IoT project)
+# Once linked, will appear in tuya_list_devices and can be controlled the same way
+```
+
+#### EV Breaker — Phase data decode
+`phase_a` field is Base64-encoded. Decode with:
+```python
+import base64, struct
+data = base64.b64decode(phase_a_value)
+current_A  = struct.unpack('>H', data[0:2])[0] / 1000  # amps
+voltage_V  = struct.unpack('>H', data[2:4])[0] / 10    # volts (0 when off)
+power_W    = struct.unpack('>H', data[4:6])[0] / 10    # watts (0 when off)
+```
+
+#### Integration notes
+- EV Breaker **does NOT support current limiting** — on/off only
+- Use EV Breaker to prevent EV charging during demand window or peak price
+- Hot water heater: once added, turn off during demand window / high price,
+  schedule on during low price (06:30–09:30 off-peak window)
+
 ## Decision Rules (demand-mode-manager.js)
 
 | Priority | Condition | Mode |
