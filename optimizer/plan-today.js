@@ -322,8 +322,8 @@ async function main() {
       action    = chargeKw > 0 ? 'charge' : 'self-use';
       if (inHW && chargeKw > 0) action = 'charge+hw';  // mark hot water overlap
 
-    } else if (feedinC >= SELL_MIN_C && h < SELL_STOP_HOUR) {
-      // High feedIn: sell
+    } else if (feedinC >= SELL_MIN_C && h < SELL_STOP_HOUR && h >= 6) {
+      // High feedIn: sell — only between 06:00 and SELL_STOP_HOUR (no overnight selling)
       const socMinSell = h < 11 ? SOC_MIN_SELL_MORNING : SOC_MIN_SELL_AFTERNOON;
       if (socKwh > socMinSell) {
         action = 'sell';

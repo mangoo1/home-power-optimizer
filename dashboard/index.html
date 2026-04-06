@@ -457,9 +457,14 @@ async function loadPlan() {
   const nowSyd  = new Date(new Date().getTime() + SYD_OFF * 3600 * 1000);
   const nowMins = nowSyd.getUTCHours() * 60 + nowSyd.getUTCMinutes();
 
-  // Filter to today's slots only
+  // Filter to today's slots only, 06:00 onwards (skip overnight carry-over)
   const todayStr = date; // YYYY-MM-DD
-  const todaySlots = intervals.filter(iv => (iv.key || iv.nemTime || '').includes(todayStr));
+  const todaySlots = intervals.filter(iv => {
+    const k = iv.key || iv.nemTime || '';
+    if (!k.includes(todayStr)) return false;
+    const hh = parseInt((k.split('T')[1] || '').substring(0, 2), 10);
+    return hh >= 6;
+  });
 
   // Group consecutive same-action 30-min slots into blocks
   let blocks = [];
