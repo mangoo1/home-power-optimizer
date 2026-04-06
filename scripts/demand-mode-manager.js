@@ -1255,12 +1255,11 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   const avgBuyPrice = avgBuyCalc.avg;
   // If avg price is valid: use avg + margin (floor at SELL_ABS_MIN).
   // If avg is unavailable (midnight/error): fall back to absolute floor to prevent false triggers.
-  const effectiveSellMin = avgBuyPrice != null
-    ? Math.max(SELL_ABS_MIN, avgBuyPrice + SELL_MIN_MARGIN)
-    : SELL_ABS_MIN;
-  const sellMinLabel = avgBuyPrice != null
-    ? `avg_buy=${avgBuyPrice.toFixed(1)}c+${SELL_MIN_MARGIN}c=>${effectiveSellMin.toFixed(1)}c`
-    : `abs_floor=${SELL_ABS_MIN}c (${avgBuyCalc.reason})`;
+  // effectiveSellMin = absolute floor only. avgBuyPrice-based margin removed:
+  // today's avg buy often includes expensive intervals (hot water, DW), which incorrectly
+  // raises the sell threshold and blocks profitable selling at 14c+.
+  const effectiveSellMin = SELL_ABS_MIN;
+  const sellMinLabel = `abs_floor=${SELL_ABS_MIN}c`;
 
   // ── Priority 5: Sell to grid ─────────────────────────────────────────────
   // Hard stop: no selling after SELL_STOP_HOUR (Sydney time) — reserve battery overnight
@@ -1285,8 +1284,8 @@ function decide(ess, pvPower, amber, state, dailySummary) {
     reason = `EMERGENCY stop selling — projected deficit ${projectedDeficit.toFixed(1)}kWh, switching to charge at ${currentPrice.toFixed(1)}c`;
     return { targetMode, reason, alert };
   } else if (feedInPrice >= effectiveSellMin && soc > socMinSell && !emergencyCharge) {
-    // Max sell power = inverter cap minus home load (no buffer — user confirmed)
-    const maxSellPower = Math.min(INVERTER_MAX_DISCHARGE, INVERTER_MAX_DISCHARGE - (homeLoad ?? 0));
+    // Max sell power = inverter discharge cap (independent of homeLoad — grid handles both simultaneously)
+    const maxSellPower = INVERTER_MAX_DISCHARGE;
     if (maxSellPower > 0) {
       // If projected deficit tonight, scale down sell power proportionally to preserve battery
       let sellPower = maxSellPower;
