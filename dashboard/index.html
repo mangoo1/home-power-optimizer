@@ -8,27 +8,43 @@
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: #0f1117; color: #e0e0e0; font-family: -apple-system, sans-serif; padding: 16px; }
-  h1 { text-align: center; font-size: 1.4rem; margin-bottom: 16px; color: #fff; }
-  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-bottom: 20px; }
-  .stat { background: #1a1d27; border-radius: 12px; padding: 14px; text-align: center; }
-  .stat .label { font-size: 0.75rem; color: #888; margin-bottom: 6px; }
-  .stat .value { font-size: 1.8rem; font-weight: 700; }
-  .stat .unit { font-size: 0.75rem; color: #888; }
+  h1 { text-align: center; font-size: 1.4rem; margin-bottom: 12px; color: #fff; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-bottom: 16px; }
+  .stat { background: #1a1d27; border-radius: 12px; padding: 12px; text-align: center; }
+  .stat .label { font-size: 0.72rem; color: #888; margin-bottom: 4px; }
+  .stat .value { font-size: 1.7rem; font-weight: 700; }
+  .stat .unit { font-size: 0.72rem; color: #888; }
   .green { color: #4ade80; }
   .red { color: #f87171; }
   .yellow { color: #fbbf24; }
   .blue { color: #60a5fa; }
-  .chart-card { background: #1a1d27; border-radius: 12px; padding: 16px; margin-bottom: 16px; }
-  .chart-card h2 { font-size: 0.9rem; color: #aaa; margin-bottom: 12px; }
+  .chart-card { background: #1a1d27; border-radius: 12px; padding: 14px; margin-bottom: 14px; }
+  .chart-card h2 { font-size: 0.9rem; color: #aaa; margin-bottom: 10px; }
   canvas { max-height: 200px; }
-  .footer { text-align: center; font-size: 0.7rem; color: #555; margin-top: 16px; }
-  .loading { text-align: center; color: #555; padding: 40px; }
+  .footer { text-align: center; font-size: 0.7rem; color: #555; margin-top: 14px; }
+
+  /* Time range selector */
+  .timerange { display: flex; gap: 8px; justify-content: center; margin-bottom: 16px; flex-wrap: wrap; }
+  .timerange button {
+    background: #1a1d27; color: #aaa; border: 1px solid #333;
+    border-radius: 8px; padding: 6px 14px; font-size: 0.8rem; cursor: pointer;
+  }
+  .timerange button.active { background: #3b82f6; color: #fff; border-color: #3b82f6; }
 </style>
 </head>
 <body>
 
 <h1>⚡ Home Power Dashboard</h1>
 
+<!-- Time range selector -->
+<div class="timerange">
+  <button onclick="setRange('today')" id="btn-today" class="active">今天</button>
+  <button onclick="setRange('24h')"  id="btn-24h">24小时</button>
+  <button onclick="setRange('48h')"  id="btn-48h">48小时</button>
+  <button onclick="setRange('7d')"   id="btn-7d">7天</button>
+</div>
+
+<!-- Live stats (always current) -->
 <div class="stats">
   <div class="stat">
     <div class="label">Battery SOC</div>
@@ -61,7 +77,7 @@
     <div class="unit">c/kWh</div>
   </div>
   <div class="stat">
-    <div class="label">Today Net</div>
+    <div class="label">今日净费用</div>
     <div class="value" id="net">--</div>
     <div class="unit">AUD</div>
   </div>
@@ -72,28 +88,57 @@
   </div>
 </div>
 
+<!-- Charts -->
 <div class="chart-card">
-  <h2>🔋 Battery SOC (24h)</h2>
+  <h2>🔋 Battery SOC</h2>
   <canvas id="socChart"></canvas>
 </div>
 
 <div class="chart-card">
-  <h2>⚡ Power Flow (24h)</h2>
+  <h2>⚡ Power Flow</h2>
   <canvas id="powerChart"></canvas>
 </div>
 
 <div class="chart-card">
-  <h2>💰 Electricity Price (24h)</h2>
+  <h2>💰 Electricity Price (c/kWh)</h2>
   <canvas id="priceChart"></canvas>
+</div>
+
+<div class="chart-card">
+  <h2>💵 当天累计电费 (AUD)</h2>
+  <canvas id="costChart"></canvas>
 </div>
 
 <div class="footer" id="updated">Loading...</div>
 
 <script>
-const TURSO_URL = 'https://home-power-optimizer-mangoo1.aws-ap-south-1.turso.io/v2/pipeline';
-const TURSO_TOKEN = 'eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJpYXQiOjE3NzQ5NTU2MjgsImlkIjoiMDE5ZDQzODEtOTYwMS03Njg2LWEwNWUtMjM5MTZjYTU3MzNmIiwicmlkIjoiNGFkNzM3YzctZTRiMS00NTViLWJiMjEtMDM5NmIzNDc4NmU3In0.ircuDV8tvI83BricjrjJrAihL7j016jTepXZa1g1FAP9GCZXD0Iufj6kt5rs52xzK4ZGVzPMpTo97WoUcZXXAg';
+const TURSO_URL   = 'https://home-power-optimizer-mangoo1.aws-ap-south-1.turso.io/v2/pipeline';
+const TURSO_TOKEN = 'eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJpYXQiOjE3NzQ5NTU2MjgsImlkIjoiMDE5ZDQzODEtOTYwMS03Njg2LWEwNWUtMjM5MTZjYTU3MzNmIiwicmlkIjoiNGFkNzM3YzctZTRiMS00NTViLWJiMjEtMDM5NmIzNDg2ZTcifQ.ircuDV8tvI83BricjrjJrAihL7j016jTepXZa1g1FAP9GCZXD0Iufj6kt5rs52xzK4ZGVzPMpTo97WoUcZXXAg';
 
-let socChartObj, powerChartObj, priceChartObj;
+let socChartObj, powerChartObj, priceChartObj, costChartObj;
+let currentRange = 'today';
+
+// Sydney offset (auto DST)
+function sydOffset() {
+  const d = new Date();
+  const s = d.toLocaleString('en-AU', { timeZone: 'Australia/Sydney', hour12: false });
+  const h = parseInt((s.split(', ')[1] || s.split(' ')[1]).split(':')[0]);
+  let off = h - d.getUTCHours(); if (off < -12) off += 24; if (off > 12) off -= 24;
+  return off;
+}
+const SYD_OFF = sydOffset();
+
+function toSydney(utcStr) {
+  return new Date(new Date(utcStr).getTime() + SYD_OFF * 3600 * 1000);
+}
+function fmtTime(utcStr) {
+  const d = toSydney(utcStr);
+  return d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0');
+}
+function fmtDateTime(utcStr) {
+  const d = toSydney(utcStr);
+  return (d.getMonth()+1) + '/' + d.getDate() + ' ' + d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0');
+}
 
 async function query(sql) {
   const res = await fetch(TURSO_URL, {
@@ -105,108 +150,165 @@ async function query(sql) {
   return data.results[0].response.result.rows;
 }
 
-function toSydney(utcStr) {
-  return new Date(new Date(utcStr).getTime() + 11 * 3600 * 1000);
-}
-
-function fmt(utcStr) {
-  const d = toSydney(utcStr);
-  return d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0');
-}
+function v(cell) { return cell?.value ?? cell ?? null; }
 
 function chartDefaults() {
   return {
-    responsive: true,
-    maintainAspectRatio: true,
+    responsive: true, maintainAspectRatio: true,
     interaction: { mode: 'index', intersect: false },
     plugins: { legend: { labels: { color: '#aaa', font: { size: 11 } } } },
     scales: {
-      x: { ticks: { color: '#666', maxTicksLimit: 8 }, grid: { color: '#222' } },
-      y: { ticks: { color: '#666' }, grid: { color: '#222' } }
+      x: { ticks: { color: '#666', maxTicksLimit: 8, font: { size: 10 } }, grid: { color: '#222' } },
+      y: { ticks: { color: '#666', font: { size: 10 } }, grid: { color: '#222' } }
     }
   };
 }
 
+function setRange(r) {
+  currentRange = r;
+  ['today','24h','48h','7d'].forEach(x => document.getElementById('btn-'+x).classList.remove('active'));
+  document.getElementById('btn-'+r).classList.add('active');
+  loadCharts();
+}
+
+function getRangeSQL() {
+  if (currentRange === 'today') {
+    // Sydney today from midnight
+    const sydMidnight = new Date();
+    const syd = new Date(sydMidnight.getTime() + SYD_OFF * 3600 * 1000);
+    syd.setUTCHours(0, 0, 0, 0);
+    const utcMidnight = new Date(syd.getTime() - SYD_OFF * 3600 * 1000);
+    return `ts >= '${utcMidnight.toISOString()}'`;
+  }
+  if (currentRange === '24h') return `ts >= datetime('now','-24 hours')`;
+  if (currentRange === '48h') return `ts >= datetime('now','-48 hours')`;
+  if (currentRange === '7d')  return `ts >= datetime('now','-7 days')`;
+  return `ts >= datetime('now','-24 hours')`;
+}
+
+function getFmtFn() {
+  return currentRange === '7d' ? fmtDateTime : fmtTime;
+}
+
+async function loadStats() {
+  // Latest record
+  const latest = await query('SELECT ts, soc, batt_power, home_load, grid_power, buy_price, feedin_price, mode FROM energy_log ORDER BY ts DESC LIMIT 1');
+  if (latest.length > 0) {
+    const r = latest[0];
+    const soc  = parseFloat(v(r[1]) || 0);
+    const batt = parseFloat(v(r[2]) || 0);
+    const load = parseFloat(v(r[3]) || 0);
+    const grid = parseFloat(v(r[4]) || 0);
+    const buy  = parseFloat(v(r[5]) || 0);
+    const fi   = parseFloat(v(r[6]) || 0);
+
+    document.getElementById('soc').textContent   = soc.toFixed(0);
+    document.getElementById('soc').className     = 'value ' + (soc > 60 ? 'green' : soc > 30 ? 'yellow' : 'red');
+    document.getElementById('load').textContent  = load.toFixed(2);
+    document.getElementById('batt').textContent  = batt.toFixed(2);
+    document.getElementById('grid').textContent  = grid.toFixed(2);
+    document.getElementById('grid').className    = 'value ' + (grid < 0 ? 'green' : grid > 0.5 ? 'red' : '');
+    document.getElementById('buy').textContent   = buy.toFixed(2);
+    document.getElementById('feedin').textContent = fi.toFixed(2);
+  }
+
+  // Today summary
+  const today = await query("SELECT cost_aud, earnings_aud, demand_peak_kw FROM daily_summary ORDER BY date DESC LIMIT 1");
+  if (today.length > 0) {
+    const cost  = parseFloat(v(today[0][0]) || 0);
+    const earn  = parseFloat(v(today[0][1]) || 0);
+    const net   = cost - earn;
+    const peak  = parseFloat(v(today[0][2]) || 0);
+    const netEl = document.getElementById('net');
+    netEl.textContent = (net >= 0 ? '+' : '') + net.toFixed(2);
+    netEl.className   = 'value ' + (net < 0 ? 'green' : 'red');
+    const demEl = document.getElementById('demand');
+    demEl.textContent = peak.toFixed(2);
+    demEl.className   = 'value ' + (peak < 0.5 ? 'green' : peak < 1.5 ? 'yellow' : 'red');
+  }
+}
+
+async function loadCharts() {
+  const where  = getRangeSQL();
+  const fmtFn  = getFmtFn();
+
+  const hist = await query(`SELECT ts, soc, batt_power, home_load, grid_power, buy_price, feedin_price,
+    interval_buy_aud, interval_sell_aud, interval_net_aud
+    FROM energy_log WHERE ${where} ORDER BY ts`);
+
+  const labels  = hist.map(r => fmtFn(v(r[0])));
+  const socs    = hist.map(r => parseFloat(v(r[1]) || 0));
+  const batts   = hist.map(r => parseFloat(v(r[2]) || 0));
+  const loads   = hist.map(r => parseFloat(v(r[3]) || 0));
+  const grids   = hist.map(r => parseFloat(v(r[4]) || 0));
+  const buys    = hist.map(r => parseFloat(v(r[5]) || 0));
+  const feedins = hist.map(r => parseFloat(v(r[6]) || 0));
+
+  // Cumulative cost — running sum of interval_buy_aud / interval_sell_aud
+  let cumBuy = 0, cumSell = 0, cumNet = 0;
+  const cumBuys = [], cumSells = [], cumNets = [];
+  for (let i = 0; i < hist.length; i++) {
+    cumBuy  += parseFloat(v(hist[i][7]) || 0);
+    cumSell += parseFloat(v(hist[i][8]) || 0);
+    cumNet  += parseFloat(v(hist[i][9]) || 0);
+    cumBuys.push(parseFloat(cumBuy.toFixed(4)));
+    cumSells.push(parseFloat(cumSell.toFixed(4)));
+    cumNets.push(parseFloat(cumNet.toFixed(4)));
+  }
+
+  // SOC chart
+  if (socChartObj) socChartObj.destroy();
+  socChartObj = new Chart(document.getElementById('socChart'), {
+    type: 'line',
+    data: { labels, datasets: [{ label: 'SOC %', data: socs, borderColor: '#4ade80', backgroundColor: 'rgba(74,222,128,0.08)', fill: true, tension: 0.3, pointRadius: 0 }] },
+    options: { ...chartDefaults(), scales: { ...chartDefaults().scales, y: { ...chartDefaults().scales.y, min: 0, max: 100 } } }
+  });
+
+  // Power chart
+  if (powerChartObj) powerChartObj.destroy();
+  powerChartObj = new Chart(document.getElementById('powerChart'), {
+    type: 'line',
+    data: { labels, datasets: [
+      { label: 'Home Load', data: loads, borderColor: '#fbbf24', tension: 0.3, pointRadius: 0 },
+      { label: 'Battery',   data: batts, borderColor: '#60a5fa', tension: 0.3, pointRadius: 0 },
+      { label: 'Grid',      data: grids, borderColor: '#f87171', tension: 0.3, pointRadius: 0 }
+    ]},
+    options: chartDefaults()
+  });
+
+  // Price chart
+  if (priceChartObj) priceChartObj.destroy();
+  priceChartObj = new Chart(document.getElementById('priceChart'), {
+    type: 'line',
+    data: { labels, datasets: [
+      { label: 'Buy c/kWh',    data: buys,    borderColor: '#f87171', tension: 0.3, pointRadius: 0 },
+      { label: 'FeedIn c/kWh', data: feedins, borderColor: '#4ade80', tension: 0.3, pointRadius: 0 }
+    ]},
+    options: chartDefaults()
+  });
+
+  // Cumulative cost chart
+  if (costChartObj) costChartObj.destroy();
+  costChartObj = new Chart(document.getElementById('costChart'), {
+    type: 'line',
+    data: { labels, datasets: [
+      { label: '累计买电 $',  data: cumBuys,  borderColor: '#f87171', tension: 0.3, pointRadius: 0, fill: false },
+      { label: '累计卖电 $',  data: cumSells, borderColor: '#4ade80', tension: 0.3, pointRadius: 0, fill: false },
+      { label: '净费用 $',    data: cumNets,  borderColor: '#fbbf24', tension: 0.3, pointRadius: 0, fill: false,
+        borderDash: [4, 4] }
+    ]},
+    options: chartDefaults()
+  });
+
+  const sydneyNow = toSydney(new Date().toISOString());
+  document.getElementById('updated').textContent =
+    '更新时间: ' + sydneyNow.toLocaleTimeString('en-AU', {timeZone:'Australia/Sydney'}) +
+    ' AEDT | 自动刷新 5分钟';
+}
+
 async function load() {
   try {
-    // Latest record
-    const latest = await query('SELECT ts, soc, batt_power, home_load, grid_power, buy_price, feedin_price, mode FROM energy_log ORDER BY ts DESC LIMIT 1');
-    if (latest.length > 0) {
-      const r = latest[0];
-      const soc = parseFloat(r[1].value);
-      const batt = parseFloat(r[2].value||0);
-      const load = parseFloat(r[3].value||0);
-      const grid = parseFloat(r[4].value||0);
-      const buy = parseFloat(r[5].value||0);
-      const fi = parseFloat(r[6].value||0);
-
-      document.getElementById('soc').textContent = soc.toFixed(0);
-      document.getElementById('soc').className = 'value ' + (soc > 60 ? 'green' : soc > 30 ? 'yellow' : 'red');
-      document.getElementById('load').textContent = load.toFixed(2);
-      document.getElementById('batt').textContent = batt.toFixed(2);
-      document.getElementById('grid').textContent = grid.toFixed(2);
-      document.getElementById('grid').className = 'value ' + (grid < 0 ? 'green' : grid > 0.5 ? 'red' : '');
-      document.getElementById('buy').textContent = buy.toFixed(2);
-      document.getElementById('feedin').textContent = fi.toFixed(2);
-    }
-
-    // Today summary
-    const today = await query("SELECT cost_aud, earnings_aud, demand_peak_kw FROM daily_summary ORDER BY date DESC LIMIT 1");
-    if (today.length > 0) {
-      const net = parseFloat(today[0][0].value||0) - parseFloat(today[0][1].value||0);
-      const peak = parseFloat(today[0][2].value||0);
-      const netEl = document.getElementById('net');
-      netEl.textContent = (net >= 0 ? '+' : '') + net.toFixed(2);
-      netEl.className = 'value ' + (net < 0 ? 'green' : 'red');
-      const demandEl = document.getElementById('demand');
-      demandEl.textContent = peak.toFixed(2);
-      demandEl.className = 'value ' + (peak < 0.5 ? 'green' : peak < 1.5 ? 'yellow' : 'red');
-    }
-
-    // 24h history
-    const hist = await query("SELECT ts, soc, batt_power, home_load, grid_power, buy_price, feedin_price FROM energy_log WHERE ts >= datetime('now','-24 hours') ORDER BY ts");
-    const labels = hist.map(r => fmt(r[0].value));
-    const socs = hist.map(r => parseFloat(r[1].value||0));
-    const batts = hist.map(r => parseFloat(r[2].value||0));
-    const loads = hist.map(r => parseFloat(r[3].value||0));
-    const grids = hist.map(r => parseFloat(r[4].value||0));
-    const buys = hist.map(r => parseFloat(r[5].value||0));
-    const feedins = hist.map(r => parseFloat(r[6].value||0));
-
-    // SOC chart
-    if (socChartObj) socChartObj.destroy();
-    socChartObj = new Chart(document.getElementById('socChart'), {
-      type: 'line',
-      data: { labels, datasets: [{ label: 'SOC %', data: socs, borderColor: '#4ade80', backgroundColor: 'rgba(74,222,128,0.1)', fill: true, tension: 0.3, pointRadius: 0 }] },
-      options: { ...chartDefaults(), scales: { ...chartDefaults().scales, y: { ...chartDefaults().scales.y, min: 0, max: 100 } } }
-    });
-
-    // Power chart
-    if (powerChartObj) powerChartObj.destroy();
-    powerChartObj = new Chart(document.getElementById('powerChart'), {
-      type: 'line',
-      data: { labels, datasets: [
-        { label: 'Home Load', data: loads, borderColor: '#fbbf24', tension: 0.3, pointRadius: 0 },
-        { label: 'Battery', data: batts, borderColor: '#60a5fa', tension: 0.3, pointRadius: 0 },
-        { label: 'Grid', data: grids, borderColor: '#f87171', tension: 0.3, pointRadius: 0 }
-      ]},
-      options: chartDefaults()
-    });
-
-    // Price chart
-    if (priceChartObj) priceChartObj.destroy();
-    priceChartObj = new Chart(document.getElementById('priceChart'), {
-      type: 'line',
-      data: { labels, datasets: [
-        { label: 'Buy c/kWh', data: buys, borderColor: '#f87171', tension: 0.3, pointRadius: 0 },
-        { label: 'FeedIn c/kWh', data: feedins, borderColor: '#4ade80', tension: 0.3, pointRadius: 0 }
-      ]},
-      options: chartDefaults()
-    });
-
-    const sydneyNow = toSydney(new Date().toISOString());
-    document.getElementById('updated').textContent = 'Updated: ' + sydneyNow.toLocaleTimeString('en-AU', {timeZone:'Australia/Sydney'}) + ' AEDT | Auto-refresh 5min';
-
+    await Promise.all([loadStats(), loadCharts()]);
   } catch(e) {
     document.getElementById('updated').textContent = 'Error: ' + e.message;
     console.error(e);
@@ -214,7 +316,7 @@ async function load() {
 }
 
 load();
-setInterval(load, 5 * 60 * 1000); // refresh every 5 min
+setInterval(load, 5 * 60 * 1000);
 </script>
 </body>
 </html>
