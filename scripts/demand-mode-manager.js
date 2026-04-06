@@ -1383,12 +1383,13 @@ async function main() {
     // Safety: if currently in Timed mode (selling or charging), fall back to Self-use
     // Timed mode without price data is unsafe — could be selling at wrong price or charging at wrong time
     const reportedMode = await getReportedMode();
+    const fallbackState = loadState();
     if (reportedMode === MODE.TIMED || reportedMode === MODE.SELLING ||
-        state.currentMode === MODE.TIMED || state.currentMode === MODE.SELLING || state.currentMode === MODE.BACKUP) {
+        fallbackState.currentMode === MODE.TIMED || fallbackState.currentMode === MODE.SELLING || fallbackState.currentMode === MODE.BACKUP) {
       console.warn("[SAFETY] Amber data unavailable + active Timed/Selling/Backup mode — switching to Self-use");
       await setModeWithVerify(MODE.SELF_USE, {});
-      state.currentMode = MODE.SELF_USE;
-      saveState(state);
+      fallbackState.currentMode = MODE.SELF_USE;
+      saveState(fallbackState);
     }
     console.log(`[DONE]`);
     return;
