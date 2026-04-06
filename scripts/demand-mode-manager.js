@@ -1138,24 +1138,54 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   const cheapEntryOk = gridHeadroomOk && !currentDemand && soc < CHEAP_CHARGE_SOC && state.currentMode !== MODE.BACKUP;
 
 
-  // ── Charge decision (price-threshold only) ────────────────────────────────
-  // LP plan is for reference/calibration only — does NOT drive charge execution.
-  // All charge decisions are made purely on real-time price vs dynamicBuyMax.
+  // ── Charge decision — driven by today's plan thresholds ─────────────────
+  // If a plan exists (source=rules), use its buyThresholdC as the charge ceiling.
+  // Fall back to dynamicBuyMax if no plan is loaded.
   // Emergency charge bypasses price check when SOC is critically low.
-  const planSaysCharge = false; // LP plan disabled for execution
-  const chargeCondition = currentPrice <= dynamicBuyMax || emergencyCharge;
+  let planBuyThresholdC = null;
+  let planSellMinC      = null;
+  if (todayPlan?.notes) {
+    try {
+      const notes = typeof todayPlan.notes === 'string' ? JSON.parse(todayPlan.notes) : todayPlan.notes;
+      if (notes.buyThresholdC) planBuyThresholdC = notes.buyThresholdC;
+      if (notes.sellMinC)      planSellMinC      = notes.sellMinC;
+    } catch {}
+  }
 
-  console.log(`[PLAN] plan=${todayPlan ? 'loaded(ref-only)' : 'none'} inWindow=${inPlanChargeWindow}(ignored) price=${currentPrice.toFixed(1)}c dynamicBuyMax=${dynamicBuyMax.toFixed(1)}c chargeCondition=${chargeCondition}`);
+  // Lookup current 30-min slot action from plan intervals
+  const nowMs30  = Date.now();
+  const sydNow   = new Date(nowMs30 + getSydneyOffsetMs());
+  // Round down to nearest 30 min
+  const sydSlot  = new Date(sydNow);
+  sydSlot.setUTCMinutes(sydSlot.getUTCMinutes() < 30 ? 0 : 30, 0, 0);
+  const slotKey  = sydSlot.toISOString();
+
+  let planSlot = null;
+  if (todayPlan?.intervals?.length) {
+    planSlot = todayPlan.intervals.find(iv => iv.key === slotKey)
+            || todayPlan.intervals.find(iv => iv.key && slotKey.startsWith(iv.key.substring(0, 15)));
+  }
+
+  const planAction       = planSlot?.action ?? null;   // 'charge' | 'sell' | 'self-use'
+  const planSlotBuyC     = planSlot?.buyC   ?? null;   // this slot's buy price from plan
+  const planSaysCharge   = planAction === 'charge';
+  const planSaysSell     = planAction === 'sell';
+
+  // Effective buy ceiling: plan threshold if available, else dynamicBuyMax
+  const effectiveBuyMax  = planBuyThresholdC ?? dynamicBuyMax;
+  const chargeCondition  = currentPrice <= effectiveBuyMax || emergencyCharge;
+
+  console.log(`[PLAN] plan=${todayPlan ? `loaded(v${todayPlan.version})` : 'none'} slot=${planAction ?? 'none'} price=${currentPrice.toFixed(1)}c buyMax=${effectiveBuyMax.toFixed(1)}c chargeCondition=${chargeCondition}`);
 
   if (cheapEntryOk && chargeCondition) {
-    // Plan mode: no entry buffer — act immediately on window signal
-    // Fallback (no plan): keep 1-interval confirmation to avoid single-spike noise
-    const entryCount = todayPlan ? 3 : (state.chargeEntryCount || 0) + 1;
+    // If plan says charge: act immediately (no buffer needed — plan already smoothed noise)
+    // If no plan (fallback): keep 3-interval buffer to avoid single-spike noise
+    const entryCount = planSaysCharge ? 3 : (state.chargeEntryCount || 0) + 1;
     const condLabel = emergencyCharge
       ? `EMERGENCY SOC=${soc}% deficit=${projectedDeficit.toFixed(1)}kWh`
       : planSaysCharge
-        ? `plan window ${inPlanChargeWindow ? 'active' : '?'} buy=${currentPrice.toFixed(1)}c`
-        : `buy=${currentPrice.toFixed(1)}c (<=${dynamicBuyMax.toFixed(1)}c fallback)`;
+        ? `plan:charge buy=${currentPrice.toFixed(1)}c (≤${effectiveBuyMax.toFixed(1)}c)`
+        : `buy=${currentPrice.toFixed(1)}c (≤${effectiveBuyMax.toFixed(1)}c fallback)`;
     if (entryCount >= 3 || emergencyCharge) {
       targetMode = MODE.BACKUP;
       reason = `${condLabel} — charging (SOC ${soc}% → ${CHEAP_CHARGE_SOC}%)`;
@@ -1269,8 +1299,11 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   // effectiveSellMin = absolute floor only. avgBuyPrice-based margin removed:
   // today's avg buy often includes expensive intervals (hot water, DW), which incorrectly
   // raises the sell threshold and blocks profitable selling at 14c+.
-  const effectiveSellMin = SELL_ABS_MIN;
-  const sellMinLabel = `abs_floor=${SELL_ABS_MIN}c`;
+  // Use plan's sellMinC if available, else absolute floor
+  const effectiveSellMin = planSellMinC ?? SELL_ABS_MIN;
+  const sellMinLabel = planSellMinC
+    ? `plan_sell_min=${planSellMinC.toFixed(1)}c`
+    : `abs_floor=${SELL_ABS_MIN}c`;
 
   // ── Priority 5: Sell to grid ─────────────────────────────────────────────
   // Hard stop: no selling after SELL_STOP_HOUR (Sydney time) — reserve battery overnight
