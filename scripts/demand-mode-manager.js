@@ -838,7 +838,16 @@ function appendLog(record) {
       solarWm2:        record.solar_wm2       ?? null,
       cloudCoverPct:   record.cloud_cover_pct ?? null,
     });
-  } catch (e) { console.warn("[DB] insert failed:", e.message); }
+  } catch (e) {
+    console.warn("[DB] insert failed:", e.message);
+    // Debug: find bad field type
+    try {
+      const entries = { ts: record.ts, soc: record.soc, demandWindow: record.demandWindow, modeChanged: record.modeChanged, mode_verify_ok: record.mode_verify_ok, solar_wm2: record.solar_wm2, cloud_cover_pct: record.cloud_cover_pct };
+      for (const [k, v] of Object.entries(entries)) {
+        if (typeof v === 'boolean' || v === undefined) console.warn(`[DB] bad field: ${k}=${v} (${typeof v})`);
+      }
+    } catch {}
+  }
 }
 
 function updateDailySummary(record) {
