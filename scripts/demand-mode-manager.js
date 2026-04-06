@@ -399,7 +399,7 @@ async function createSellingCron() {
     sessionTarget: "main",
     payload: {
       kind: "systemEvent",
-      text: `[Selling Safety Monitor]\n\nAMBER_API_TOKEN=psk_c654897f6caa055fda06e83369936242 ESS_TOKEN=${ESS_TOKEN} ESS_MAC_HEX=${MAC_HEX} AMBER_SITE_ID=${AMBER_SITE_ID} node /home/deven/.openclaw/workspace/scripts/selling-monitor.js\n\nIf output contains [EXIT SELL] or [ENTER SELL] or warning, relay to user. Otherwise silent.`,
+      text: `[Selling Safety Monitor]\n\nAMBER_API_TOKEN=${AMBER_TOKEN} ESS_TOKEN=${ESS_TOKEN} ESS_MAC_HEX=${MAC_HEX} AMBER_SITE_ID=${AMBER_SITE_ID} node /home/deven/.openclaw/workspace/scripts/selling-monitor.js\n\nIf output contains [EXIT SELL] or [ENTER SELL] or warning, relay to user. Otherwise silent.`,
     },
   };
   try {
