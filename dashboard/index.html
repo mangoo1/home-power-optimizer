@@ -338,8 +338,9 @@ async function load() {
   try {
     await Promise.all([loadStats(), loadCharts(), loadPlan()]);
   } catch(e) {
-    document.getElementById('updated').textContent = 'Error: ' + e.message;
-    console.error(e);
+    const msg = e.message || String(e);
+    document.getElementById('updated').textContent = '❌ Error: ' + msg;
+    console.error('Dashboard load error:', e);
   }
 }
 
