@@ -797,7 +797,7 @@ function appendLog(record) {
       spotPrice: record.spotPrice, demandWindow: record.demandWindow ? 1 : 0,
       mode: record.mode, modeChanged: record.modeChanged ? 1 : 0,
       modeReason: record.modeReason || null, renewables: record.renewables,
-      alert: record.alert || null,
+      alert: record.alert ? (typeof record.alert === 'string' ? record.alert : JSON.stringify(record.alert)) : null,
       meterBuyTotal: record.meterBuyTotal ?? null,
       meterSellTotal: record.meterSellTotal ?? null,
       battVoltage: record.battVoltage ?? null,
