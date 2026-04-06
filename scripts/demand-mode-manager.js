@@ -128,7 +128,7 @@ const MODE = { SELF_USE: 0, TIMED: 1, PV_PRIORITY: 5, SELLING: 6, BACKUP: 1 };
 const MODE_LABEL = { 0: "Self-use", 1: "Timed/Charging", 3: "Backup(unused)", 5: "PV-Priority", 6: "Selling", 7: "Voltage-Reg" };
 
 // Strategy parameters
-const SOC_MAX_CHARGE = 90;        // Target SOC default — may be overridden dynamically below
+const SOC_MAX_CHARGE = 85;        // Target SOC default — may be overridden dynamically below
 const SOC_MAX_CHARGE_ULTRACHEAP = 100; // % — charge to 100% when price <= this threshold
 const ULTRACHEAP_PRICE_C = 7.0;   // ¢ — "ultra cheap" threshold
                                   // 85% chosen: above this BMS throttles charge rate,
