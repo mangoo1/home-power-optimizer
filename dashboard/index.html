@@ -347,121 +347,173 @@ load();
 setInterval(load, 5 * 60 * 1000);
 
 async function loadPlan() {
-  // Get today's active plan (highest version)
+  // Try daily_plan_report first (summary), then fall back to daily_plan intervals
+  const reportRows = await query(
+    `SELECT date, generated_at, current_soc, target_soc, floor_soc,
+            needed_kwh, total_charge_kwh, surplus_kwh, pv_forecast_kwh,
+            charge_window, charge_hours, avg_charge_kw,
+            hw_start_h, hw_end_h, hw_avg_buy_c,
+            sell_window, avg_sell_feedin_c, sell_slot_count,
+            buy_threshold_c
+     FROM daily_plan_report ORDER BY date DESC LIMIT 1`
+  );
+
   const planRows = await query(
     `SELECT date, version, generated_at, soc_at_gen, has_demand_window,
             charge_cutoff_hour, pv_forecast_kwh, pv_peak_kw,
-            charge_windows_json, intervals_json, notes
+            charge_windows_json, intervals_json, notes, source
      FROM daily_plan WHERE is_active=1 ORDER BY generated_at DESC LIMIT 1`
   );
+
   if (!planRows.length) {
     document.getElementById('plan-meta').textContent = '暂无计划数据';
     return;
   }
-  const p = planRows[0];
-  const date        = v(p[0]);
-  const ver         = v(p[1]);
-  const genAt       = v(p[2]);
-  const socAtGen    = parseFloat(v(p[3]) || 0);
-  const hasDW       = parseInt(v(p[4]) || 0);
-  const cutoff      = v(p[5]);
-  const pvKwh       = parseFloat(v(p[6]) || 0);
-  const pvPeak      = parseFloat(v(p[7]) || 0);
-  const chargeWins  = JSON.parse(v(p[8]) || '[]');
-  const intervals   = JSON.parse(v(p[9]) || '[]');
-  const notes       = (() => { try { return JSON.parse(v(p[10]) || '{}'); } catch { return {}; } })();
-  const hwRec       = notes.hotWater || null;
 
-  // Hot water recommendation banner
+  const p        = planRows[0];
+  const date     = v(p[0]);
+  const ver      = v(p[1]);
+  const genAt    = v(p[2]);
+  const socAtGen = parseFloat(v(p[3]) || 0);
+  const hasDW    = parseInt(v(p[4]) || 0);
+  const cutoff   = v(p[5]);
+  const pvKwh    = parseFloat(v(p[6]) || 0);
+  const pvPeak   = parseFloat(v(p[7]) || 0);
+  const intervals = JSON.parse(v(p[9]) || '[]');
+  const notes    = (() => { try { return JSON.parse(v(p[10]) || '{}'); } catch { return {}; } })();
+  const source   = v(p[11]) || 'unknown';
+
+  // ── Summary bar from daily_plan_report ──────────────────────────────────
+  let rpt = null;
+  if (reportRows.length && v(reportRows[0][0]) === date) {
+    const r = reportRows[0];
+    rpt = {
+      currentSoc:      parseFloat(v(r[2]) || 0),
+      targetSoc:       parseFloat(v(r[3]) || 85),
+      floorSoc:        parseFloat(v(r[4]) || 10),
+      neededKwh:       parseFloat(v(r[5]) || 0),
+      totalChargeKwh:  parseFloat(v(r[6]) || 0),
+      surplusKwh:      parseFloat(v(r[7]) || 0),
+      pvForecastKwh:   parseFloat(v(r[8]) || 0),
+      chargeWindow:    v(r[9]) || '—',
+      chargeHours:     parseFloat(v(r[10]) || 0),
+      avgChargeKw:     parseFloat(v(r[11]) || 0),
+      hwStartH:        v(r[12]),
+      hwEndH:          v(r[13]),
+      hwAvgBuyC:       v(r[14]),
+      sellWindow:      v(r[15]) || '—',
+      avgSellFeedinC:  parseFloat(v(r[16]) || 0),
+      sellSlotCount:   parseInt(v(r[17]) || 0),
+      buyThresholdC:   parseFloat(v(r[18]) || 0),
+    };
+  }
+
+  // ── Hot water banner ────────────────────────────────────────────────────
   const hwBanner = document.getElementById('hw-banner');
-  if (hwRec) {
-    hwBanner.innerHTML = `🚿 <strong>热水器建议</strong>：${hwRec.startTime} 开 → ${hwRec.endTime} 关 &nbsp;|&nbsp; 均价 ${hwRec.avgPriceC}¢ &nbsp;|&nbsp; 预计费用 $${hwRec.costEst}`;
+  const hwStartH = rpt?.hwStartH ?? notes?.hotWater?.startH ?? null;
+  const hwEndH   = rpt?.hwEndH   ?? notes?.hotWater?.endH   ?? null;
+  const hwBuyC   = rpt?.hwAvgBuyC ?? notes?.hotWater?.avgBuyC ?? null;
+  if (hwStartH !== null) {
+    hwBanner.innerHTML = `🚿 <strong>热水器建议</strong>：${String(hwStartH).padStart(2,'0')}:00 开 → ${String(hwEndH).padStart(2,'0')}:00 关 &nbsp;|&nbsp; 均价 ${hwBuyC}¢（手动操作）`;
     hwBanner.style.display = 'block';
   } else {
     hwBanner.style.display = 'none';
   }
 
-  // Meta info
+  // ── Meta panel ──────────────────────────────────────────────────────────
   const genSyd = toSydney(genAt);
   const genStr = genSyd.toLocaleTimeString('en-AU', { timeZone: 'Australia/Sydney', hour: '2-digit', minute: '2-digit' });
-  const cwStr  = chargeWins.map(w => `${w.startHour}:00–${w.endHour}:00 avg${w.avgPriceC?.toFixed(1)}c`).join(', ') || '无充电窗口';
-  document.getElementById('plan-meta').innerHTML =
-    `<span>📅 ${date} v${ver}</span>` +
-    `<span>⏱ 生成于 ${genStr}</span>` +
-    `<span>🔋 生成时SOC ${socAtGen}%</span>` +
-    `<span>☀️ PV预测 ${pvKwh.toFixed(1)}kWh (峰值${pvPeak.toFixed(1)}kW)</span>` +
-    `<span>${hasDW ? '⚠️ 有Demand Window' : '✅ 无Demand Window'}</span>` +
-    `<span>⚡ 充电窗口: ${cwStr}</span>` +
-    `<span>🛑 截止充电: ${cutoff}:00</span>`;
+  const buyMaxC = rpt?.buyThresholdC ?? notes?.buyThresholdC ?? '—';
 
-  // Current Sydney time for highlighting
-  const nowSyd = new Date(new Date().getTime() + SYD_OFF * 3600 * 1000);
-  const nowHH  = nowSyd.getUTCHours();
-  const nowMM  = nowSyd.getUTCMinutes();
-  const nowMins = nowHH * 60 + nowMM;
+  let metaHtml =
+    `<span>📅 ${date} v${ver} (${source})</span>` +
+    `<span>⏱ 生成 ${genStr}</span>` +
+    `<span>🔋 SOC ${socAtGen}%</span>` +
+    `<span>☀️ PV ${(rpt?.pvForecastKwh ?? pvKwh).toFixed(1)} kWh</span>` +
+    `<span>${hasDW ? '⚠️ 有DW' : '✅ 无DW'}</span>` +
+    `<span>买价上限 ≤${buyMaxC}c</span>`;
 
-  // Action reason helper
-  function actionReason(interval) {
-    if (interval.action === 'charge') {
-      return `买价${interval.buyC}c 低于充电上限，充电划算`;
-    } else if (interval.action === 'sell') {
-      const margin = (interval.feedinC - interval.buyC).toFixed(1);
-      return `卖价${interval.feedinC}c，收益可观`;
-    }
-    return `买${interval.buyC}c 卖${interval.feedinC}c，维持自用`;
+  if (rpt) {
+    const surplus = rpt.surplusKwh;
+    const surplusColor = surplus >= 0 ? 'color:#4ade80' : 'color:#f87171';
+    metaHtml +=
+      `<span>⚡ 充电 ${rpt.chargeWindow}（${rpt.chargeHours}h）</span>` +
+      `<span>📥 充入 ${rpt.totalChargeKwh.toFixed(1)} kWh / 需要 ${rpt.neededKwh.toFixed(1)} kWh <span style="${surplusColor}">(${surplus >= 0 ? '+' : ''}${surplus.toFixed(1)})</span></span>` +
+      `<span>💰 卖电 ${rpt.sellWindow}，均 ${rpt.avgSellFeedinC.toFixed(1)}c</span>`;
   }
 
-  const tbody = document.getElementById('plan-body');
-  tbody.innerHTML = '';
+  document.getElementById('plan-meta').innerHTML = metaHtml;
 
-  // Group consecutive same-action intervals into blocks
+  // ── Interval table ──────────────────────────────────────────────────────
+  const nowSyd  = new Date(new Date().getTime() + SYD_OFF * 3600 * 1000);
+  const nowMins = nowSyd.getUTCHours() * 60 + nowSyd.getUTCMinutes();
+
+  // Filter to today's slots only
+  const todayStr = date; // YYYY-MM-DD
+  const todaySlots = intervals.filter(iv => (iv.key || iv.nemTime || '').includes(todayStr));
+
+  // Group consecutive same-action 30-min slots into blocks
   let blocks = [];
   let cur = null;
-  for (const iv of intervals) {
-    const dt   = new Date(iv.nemTime);
-    const syd  = new Date(dt.getTime() + SYD_OFF * 3600 * 1000);
-    const hhmm = syd.getUTCHours() * 60 + syd.getUTCMinutes();
-    const timeStr = syd.getUTCHours().toString().padStart(2,'0') + ':' + syd.getUTCMinutes().toString().padStart(2,'0');
+  for (const iv of todaySlots) {
+    const slotKey = iv.key || iv.nemTime;
+    const timeStr = slotKey.split('T')[1]?.substring(0, 5) || '??:??';
+    const [hh, mm] = timeStr.split(':').map(Number);
+    const slotMins = hh * 60 + mm;
+    const action   = iv.action || 'self-use';
 
-    if (!cur || cur.action !== iv.action) {
+    if (!cur || cur.action !== action) {
       if (cur) blocks.push(cur);
-      cur = { action: iv.action, startTime: timeStr, startMins: hhmm, endTime: timeStr,
-              minBuy: iv.buyC, maxBuy: iv.buyC, minFeed: iv.feedinC, maxFeed: iv.feedinC, count: 1 };
+      cur = {
+        action, startTime: timeStr, startMins: slotMins, endTime: timeStr, endMins: slotMins + 30,
+        minBuy: iv.buyC, maxBuy: iv.buyC, minFeed: iv.feedinC, maxFeed: iv.feedinC,
+        chargeKw: iv.chargeKw || 0, inHW: iv.inHW || false, count: 1
+      };
     } else {
-      cur.endTime = timeStr;
-      cur.minBuy  = Math.min(cur.minBuy, iv.buyC);
-      cur.maxBuy  = Math.max(cur.maxBuy, iv.buyC);
-      cur.minFeed = Math.min(cur.minFeed, iv.feedinC);
-      cur.maxFeed = Math.max(cur.maxFeed, iv.feedinC);
+      cur.endTime  = timeStr;
+      cur.endMins  = slotMins + 30;
+      cur.minBuy   = Math.min(cur.minBuy, iv.buyC);
+      cur.maxBuy   = Math.max(cur.maxBuy, iv.buyC);
+      cur.minFeed  = Math.min(cur.minFeed, iv.feedinC);
+      cur.maxFeed  = Math.max(cur.maxFeed, iv.feedinC);
+      cur.chargeKw = Math.max(cur.chargeKw, iv.chargeKw || 0);
+      if (iv.inHW) cur.inHW = true;
       cur.count++;
     }
   }
   if (cur) blocks.push(cur);
 
+  const tbody = document.getElementById('plan-body');
+  tbody.innerHTML = '';
+
   for (const b of blocks) {
-    const isNow = nowMins >= b.startMins && nowMins < (b.startMins + b.count * 5);
-    const tr = document.createElement('tr');
+    const isNow = nowMins >= b.startMins && nowMins < b.endMins;
+    const tr    = document.createElement('tr');
     if (isNow) tr.className = 'now-row';
 
     const buyRange  = b.minBuy === b.maxBuy ? b.minBuy.toFixed(1) : `${b.minBuy.toFixed(1)}–${b.maxBuy.toFixed(1)}`;
     const feedRange = b.minFeed === b.maxFeed ? b.minFeed.toFixed(1) : `${b.minFeed.toFixed(1)}–${b.maxFeed.toFixed(1)}`;
+    const endH = String(Math.floor(b.endMins / 60)).padStart(2,'0');
+    const endM = String(b.endMins % 60).padStart(2,'0');
+    const timeStr = `${b.startTime}–${endH}:${endM}`;
 
     let actionLabel, actionClass, reason;
-    if (b.action === 'charge') {
-      actionLabel = '⚡ 充电'; actionClass = 'action-charge';
-      reason = `买价低(${buyRange}c)，从电网充电`;
+    const hwTag = b.inHW ? ' 🚿' : '';
+    if (b.action === 'charge' || b.action === 'charge+hw') {
+      actionLabel = `⚡ 充电${hwTag}`; actionClass = 'action-charge';
+      reason = b.inHW
+        ? `热水器运行中，充${b.chargeKw.toFixed(1)}kW（限额保护空开）`
+        : `买价低(${buyRange}c ≤ ${buyMaxC}c)，充${b.chargeKw.toFixed(1)}kW`;
     } else if (b.action === 'sell') {
-      actionLabel = '💰 卖电'; actionClass = 'action-sell';
-      const avgFeed = ((b.minFeed + b.maxFeed) / 2).toFixed(1);
-      reason = `卖价${feedRange}c，放电卖给电网`;
+      actionLabel = `💰 卖电`; actionClass = 'action-sell';
+      reason = `卖价${feedRange}c，放电卖网`;
     } else {
-      actionLabel = '🔄 自用'; actionClass = 'action-self';
-      reason = `买${buyRange}c 卖${feedRange}c，太阳能自用`;
+      actionLabel = `🔄 自用${hwTag}`; actionClass = 'action-self';
+      reason = b.inHW ? `热水器运行，PV+电网直供` : `买卖价差不划算，自用`;
     }
 
-    const timeStr = b.startTime === b.endTime ? b.startTime : `${b.startTime}–${b.endTime}`;
     tr.innerHTML = `
-      <td>${timeStr}${isNow ? ' ◀' : ''}</td>
+      <td>${timeStr}${isNow ? ' ◀ <span style="color:#fbbf24">现在</span>' : ''}</td>
       <td>${buyRange}</td>
       <td>${feedRange}</td>
       <td class="${actionClass}">${actionLabel}</td>
