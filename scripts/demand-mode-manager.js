@@ -1076,7 +1076,7 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   const forecastMinBuy = avgWindowN > 0
     ? sortedBuyPrices.slice(0, avgWindowN).reduce((s, v) => s + v, 0) / avgWindowN
     : 0;  // No forecast slots available (past 16:00 or no data) — set to 0 so dynamicBuyMax falls to floor (9.6c), effectively disabling grid charging
-  const dynamicBuyMax = Math.max(9.6, forecastMinBuy * 1.3); // max(avg6×1.3, 9.6c) — floor ensures we catch cheap windows even on low-forecast days
+  const dynamicBuyMax = Math.min(12.0, Math.max(9.6, forecastMinBuy * 1.3)); // capped at 12c hard ceiling — never charge above this even on expensive days
 
   // High-load throttle: when homeLoad is large (e.g. hot water heater), charge at 0.5kW only.
   // When homeLoad is small, Self-use mode lets solar charge the battery naturally — no grid charge needed.
