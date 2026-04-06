@@ -1379,7 +1379,7 @@ function decide(ess, pvPower, amber, state, dailySummary) {
     reason = "initialising — default to Self-use";
   }
 
-  return { targetMode, reason, alert, chargeThrottled };
+  return { targetMode, reason, alert, chargeThrottled, planSlotChargeKw };
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -1515,7 +1515,7 @@ async function main() {
       return _db.prepare("SELECT * FROM daily_summary WHERE date=?").get(today) || {};
     } catch { return {}; }
   })();
-  const { targetMode, reason, alert, chargeThrottled } = decide(ess, pvPower, amber, state, todaySummary);
+  const { targetMode, reason, alert, chargeThrottled, planSlotChargeKw } = decide(ess, pvPower, amber, state, todaySummary);
 
   if (alert) console.log(`[ALERT] ${alert}`);
 
