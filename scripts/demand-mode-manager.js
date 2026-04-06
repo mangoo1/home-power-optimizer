@@ -367,6 +367,7 @@ function httpLocal(method, path, body) {
     const req = require("http").request({
       hostname: "localhost", port: parseInt(GATEWAY_PORT),
       path, method,
+      timeout: 5000,
       headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) },
     }, res => {
       let d = "";
@@ -374,6 +375,7 @@ function httpLocal(method, path, body) {
       res.on("end", () => { try { resolve(JSON.parse(d)); } catch { resolve(d); } });
     });
     req.on("error", reject);
+    req.on("timeout", () => { req.destroy(); reject(new Error("httpLocal timeout")); });
     if (data) req.write(data);
     req.end();
   });
