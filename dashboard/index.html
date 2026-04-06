@@ -140,8 +140,8 @@
 <div class="footer" id="updated">Loading...</div>
 
 <script>
-const TURSO_URL   = 'https://home-power-optimizer-mangoo1.aws-ap-south-1.turso.io/v2/pipeline';
-const TURSO_TOKEN = 'eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJpYXQiOjE3NzQ5NTU2MjgsImlkIjoiMDE5ZDQzODEtOTYwMS03Njg2LWEwNWUtMjM5MTZjYTU3MzNmIiwicmlkIjoiNGFkNzM3YzctZTRiMS00NTViLWJiMjEtMDM5NmIzNDg2ZTcifQ.ircuDV8tvI83BricjrjJrAihL7j016jTepXZa1g1FAP9GCZXD0Iufj6kt5rs52xzK4ZGVzPMpTo97WoUcZXXAg';
+// Use local proxy to avoid CORS — proxy handles auth server-side
+const TURSO_URL = '/turso';
 
 let socChartObj, powerChartObj, priceChartObj, costChartObj;
 let currentRange = 'today';
@@ -171,7 +171,7 @@ function fmtDateTime(utcStr) {
 async function query(sql) {
   const res = await fetch(TURSO_URL, {
     method: 'POST',
-    headers: { 'Authorization': 'Bearer ' + TURSO_TOKEN, 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ requests: [{ type: 'execute', stmt: { sql } }, { type: 'close' }] })
   });
   const data = await res.json();
