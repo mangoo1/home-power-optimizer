@@ -261,7 +261,7 @@ async function loadCharts() {
   const fmtFn  = getFmtFn();
 
   const hist = await query(`SELECT ts, soc, batt_power, home_load, grid_power, buy_price, feedin_price,
-    interval_buy_aud, interval_sell_aud, interval_net_aud
+    meter_buy_total, meter_sell_total, record_trigger
     FROM energy_log WHERE ${where} ORDER BY ts`);
 
   const labels  = hist.map(r => fmtFn(v(r[0])));
@@ -272,19 +272,25 @@ async function loadCharts() {
   const buys    = hist.map(r => parseFloat(v(r[5]) || 0));
   const feedins = hist.map(r => parseFloat(v(r[6]) || 0));
 
-  // Cumulative cost — running sum of interval_buy_aud / interval_sell_aud
-  let cumBuy = 0, cumSell = 0, cumNet = 0;
-  const cumBuys = [], cumSells = [], cumNets = [];
-  for (let i = 0; i < hist.length; i++) {
-    cumBuy  += parseFloat(v(hist[i][7]) || 0);
-    cumSell += parseFloat(v(hist[i][8]) || 0);
-    cumNet  += parseFloat(v(hist[i][9]) || 0);
-    cumBuys.push(parseFloat(cumBuy.toFixed(4)));
-    cumSells.push(parseFloat(cumSell.toFixed(4)));
-    cumNets.push(parseFloat(cumNet.toFixed(4)));
-  }
-
-  // SOC chart
+  // Cost chart — always use daily_summary (only reliable cost source)
+  if (costChartObj) { costChartObj.destroy(); costChartObj = null; }
+  const daysBack = currentRange === '7d' ? 7 : currentRange === '48h' ? 2 : 1;
+  const ds = await query(`SELECT date, cost_aud, earnings_aud FROM daily_summary ORDER BY date DESC LIMIT ${daysBack}`);
+  ds.reverse();
+  const dsLabels = ds.map(r => v(r[0])?.substring(5));
+  const dsCost   = ds.map(r => parseFloat(v(r[1]) || 0).toFixed(3));
+  const dsEarn   = ds.map(r => parseFloat(v(r[2]) || 0).toFixed(3));
+  const dsNet    = ds.map((r,i) => (parseFloat(dsCost[i]) - parseFloat(dsEarn[i])).toFixed(3));
+  costChartObj = new Chart(document.getElementById('costChart'), {
+    type: 'bar',
+    data: { labels: dsLabels, datasets: [
+      { label: '买电 $',   data: dsCost, backgroundColor: 'rgba(248,113,113,0.75)', order: 2 },
+      { label: '卖电 $',   data: dsEarn, backgroundColor: 'rgba(74,222,128,0.75)',  order: 2 },
+      { label: '净费用 $', data: dsNet,  type: 'line', borderColor: '#fbbf24',
+        backgroundColor: 'rgba(251,191,36,0.1)', pointRadius: 4, tension: 0.3, order: 1 }
+    ]},
+    options: chartDefaults()
+  });
   if (socChartObj) socChartObj.destroy();
   socChartObj = new Chart(document.getElementById('socChart'), {
     type: 'line',
@@ -311,19 +317,6 @@ async function loadCharts() {
     data: { labels, datasets: [
       { label: 'Buy c/kWh',    data: buys,    borderColor: '#f87171', tension: 0.3, pointRadius: 0 },
       { label: 'FeedIn c/kWh', data: feedins, borderColor: '#4ade80', tension: 0.3, pointRadius: 0 }
-    ]},
-    options: chartDefaults()
-  });
-
-  // Cumulative cost chart
-  if (costChartObj) costChartObj.destroy();
-  costChartObj = new Chart(document.getElementById('costChart'), {
-    type: 'line',
-    data: { labels, datasets: [
-      { label: '累计买电 $',  data: cumBuys,  borderColor: '#f87171', tension: 0.3, pointRadius: 0, fill: false },
-      { label: '累计卖电 $',  data: cumSells, borderColor: '#4ade80', tension: 0.3, pointRadius: 0, fill: false },
-      { label: '净费用 $',    data: cumNets,  borderColor: '#fbbf24', tension: 0.3, pointRadius: 0, fill: false,
-        borderDash: [4, 4] }
     ]},
     options: chartDefaults()
   });
