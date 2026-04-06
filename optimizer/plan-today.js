@@ -518,6 +518,41 @@ async function main() {
   console.log(`\n  ☀️  SOLAR OUTLOOK: ${outlook2} — peak ${peakKw2}kW at ${peakH2}:00 (${PANEL_KWP}kWp system)`);
   console.log(`     Est. total generation: ${totalPvEst.toFixed(1)} kWh`);
 
+  // ── Hot water heater recommendation ────────────────────────────────────────
+  // Find the cheapest 4-slot (2h) window for hot water heater (avoid DW)
+  // Prefer daytime (07:00–16:00) to avoid waking up at midnight
+  const HW_SLOTS = 4;  // 4 × 30min = 2 hours
+  const HW_KW    = 10; // combined heater load kW
+
+  const eligibleSlots = priceIntervals.filter(iv => {
+    const h = sydHour(iv.nemTime);
+    return !iv.demandWindow && h >= 7 && h < 22 && (iv.buy||99) < 20;
+  });
+
+  let bestHwStart = null, bestHwAvg = 9999;
+  for (let i = 0; i <= eligibleSlots.length - HW_SLOTS; i++) {
+    const window = eligibleSlots.slice(i, i + HW_SLOTS);
+    // Must be consecutive (within 40 min total)
+    const t0 = new Date(window[0].nemTime).getTime();
+    const t3 = new Date(window[HW_SLOTS-1].nemTime).getTime();
+    if ((t3 - t0) > (HW_SLOTS - 1) * 35 * 60 * 1000) continue; // gap too large
+    const avg = window.reduce((s, iv) => s + (iv.buy||0), 0) / HW_SLOTS;
+    if (avg < bestHwAvg) { bestHwAvg = avg; bestHwStart = window[0]; }
+  }
+
+  let hwNote = null;
+  if (bestHwStart) {
+    const hwStartDt = new Date(new Date(bestHwStart.nemTime).getTime() + SYD_OFFSET * 3600 * 1000);
+    const hwEndDt   = new Date(hwStartDt.getTime() + HW_SLOTS * 30 * 60 * 1000);
+    const fmt2 = n => String(n).padStart(2, '0');
+    const hwStartStr = `${fmt2(hwStartDt.getUTCHours())}:${fmt2(hwStartDt.getUTCMinutes())}`;
+    const hwEndStr   = `${fmt2(hwEndDt.getUTCHours())}:${fmt2(hwEndDt.getUTCMinutes())}`;
+    hwNote = { startTime: hwStartStr, endTime: hwEndStr, avgPriceC: parseFloat(bestHwAvg.toFixed(1)), costEst: parseFloat((bestHwAvg * HW_KW * 2 / 100).toFixed(2)) };
+    console.log(`\n  🚿 HOT WATER: Best window ${hwStartStr}–${hwEndStr} @ avg ${bestHwAvg.toFixed(1)}¢ (est. $${hwNote.costEst} for 2h×10kW)`);
+  } else {
+    console.log(`\n  🚿 HOT WATER: No ideal window found today (all slots >20¢ or DW)`);
+  }
+
   // ── Save plan to database ──────────────────────────────────────────────────
   const db = new Database(DB_PATH);
 
@@ -606,13 +641,14 @@ async function main() {
   db.prepare(`
     INSERT INTO daily_plan (date, version, generated_at, source, created_by, soc_at_gen,
       has_demand_window, demand_window_start, demand_window_end, charge_cutoff_hour,
-      pv_forecast_kwh, pv_peak_kw, charge_windows_json, intervals_json, is_active)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)
+      pv_forecast_kwh, pv_peak_kw, charge_windows_json, intervals_json, notes, is_active)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)
   `).run(
     today, newVersion, new Date().toISOString(), 'lp', 'plan-today.js', currentSOC,
     hasDW ? 1 : 0, dwStart, dwEnd, cutoff,
     totPvKwh, Math.max(...Object.values(solarByHour), 0),
-    JSON.stringify(chargeWindows), JSON.stringify(intervalsData)
+    JSON.stringify(chargeWindows), JSON.stringify(intervalsData),
+    hwNote ? JSON.stringify({ hotWater: hwNote }) : null
   );
 
   db.close();

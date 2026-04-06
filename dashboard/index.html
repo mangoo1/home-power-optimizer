@@ -36,6 +36,9 @@
   .action-sell   { color: #4ade80; font-weight: 600; }
   .action-self   { color: #888; }
   .now-row td { background: #2a2d3a !important; }
+  /* Hot water banner */
+  .hw-banner { background: #1a2a1a; border: 1px solid #2d5a2d; border-radius: 10px;
+    padding: 10px 14px; margin-bottom: 14px; font-size: 0.85rem; color: #4ade80; display: none; }
 
   /* Time range selector */
   .timerange { display: flex; gap: 8px; justify-content: center; margin-bottom: 16px; flex-wrap: wrap; }
@@ -122,6 +125,9 @@
   <h2>💵 当天累计电费 (AUD)</h2>
   <canvas id="costChart"></canvas>
 </div>
+
+<!-- Hot water recommendation -->
+<div class="hw-banner" id="hw-banner"></div>
 
 <!-- Today's charge/sell plan -->
 <div class="plan-card">
@@ -345,7 +351,7 @@ async function loadPlan() {
   const planRows = await query(
     `SELECT date, version, generated_at, soc_at_gen, has_demand_window,
             charge_cutoff_hour, pv_forecast_kwh, pv_peak_kw,
-            charge_windows_json, intervals_json
+            charge_windows_json, intervals_json, notes
      FROM daily_plan WHERE is_active=1 ORDER BY generated_at DESC LIMIT 1`
   );
   if (!planRows.length) {
@@ -363,6 +369,17 @@ async function loadPlan() {
   const pvPeak      = parseFloat(v(p[7]) || 0);
   const chargeWins  = JSON.parse(v(p[8]) || '[]');
   const intervals   = JSON.parse(v(p[9]) || '[]');
+  const notes       = (() => { try { return JSON.parse(v(p[10]) || '{}'); } catch { return {}; } })();
+  const hwRec       = notes.hotWater || null;
+
+  // Hot water recommendation banner
+  const hwBanner = document.getElementById('hw-banner');
+  if (hwRec) {
+    hwBanner.innerHTML = `🚿 <strong>热水器建议</strong>：${hwRec.startTime} 开 → ${hwRec.endTime} 关 &nbsp;|&nbsp; 均价 ${hwRec.avgPriceC}¢ &nbsp;|&nbsp; 预计费用 $${hwRec.costEst}`;
+    hwBanner.style.display = 'block';
+  } else {
+    hwBanner.style.display = 'none';
+  }
 
   // Meta info
   const genSyd = toSydney(genAt);
