@@ -177,40 +177,46 @@ const TURSO_URL = '/turso';
 let socChartObj, powerChartObj, priceChartObj, costChartObj;
 let currentRange = 'today';
 
-function fmtSydney(utcStr, opts) {
-  return new Date(utcStr).toLocaleString('en-AU', { timeZone: 'Australia/Sydney', ...opts });
+// Sydney time — use formatToParts to extract numeric values directly
+// Avoids all browser AM/PM and locale formatting inconsistencies (Safari, iOS, etc.)
+function _sydParts(date, opts) {
+  return new Intl.DateTimeFormat('en-AU', { timeZone: 'Australia/Sydney', ...opts })
+    .formatToParts(date)
+    .reduce((a, p) => { a[p.type] = p.value; return a; }, {});
+}
+function _h24(parts) {
+  // Extract hour as 24h integer regardless of how browser formats it
+  return String(parseInt(parts.hour || '0') % 24).padStart(2, '0');
 }
 function fmtTime(utcStr) {
-  // Use Intl.DateTimeFormat for consistent 24h output across all browsers
-  return new Intl.DateTimeFormat('en-AU', {
-    timeZone: 'Australia/Sydney', hour: '2-digit', minute: '2-digit', hour12: false
-  }).format(new Date(utcStr)).replace('24:', '00:');
+  const p = _sydParts(new Date(utcStr), { hour: 'numeric', minute: '2-digit', hour12: false });
+  return _h24(p) + ':' + p.minute;
 }
 function fmtDateTime(utcStr) {
-  return new Intl.DateTimeFormat('en-AU', {
-    timeZone: 'Australia/Sydney', month: 'numeric', day: 'numeric',
-    hour: '2-digit', minute: '2-digit', hour12: false
-  }).format(new Date(utcStr)).replace('24:', '00:');
+  const p = _sydParts(new Date(utcStr), { month: 'numeric', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: false });
+  return (p.day||'?') + '/' + (p.month||'?') + ' ' + _h24(p) + ':' + (p.minute||'00');
+}
+function sydneyNowStr() {
+  const p = _sydParts(new Date(), { hour: 'numeric', minute: '2-digit', second: '2-digit', hour12: false });
+  return _h24(p) + ':' + (p.minute||'00') + ':' + (p.second||'00');
 }
 function sydneyMidnightUTC() {
-  const sydDateStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Australia/Sydney' });
-  const offsetStr = getSydneyOffsetStr();
-  return new Date(sydDateStr + 'T00:00:00+' + offsetStr).toISOString();
-}
-function getSydneyOffsetStr() {
+  // Get today's date in Sydney, then compute UTC midnight
+  const sydDateStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Australia/Sydney' }); // "2026-04-07"
   const now = new Date();
   const utcH = now.getUTCHours();
-  const sydH = parseInt(now.toLocaleString('en-AU', { timeZone: 'Australia/Sydney', hour: 'numeric', hour12: false }), 10);
+  const p = _sydParts(now, { hour: 'numeric', hour12: false });
+  const sydH = parseInt(p.hour || '0') % 24;
   let diff = sydH - utcH;
   if (diff < -12) diff += 24;
   if (diff > 12) diff -= 24;
-  return diff.toString().padStart(2, '0') + ':00';
+  const sign = diff >= 0 ? '+' : '-';
+  const absDiff = Math.abs(diff);
+  return new Date(sydDateStr + 'T00:00:00' + sign + String(absDiff).padStart(2,'0') + ':00').toISOString();
 }
-function sydneyNowStr() {
-  return new Intl.DateTimeFormat('en-AU', {
-    timeZone: 'Australia/Sydney',
-    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
-  }).format(new Date()).replace('24:', '00:');
+function fmtSydney(utcStr, opts) {
+  const p = _sydParts(new Date(utcStr), { hour: 'numeric', minute: '2-digit', ...opts, hour12: false });
+  return _h24(p) + ':' + (p.minute || '00');
 }
 
 async function query(sql) {
