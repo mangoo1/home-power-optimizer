@@ -1032,16 +1032,19 @@ function decide(ess, pvPower, amber, state, dailySummary) {
 
   // Dynamic SOC target: charge to 100% when price is ultra-cheap (<=7¢), else 90%
   const CHEAP_CHARGE_SOC = currentPrice <= ULTRACHEAP_PRICE_C ? SOC_MAX_CHARGE_ULTRACHEAP : SOC_MAX_CHARGE;
+  // Note: spot<=0 (free grid energy) still uses SOC_MAX_CHARGE (85%) as target,
+  // NOT SOC_MAX_CHARGE_ULTRACHEAP (100%) — ultra-cheap target only when buy price itself is cheap
 
   // ── Priority 3: Free/negative-price charging (spot <= 0) ─────────────────
   // Guard: never charge during demand window (handled in priority 1)
-  if (gridHeadroomOk && !currentDemand && spotPrice <= CHARGE_SPOT_MAX && soc < CHEAP_CHARGE_SOC) {
+  // Use SOC_MAX_CHARGE (85%) as target — NOT the ultra-cheap 100% target
+  if (gridHeadroomOk && !currentDemand && spotPrice <= CHARGE_SPOT_MAX && soc < SOC_MAX_CHARGE) {
     targetMode = MODE.BACKUP;
     reason = `spot=${spotPrice.toFixed(2)}c (<=0) — free charging (SOC ${soc}% -> ${SOC_MAX_CHARGE}%)`;
     return { targetMode, reason, alert };
   }
-  if (!currentDemand && spotPrice <= CHARGE_SPOT_MAX && soc >= CHEAP_CHARGE_SOC) {
-    // Battery full — exit Backup
+  if (!currentDemand && spotPrice <= CHARGE_SPOT_MAX && soc >= SOC_MAX_CHARGE) {
+    // Battery at target — exit Backup
     if (state.currentMode === MODE.BACKUP) {
       targetMode = MODE.SELF_USE;
       reason = `SOC reached ${soc}% (>=${SOC_MAX_CHARGE}%) — stop charging`;
