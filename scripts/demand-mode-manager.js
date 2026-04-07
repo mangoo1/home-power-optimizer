@@ -1033,10 +1033,19 @@ function decide(ess, pvPower, amber, state, dailySummary) {
     }
   }
 
-  // Dynamic SOC target: charge to 100% when price is ultra-cheap (<=7¢), else 90%
-  const CHEAP_CHARGE_SOC = currentPrice <= ULTRACHEAP_PRICE_C ? SOC_MAX_CHARGE_ULTRACHEAP : SOC_MAX_CHARGE;
-  // Note: spot<=0 (free grid energy) still uses SOC_MAX_CHARGE (85%) as target,
-  // NOT SOC_MAX_CHARGE_ULTRACHEAP (100%) — ultra-cheap target only when buy price itself is cheap
+  // ── Dynamic SOC target ───────────────────────────────────────────────────
+  // Base target: 85%
+  // Ultra-cheap grid (buy <= 7c): charge to 100% — cheap enough to top up from grid
+  // PV surplus (pvPower > homeLoad) + cheap price: also allow up to 100% — free solar, don't waste
+  const pvPowerVal2  = pvPower ?? 0;
+  const homeLoadVal2 = ess.homeLoad ?? 0;
+  const pvSurplus    = pvPowerVal2 > homeLoadVal2;  // PV generating more than house needs
+  const cheapPrice   = currentPrice <= effectiveBuyMax; // within today's cheap window
+  const CHEAP_CHARGE_SOC = (currentPrice <= ULTRACHEAP_PRICE_C || (pvSurplus && cheapPrice))
+    ? SOC_MAX_CHARGE_ULTRACHEAP   // 100% — free solar surplus or ultra-cheap grid
+    : SOC_MAX_CHARGE;             // 85% — normal target
+  console.log(`[SOC] target=${CHEAP_CHARGE_SOC}% (pvSurplus=${pvSurplus} cheapPrice=${cheapPrice} buy=${currentPrice.toFixed(1)}c ultraCheap=${currentPrice<=ULTRACHEAP_PRICE_C})`);
+  // Note: spot<=0 grid-standby uses SOC_MAX_CHARGE (85%) — see Priority 3 below
 
   // ── Priority 3: Free/negative-price charging (spot <= 0) ─────────────────
   // Guard: never charge during demand window (handled in priority 1)
@@ -1227,17 +1236,17 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   if (state.currentMode === MODE.BACKUP && !emergencyCharge) {
     const socFull = soc >= CHEAP_CHARGE_SOC;
 
-    if (socFull && currentPrice <= effectiveBuyMax) {
-      // SOC full but price still cheap — grid-standby: keep Timed mode, chargeKw=0, block discharge
-      // Grid supplies home load, battery idles. Preserves battery for evening sell.
-      reason = `SOC ${soc}% full, price=${currentPrice.toFixed(1)}c cheap — grid-standby (block discharge)`;
+    if (socFull && currentPrice <= effectiveBuyMax && !pvSurplus) {
+      // SOC full, price cheap, but no PV surplus → grid-standby
+      // Grid supplies home load, battery idles. No need to charge or discharge.
+      reason = `SOC ${soc}% full, price=${currentPrice.toFixed(1)}c cheap, no PV surplus — grid-standby (chargeKw=0)`;
       alert = { ...(alert||{}), planChargeKwOverride: 0 };
-      console.log(`[INFO] Grid-standby: SOC full + cheap price → chargeKw=0, blocking battery discharge`);
+      console.log(`[INFO] Grid-standby: SOC full + cheap price + no PV surplus → chargeKw=0`);
       return { targetMode: MODE.BACKUP, reason, alert };
     }
     if (socFull) {
       targetMode = MODE.SELF_USE;
-      reason = `SOC target ${CHEAP_CHARGE_SOC}% reached (SOC ${soc}%), price=${currentPrice.toFixed(1)}c not cheap — Self-use`;
+      reason = `SOC target ${CHEAP_CHARGE_SOC}% reached (SOC ${soc}%), price=${currentPrice.toFixed(1)}c — Self-use`;
       state.chargeExitCount = 0;
       return { targetMode, reason, alert };
     }
