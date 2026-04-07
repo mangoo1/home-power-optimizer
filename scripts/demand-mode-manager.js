@@ -1040,7 +1040,7 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   const pvPowerVal2  = pvPower ?? 0;
   const homeLoadVal2 = ess.homeLoad ?? 0;
   const pvSurplus    = pvPowerVal2 > homeLoadVal2;  // PV generating more than house needs
-  const cheapPrice   = currentPrice <= effectiveBuyMax; // within today's cheap window
+  const cheapPrice   = currentPrice <= 9.6; // early estimate — use 9.6c threshold before plan loads
   const CHEAP_CHARGE_SOC = (currentPrice <= ULTRACHEAP_PRICE_C || (pvSurplus && cheapPrice))
     ? SOC_MAX_CHARGE_ULTRACHEAP   // 100% — free solar surplus or ultra-cheap grid
     : SOC_MAX_CHARGE;             // 85% — normal target
@@ -1204,11 +1204,11 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   const planSaysCharge   = planAction === 'charge';
   const planSaysSell     = planAction === 'sell';
 
-  // Effective buy ceiling: plan threshold if available, else dynamicBuyMax
-  const effectiveBuyMax  = planBuyThresholdC ?? dynamicBuyMax;
-  const chargeCondition  = currentPrice <= effectiveBuyMax || emergencyCharge;
+  // Effective buy ceiling: plan threshold if available, else dynamicBuyMax (defined earlier)
+  const effectiveBuyMaxFull = planBuyThresholdC ?? dynamicBuyMax;
+  const chargeCondition  = currentPrice <= effectiveBuyMaxFull || emergencyCharge;
 
-  console.log(`[PLAN] plan=${todayPlan ? `loaded(v${todayPlan.version})` : 'none'} slot=${planAction ?? 'none'} price=${currentPrice.toFixed(1)}c buyMax=${effectiveBuyMax.toFixed(1)}c chargeCondition=${chargeCondition}`);
+  console.log(`[PLAN] plan=${todayPlan ? `loaded(v${todayPlan.version})` : 'none'} slot=${planAction ?? 'none'} price=${currentPrice.toFixed(1)}c buyMax=${effectiveBuyMaxFull.toFixed(1)}c chargeCondition=${chargeCondition}`);
 
   if (cheapEntryOk && chargeCondition) {
     // If plan says charge: act immediately (no buffer needed — plan already smoothed noise)
@@ -1217,7 +1217,7 @@ function decide(ess, pvPower, amber, state, dailySummary) {
     const condLabel = emergencyCharge
       ? `EMERGENCY SOC=${soc}% deficit=${projectedDeficit.toFixed(1)}kWh`
       : planSaysCharge
-        ? `plan:charge buy=${currentPrice.toFixed(1)}c (≤${effectiveBuyMax.toFixed(1)}c)`
+        ? `plan:charge buy=${currentPrice.toFixed(1)}c (≤${effectiveBuyMaxFull.toFixed(1)}c)`
         : `buy=${currentPrice.toFixed(1)}c (≤${effectiveBuyMax.toFixed(1)}c fallback)`;
     if (entryCount >= 3 || emergencyCharge) {
       targetMode = MODE.BACKUP;
@@ -1236,7 +1236,7 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   if (state.currentMode === MODE.BACKUP && !emergencyCharge) {
     const socFull = soc >= CHEAP_CHARGE_SOC;
 
-    if (socFull && currentPrice <= effectiveBuyMax && !pvSurplus) {
+    if (socFull && currentPrice <= effectiveBuyMaxFull && !pvSurplus) {
       // SOC full, price cheap, but no PV surplus → grid-standby
       // Grid supplies home load, battery idles. No need to charge or discharge.
       reason = `SOC ${soc}% full, price=${currentPrice.toFixed(1)}c cheap, no PV surplus — grid-standby (chargeKw=0)`;
