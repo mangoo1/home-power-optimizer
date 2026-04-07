@@ -569,15 +569,17 @@ async function setSellingMode(nextDemandMinutes, powerKw = 5) {
 const MAX_GRID_TARGET  = parseFloat(process.env.MAIN_BREAKER_KW ?? '7.7'); // kW — read from .env, default 7.7kW (32A@240V)
 const MAX_GRID_IMPORT_KW = MAX_GRID_TARGET - 0.2; // hard guard
 const MAX_CHARGE_KW    = 5.0;   // kW inverter max charge rate
-const MIN_CHARGE_KW    = 0.3;   // kW minimum — allow trickle charge during high-load (hot water) periods
-const CHARGE_SAFETY_BUFFER = 0.5; // kW safety headroom — reduced from 1.0 so we can still trickle-charge during hot water
+const MIN_CHARGE_KW    = 0.2;   // kW minimum — allow trickle charge during high-load (hot water) periods
+const CHARGE_SAFETY_BUFFER = 0.2; // kW safety headroom — small buffer, PV already offsets house load dynamically
 // HIGH_LOAD_ABORT_KW: absolute hard stop — only abort charging when grid would genuinely exceed breaker
 const HIGH_LOAD_ABORT_KW      = MAX_GRID_TARGET - 0.3; // kW
 const HIGH_LOAD_THRESHOLD_KW  = 3.5; // kW — above this = big appliance running (e.g. hot water heater)
 const THROTTLE_CHARGE_KW      = 0.5; // kW — trickle charge when high load detected
 
 function calcChargeKw(homeLoad, pvPower) {
-  // Available grid headroom for charging = target - net house draw - safety buffer
+  // netHouseDraw = what grid actually supplies to house after PV offsets it
+  // chargeKw = remaining breaker headroom after house draw and safety buffer
+  // PV already reduces netHouseDraw, so on sunny days we can charge MORE even when homeLoad is high
   const netHouseDraw = (homeLoad ?? 0) - (pvPower ?? 0);
   const available = MAX_GRID_TARGET - netHouseDraw - CHARGE_SAFETY_BUFFER;
   const chargeKw = Math.min(MAX_CHARGE_KW, Math.max(0, available));
@@ -1103,10 +1105,10 @@ function decide(ess, pvPower, amber, state, dailySummary) {
 
   // High-load throttle: when homeLoad is large (e.g. hot water heater), charge at 0.5kW only.
   // When homeLoad is small, Self-use mode lets solar charge the battery naturally — no grid charge needed.
-  const chargeThrottled = (ess.homeLoad ?? 0) >= HIGH_LOAD_THRESHOLD_KW;
-  if (chargeThrottled) {
-    console.log(`[THROTTLE] homeLoad=${(ess.homeLoad??0).toFixed(2)}kW >= ${HIGH_LOAD_THRESHOLD_KW}kW — throttling charge to ${THROTTLE_CHARGE_KW}kW`);
-  }
+  const chargeThrottled = false; // Throttle logic removed — calcChargeKw() already accounts for PV and breaker headroom dynamically
+  // Previously: homeLoad >= 3.5kW → fixed 0.5kW throttle. Problem: ignored PV offset.
+  // Now: always use calcChargeKw(homeLoad, pvPower) which computes: 7.7 - (homeLoad - pvPower) - 0.2
+  // When hot water heater runs (homeLoad=9kW, PV=3kW): chargeKw = 7.7 - 6.0 - 0.2 = 1.5kW (not 0.5kW!)
 
   // Peak feedIn until end of selling window (until SELL_STOP_HOUR or demand window)
   const sellStopMs = (() => { const d = new Date(); d.setHours(SELL_STOP_HOUR,0,0,0); return d.getTime(); })();
