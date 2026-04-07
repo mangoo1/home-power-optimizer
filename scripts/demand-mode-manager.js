@@ -1573,13 +1573,18 @@ async function main() {
   // Load today's summary first (used for avg buy price in sell decision)
   const state = loadState();
 
-  // ── Sync state.currentMode from reportedMode (handles manual inverter changes) ──
-  // If user manually switches inverter mode outside of this script, state.currentMode
-  // will be stale. Sync it so the decision engine sees the correct current mode.
+  // ── Sync state.currentMode from reportedMode ──────────────────────────────
+  // Exception: if we believe we're SELLING (state=6) but inverter reports TIMED(1),
+  // this is EXPECTED — ESS inverter reports mode=1 (Timed) for both charging and selling.
+  // Do NOT sync in this case, or we lose the SELLING context and fall into re-entry logic.
+  const sellingButTimedOk = state.currentMode === MODE.SELLING && ess.reportedMode === MODE.TIMED;
   if (ess.reportedMode !== null && ess.reportedMode !== undefined &&
-      state.currentMode !== null && ess.reportedMode !== state.currentMode) {
+      state.currentMode !== null && ess.reportedMode !== state.currentMode &&
+      !sellingButTimedOk) {
     console.log(`[SYNC] reportedMode=${ess.reportedMode}(${MODE_LABEL[ess.reportedMode]??ess.reportedMode}) ≠ state=${state.currentMode}(${MODE_LABEL[state.currentMode]??state.currentMode}) — syncing state to reported`);
     state.currentMode = ess.reportedMode;
+  } else if (sellingButTimedOk) {
+    console.log(`[SYNC] reportedMode=Timed(1) with state=Selling(6) — expected, not syncing`);
   }
 
   // ── Force mode override ───────────────────────────────────────────────────
