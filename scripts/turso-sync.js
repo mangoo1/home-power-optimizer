@@ -31,7 +31,9 @@ async function main() {
            renewables, record_trigger, solar_wm2, cloud_cover_pct,
            meter_buy_total, meter_sell_total,
            interval_buy_aud, interval_sell_aud, interval_net_aud,
-           meter_buy_delta, meter_sell_delta
+           meter_buy_delta, meter_sell_delta,
+           today_pv_kwh, today_grid_buy_kwh, today_grid_sell_kwh,
+           today_home_kwh, today_charge_kwh, today_discharge_kwh
     FROM energy_log WHERE ts >= ? ORDER BY ts
   `).all(since);
 
@@ -53,14 +55,18 @@ async function main() {
          spot_price,demand_window,mode,renewables,record_trigger,solar_wm2,cloud_cover_pct,
          meter_buy_total,meter_sell_total,
          interval_buy_aud,interval_sell_aud,interval_net_aud,
-         meter_buy_delta,meter_sell_delta)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+         meter_buy_delta,meter_sell_delta,
+         today_pv_kwh,today_grid_buy_kwh,today_grid_sell_kwh,
+         today_home_kwh,today_charge_kwh,today_discharge_kwh)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       args: [r.ts, r.soc, r.batt_power, r.home_load, r.pv_power, r.grid_power,
              r.buy_price, r.feedin_price, r.spot_price, r.demand_window||0, r.mode,
              r.renewables, r.record_trigger, r.solar_wm2, r.cloud_cover_pct,
              r.meter_buy_total, r.meter_sell_total,
              r.interval_buy_aud ?? null, r.interval_sell_aud ?? null, r.interval_net_aud ?? null,
-             r.meter_buy_delta ?? null, r.meter_sell_delta ?? null]
+             r.meter_buy_delta ?? null, r.meter_sell_delta ?? null,
+             r.today_pv_kwh ?? null, r.today_grid_buy_kwh ?? null, r.today_grid_sell_kwh ?? null,
+             r.today_home_kwh ?? null, r.today_charge_kwh ?? null, r.today_discharge_kwh ?? null]
     }));
     await client.batch(batch, 'write');
     process.stdout.write('.');

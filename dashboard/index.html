@@ -81,7 +81,27 @@
   <div class="stat">
     <div class="label">Solar PV</div>
     <div class="value yellow" id="pv">--</div>
-    <div class="unit">kW</div>
+    <div class="unit">kW 实时</div>
+  </div>
+  <div class="stat">
+    <div class="label">今日产电</div>
+    <div class="value yellow" id="pv-kwh">--</div>
+    <div class="unit">kWh ☀️</div>
+  </div>
+  <div class="stat">
+    <div class="label">今日用电</div>
+    <div class="value" id="home-kwh">--</div>
+    <div class="unit">kWh 🏠</div>
+  </div>
+  <div class="stat">
+    <div class="label">今日买电</div>
+    <div class="value red" id="grid-buy-kwh">--</div>
+    <div class="unit">kWh ⬇️</div>
+  </div>
+  <div class="stat">
+    <div class="label">今日卖电</div>
+    <div class="value green" id="grid-sell-kwh">--</div>
+    <div class="unit">kWh ⬆️</div>
   </div>
   <div class="stat">
     <div class="label">Grid</div>
@@ -231,7 +251,7 @@ function getFmtFn() {
 
 async function loadStats() {
   // Latest record
-  const latest = await query('SELECT ts, soc, batt_power, home_load, grid_power, buy_price, feedin_price, mode, pv_power FROM energy_log ORDER BY ts DESC LIMIT 1');
+  const latest = await query('SELECT ts, soc, batt_power, home_load, grid_power, buy_price, feedin_price, mode, pv_power, today_pv_kwh, today_grid_buy_kwh, today_grid_sell_kwh, today_home_kwh FROM energy_log ORDER BY ts DESC LIMIT 1');
   if (latest.length > 0) {
     const r = latest[0];
     const soc  = parseFloat(v(r[1]) || 0);
@@ -240,17 +260,25 @@ async function loadStats() {
     const grid = parseFloat(v(r[4]) || 0);
     const buy  = parseFloat(v(r[5]) || 0);
     const fi   = parseFloat(v(r[6]) || 0);
-    const pv   = parseFloat(v(r[8]) || 0);
+    const pv        = parseFloat(v(r[8])  || 0);
+    const pvKwh     = parseFloat(v(r[9])  || 0);
+    const gridBuyKwh= parseFloat(v(r[10]) || 0);
+    const gridSellKwh=parseFloat(v(r[11]) || 0);
+    const homeKwh   = parseFloat(v(r[12]) || 0);
 
-    document.getElementById('soc').textContent   = soc.toFixed(0);
-    document.getElementById('soc').className     = 'value ' + (soc > 60 ? 'green' : soc > 30 ? 'yellow' : 'red');
-    document.getElementById('load').textContent  = load.toFixed(2);
-    document.getElementById('batt').textContent  = batt.toFixed(2);
-    document.getElementById('grid').textContent  = grid.toFixed(2);
-    document.getElementById('grid').className    = 'value ' + (grid < 0 ? 'green' : grid > 0.5 ? 'red' : '');
-    document.getElementById('buy').textContent   = buy.toFixed(2);
+    document.getElementById('soc').textContent    = soc.toFixed(0);
+    document.getElementById('soc').className      = 'value ' + (soc > 60 ? 'green' : soc > 30 ? 'yellow' : 'red');
+    document.getElementById('load').textContent   = load.toFixed(2);
+    document.getElementById('batt').textContent   = batt.toFixed(2);
+    document.getElementById('grid').textContent   = grid.toFixed(2);
+    document.getElementById('grid').className     = 'value ' + (grid < 0 ? 'green' : grid > 0.5 ? 'red' : '');
+    document.getElementById('buy').textContent    = buy.toFixed(2);
     document.getElementById('feedin').textContent = fi.toFixed(2);
-    document.getElementById('pv').textContent    = pv.toFixed(2);
+    document.getElementById('pv').textContent     = pv.toFixed(2);
+    document.getElementById('pv-kwh').textContent = pvKwh.toFixed(1);
+    document.getElementById('home-kwh').textContent = homeKwh.toFixed(1);
+    document.getElementById('grid-buy-kwh').textContent  = gridBuyKwh.toFixed(1);
+    document.getElementById('grid-sell-kwh').textContent = gridSellKwh.toFixed(1);
   }
 
   // Today summary
