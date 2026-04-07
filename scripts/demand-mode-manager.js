@@ -1028,6 +1028,9 @@ function decide(ess, pvPower, amber, state, dailySummary) {
     }
   }
 
+  // Dynamic SOC target: charge to 100% when price is ultra-cheap (<=7¢), else 90%
+  const CHEAP_CHARGE_SOC = currentPrice <= ULTRACHEAP_PRICE_C ? SOC_MAX_CHARGE_ULTRACHEAP : SOC_MAX_CHARGE;
+
   // ── Priority 3: Free/negative-price charging (spot <= 0) ─────────────────
   // Guard: never charge during demand window (handled in priority 1)
   if (gridHeadroomOk && !currentDemand && spotPrice <= CHARGE_SPOT_MAX && soc < CHEAP_CHARGE_SOC) {
@@ -1117,8 +1120,6 @@ function decide(ess, pvPower, amber, state, dailySummary) {
 
   const CHEAP_EXIT_MIN  = 13.0;  // c/kWh — exit threshold (asymmetric: hold charge longer)
   const SPREAD_MIN      = 7.0;   // c/kWh — minimum buy→sell spread to justify charging
-  // Dynamic SOC target: charge to 100% when price is ultra-cheap (<=7¢), else 90%
-  const CHEAP_CHARGE_SOC = currentPrice <= ULTRACHEAP_PRICE_C ? SOC_MAX_CHARGE_ULTRACHEAP : SOC_MAX_CHARGE;
 
   const peakFeedIn      = peakFeedInToday ?? 0;
   const spreadOk        = peakFeedIn > 0 && (currentPrice + SPREAD_MIN) <= peakFeedIn;
