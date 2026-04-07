@@ -1423,23 +1423,52 @@ async function main() {
   const clTariffPeriod = clCurrent.tariffInformation?.period ?? null;
 
   // Guard: detect Amber API returning all-zero data (transient error).
-  // Zero price + zero renewables + no nemTime = bad data. Skip decision to avoid false charging.
+  // Zero price + zero renewables + no nemTime = bad data.
+  // Strategy: use stale cached price data for up to AMBER_STALE_TOLERANCE_MIN minutes
+  //           before falling back to Self-use. This prevents losing charge sessions during
+  //           brief Amber API blips (common around interval boundaries).
+  const AMBER_STALE_TOLERANCE_MIN = 15; // minutes — tolerate stale data for up to 15 min
   const amberDataValid = general.length > 0 && (currentPrice !== 0 || renewables !== 0 || current.nemTime != null);
+
   if (!amberDataValid) {
-    console.error("[ERROR] Amber API returned invalid/zero data — applying safety fallback");
-    // Safety: if currently in Timed mode (selling or charging), fall back to Self-use
-    // Timed mode without price data is unsafe — could be selling at wrong price or charging at wrong time
-    const reportedMode = await getReportedMode();
-    const fallbackState = loadState();
-    if (reportedMode === MODE.TIMED || reportedMode === MODE.SELLING ||
-        fallbackState.currentMode === MODE.TIMED || fallbackState.currentMode === MODE.SELLING || fallbackState.currentMode === MODE.BACKUP) {
-      console.warn("[SAFETY] Amber data unavailable + active Timed/Selling/Backup mode — switching to Self-use");
-      await setModeWithVerify(MODE.SELF_USE, {});
-      fallbackState.currentMode = MODE.SELF_USE;
-      saveState(fallbackState);
+    // Try to load last known good Amber data from state
+    const staleState = loadState();
+    const lastAmber = staleState.lastAmberData;
+    const lastAmberAge = lastAmber ? (Date.now() - new Date(lastAmber.ts).getTime()) / 60000 : 999;
+
+    if (lastAmber && lastAmberAge < AMBER_STALE_TOLERANCE_MIN) {
+      console.warn(`[WARN] Amber API returned invalid data — using cached data from ${lastAmberAge.toFixed(1)} min ago (tolerance=${AMBER_STALE_TOLERANCE_MIN}min)`);
+      // Inject stale data and continue — do NOT switch mode
+      general.push(...(lastAmber.general || []));
+      feedInCh.push(...(lastAmber.feedIn || []));
+      // Re-parse with stale data
+      Object.assign(current, lastAmber.current || {});
+    } else {
+      console.error(`[ERROR] Amber API invalid + no usable cache (age=${lastAmberAge.toFixed(0)}min) — safety fallback`);
+      const reportedMode = await getReportedMode();
+      const fallbackState = loadState();
+      if (reportedMode === MODE.TIMED || reportedMode === MODE.SELLING ||
+          fallbackState.currentMode === MODE.TIMED || fallbackState.currentMode === MODE.SELLING || fallbackState.currentMode === MODE.BACKUP) {
+        console.warn("[SAFETY] Amber data stale + active Timed/Selling/Backup mode — switching to Self-use");
+        await setModeWithVerify(MODE.SELF_USE, {});
+        fallbackState.currentMode = MODE.SELF_USE;
+        saveState(fallbackState);
+      }
+      console.log(`[DONE]`);
+      return;
     }
-    console.log(`[DONE]`);
-    return;
+  }
+
+  // Cache this valid Amber response for stale-data tolerance
+  {
+    const cacheState = loadState();
+    cacheState.lastAmberData = {
+      ts: now.toISOString(),
+      current: { ...current },
+      general: general.slice(0, 20),  // keep first 20 intervals (enough for decisions)
+      feedIn:  feedInCh.slice(0, 20),
+    };
+    saveState(cacheState);
   }
 
   // Find next demand window start time from forecast
