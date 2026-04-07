@@ -1296,16 +1296,21 @@ function decide(ess, pvPower, amber, state, dailySummary) {
       // (sell logic below may override this)
     }
     // Exit when price rises above threshold — 3-interval buffer to avoid thrashing
-    if (currentPrice > dynamicBuyMax) {
-      const overCount = (state.chargeExitCount || 0) + 1;
+    // Use effectiveBuyMaxFull (plan threshold if set) so manual overrides are respected
+    const exitThreshold = effectiveBuyMaxFull;
+    if (currentPrice > exitThreshold) {
+      // If plan has explicit buyThresholdC, exit immediately (no buffer needed — plan decision is authoritative)
+      // Otherwise use 3-interval buffer to avoid single-spike noise
+      const useBuffer = !planBuyThresholdC;
+      const overCount = useBuffer ? (state.chargeExitCount || 0) + 1 : 3;
       if (overCount >= 3) {
         targetMode = MODE.SELF_USE;
-        reason = `price ${currentPrice.toFixed(1)}c > ${dynamicBuyMax.toFixed(1)}c (fallback exit, count=${overCount})`;
+        reason = `price ${currentPrice.toFixed(1)}c > ${exitThreshold.toFixed(1)}c (exit${planBuyThresholdC ? '/plan' : ''}, count=${overCount})`;
         state.chargeExitCount = 0;
         return { targetMode, reason, alert };
       } else {
         state.chargeExitCount = overCount;
-        console.log(`[INFO] Fallback exit buffer: ${currentPrice.toFixed(1)}c > ${dynamicBuyMax.toFixed(1)}c (count=${overCount}/3)`);
+        console.log(`[INFO] Charge exit buffer: ${currentPrice.toFixed(1)}c > ${exitThreshold.toFixed(1)}c (count=${overCount}/3)`);
       }
     } else {
       state.chargeExitCount = 0;
@@ -1315,8 +1320,10 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   // ── extremelyLow opportunistic charging (no plan / outside window) ─────────
   // Only fires when no plan active OR plan says idle but price is extremely cheap.
   // Uses 2-interval buffer to avoid single-spike noise.
+  // Respects planBuyThresholdC: if plan sets a lower threshold, don't charge above it.
   const EXTREMELY_LOW_MAX = 10; // c/kWh
-  if (gridHeadroomOk && !currentDemand && descriptor === 'extremelyLow' && currentPrice < EXTREMELY_LOW_MAX && soc < CHEAP_CHARGE_SOC && state.currentMode !== MODE.BACKUP) {
+  const elMaxPrice = planBuyThresholdC != null ? Math.min(EXTREMELY_LOW_MAX, planBuyThresholdC) : EXTREMELY_LOW_MAX;
+  if (gridHeadroomOk && !currentDemand && descriptor === 'extremelyLow' && currentPrice < elMaxPrice && soc < CHEAP_CHARGE_SOC && state.currentMode !== MODE.BACKUP) {
     const elEntryCount = (state.extremelyLowEntryCount || 0) + 1;
     if (elEntryCount >= 2) {
       targetMode = MODE.BACKUP;
@@ -1331,11 +1338,14 @@ function decide(ess, pvPower, amber, state, dailySummary) {
     state.extremelyLowEntryCount = 0;
   }
   if (state.currentMode === MODE.BACKUP && !emergencyCharge) {
-    if (currentPrice > dynamicBuyMax || soc >= CHEAP_CHARGE_SOC) {
-      const overCount = (state.elExitCount || 0) + 1;
+    const elExitMax = planBuyThresholdC != null ? Math.min(dynamicBuyMax, planBuyThresholdC) : dynamicBuyMax;
+    if (currentPrice > elExitMax || soc >= CHEAP_CHARGE_SOC) {
+      // If plan has explicit threshold, exit immediately; else use buffer
+      const useBuffer = !planBuyThresholdC;
+      const overCount = useBuffer ? (state.elExitCount || 0) + 1 : 3;
       if (soc >= CHEAP_CHARGE_SOC || overCount >= 3) {
         targetMode = MODE.SELF_USE;
-        reason = `extremelyLow ended buy=${currentPrice.toFixed(1)}c dynamicMax=${dynamicBuyMax.toFixed(1)}c SOC=${soc}%`;
+        reason = `extremelyLow ended buy=${currentPrice.toFixed(1)}c exitMax=${elExitMax.toFixed(1)}c SOC=${soc}%`;
         state.elExitCount = 0;
         return { targetMode, reason, alert };
       } else {
@@ -1523,41 +1533,30 @@ async function main() {
   // Strategy: use stale cached price data for up to AMBER_STALE_TOLERANCE_MIN minutes
   //           before falling back to Self-use. This prevents losing charge sessions during
   //           brief Amber API blips (common around interval boundaries).
-  const AMBER_STALE_TOLERANCE_MIN = 15; // minutes — tolerate stale data for up to 15 min
+  const AMBER_STALE_TOLERANCE_MIN = 15;
   const amberDataValid = general.length > 0 && (currentPrice !== 0 || renewables !== 0 || current.nemTime != null);
 
   if (!amberDataValid) {
-    // Try to load last known good Amber data from state
-    const staleState = loadState();
-    const lastAmber = staleState.lastAmberData;
-    const lastAmberAge = lastAmber ? (Date.now() - new Date(lastAmber.ts).getTime()) / 60000 : 999;
-    // Cache is valid only if price data is non-zero
-    const cacheValid = lastAmber && lastAmberAge < AMBER_STALE_TOLERANCE_MIN &&
-      lastAmber.current?.perKwh != null && lastAmber.current.perKwh !== 0;
+    // Amber API blip — NEVER change the inverter mode based on bad data.
+    // Just roll the active session window if needed, then exit.
+    const blipState = loadState();
+    const cacheAge = blipState.lastAmberData
+      ? (Date.now() - new Date(blipState.lastAmberData.ts).getTime()) / 60000 : 999;
+    console.warn(`[WARN] Amber API blip — holding mode=${MODE_LABEL[blipState.currentMode]??blipState.currentMode}, cache age=${cacheAge.toFixed(0)}min`);
 
-    if (cacheValid) {
-      console.warn(`[WARN] Amber API blip — holding current mode, using cached price ${lastAmber.current.perKwh.toFixed(2)}c from ${lastAmberAge.toFixed(1)}min ago`);
-      // Do NOT inject stale data into decision engine — just keep current inverter mode unchanged
-      // This prevents buy=0/spot=0 from triggering false "free charging" or wrong decisions
-      const holdState = loadState();
-      holdState.lastCheck = now.toISOString();
-      saveState(holdState);
-      console.log(`[DONE] (Amber blip — mode held)`);
-      return;
+    // Roll sell/charge window so inverter doesn't time out
+    if (blipState.currentMode === MODE.SELLING) {
+      await updateSellingEndTime();
+      console.log(`[DONE] (Amber blip — sell session held)`);
+    } else if (blipState.currentMode === MODE.BACKUP) {
+      // Re-apply charge window to prevent inverter reset
+      const { startHHMM } = timedModeTimeContext(null);
+      const pwOk = await setParam('0xC016', '1800'); // keep charge end at 18:00 or similar
+      console.log(`[DONE] (Amber blip — charge session held)`);
     } else {
-      console.error(`[ERROR] Amber API invalid + no usable cache (age=${lastAmberAge.toFixed(0)}min, valid=${cacheValid}) — safety fallback`);
-      const reportedMode = await getReportedMode();
-      const fallbackState = loadState();
-      if (reportedMode === MODE.TIMED || reportedMode === MODE.SELLING ||
-          fallbackState.currentMode === MODE.TIMED || fallbackState.currentMode === MODE.SELLING || fallbackState.currentMode === MODE.BACKUP) {
-        console.warn("[SAFETY] Amber data stale + active Timed/Selling/Backup mode — switching to Self-use");
-        await setModeWithVerify(MODE.SELF_USE, {});
-        fallbackState.currentMode = MODE.SELF_USE;
-        saveState(fallbackState);
-      }
-      console.log(`[DONE]`);
-      return;
+      console.log(`[DONE] (Amber blip — Self-use held, no action needed)`);
     }
+    return;
   }
 
   // Cache this valid Amber response for stale-data tolerance
