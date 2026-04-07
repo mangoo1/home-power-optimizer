@@ -567,14 +567,12 @@ async function setSellingMode(nextDemandMinutes, powerKw = 5) {
 // => chargeKw <= MAX_GRID_TARGET - homeLoad + pvPower
 // Capped at MAX_CHARGE_KW (inverter limit), floor at 0. If below MIN_CHARGE_KW, skip charging.
 const MAX_GRID_TARGET  = parseFloat(process.env.MAIN_BREAKER_KW ?? '7.7'); // kW — read from .env, default 7.7kW (32A@240V)
-const MAX_GRID_IMPORT_KW = MAX_GRID_TARGET - 0.2; // hard guard: refuse Backup if grid would exceed this (breaker - 0.2kW headroom)
-const MAX_CHARGE_KW    = 5.0;  // kW inverter max charge rate
-const MIN_CHARGE_KW    = 1.0;  // kW minimum worth charging (below this, skip)
-const CHARGE_SAFETY_BUFFER = 1.0; // kW safety headroom above house load — protects against hot water heater/appliance surge
-// HIGH_LOAD_ABORT_KW: hard trip-protection ceiling. If homeLoad >= this AND calcChargeKw < MIN_CHARGE_KW,
-// stop charging. Set to MAX_GRID_TARGET - 0.5 so calcChargeKw() (which already accounts for buffer) is the
-// real dynamic controller; this is only a last-resort hard stop.
-const HIGH_LOAD_ABORT_KW      = MAX_GRID_TARGET - 0.5; // kW — hard abort only when truly no headroom left
+const MAX_GRID_IMPORT_KW = MAX_GRID_TARGET - 0.2; // hard guard
+const MAX_CHARGE_KW    = 5.0;   // kW inverter max charge rate
+const MIN_CHARGE_KW    = 0.3;   // kW minimum — allow trickle charge during high-load (hot water) periods
+const CHARGE_SAFETY_BUFFER = 0.5; // kW safety headroom — reduced from 1.0 so we can still trickle-charge during hot water
+// HIGH_LOAD_ABORT_KW: absolute hard stop — only abort charging when grid would genuinely exceed breaker
+const HIGH_LOAD_ABORT_KW      = MAX_GRID_TARGET - 0.3; // kW
 const HIGH_LOAD_THRESHOLD_KW  = 3.5; // kW — above this = big appliance running (e.g. hot water heater)
 const THROTTLE_CHARGE_KW      = 0.5; // kW — trickle charge when high load detected
 
@@ -588,22 +586,24 @@ function calcChargeKw(homeLoad, pvPower) {
 
 async function setChargingMode(homeLoad, pvPower, nextDemandMinutes, throttled = false, planOverrideKw = null) {
   let chargeKw;
+  const netDraw = (homeLoad ?? 0) - (pvPower ?? 0);
   if (planOverrideKw !== null && planOverrideKw > 0) {
-    // Plan pre-calculated the charge power (e.g. derated for hot water heater)
-    chargeKw = Math.min(MAX_CHARGE_KW, planOverrideKw);
-    console.log(`[BUY] chargeKw=${chargeKw.toFixed(2)}kW (from plan, hot-water-aware)`);
+    // Plan pre-calculated the charge power — but still re-check against real-time homeLoad
+    // In case homeLoad is higher than plan assumed (e.g. extra appliance), re-calc dynamically
+    const dynKw = calcChargeKw(homeLoad, pvPower);
+    chargeKw = Math.min(planOverrideKw, dynKw);
+    console.log(`[BUY] chargeKw=${chargeKw.toFixed(2)}kW (plan=${planOverrideKw.toFixed(2)}kW, realtime=${dynKw.toFixed(2)}kW, using min)`);
   } else if (throttled) {
     chargeKw = THROTTLE_CHARGE_KW;
   } else {
     chargeKw = calcChargeKw(homeLoad, pvPower);
   }
-  const minKw = throttled ? 0.1 : MIN_CHARGE_KW;
-  if (chargeKw < minKw) {
-    console.log(`[BUY] chargeKw=${chargeKw.toFixed(2)}kW < ${minKw}kW min — skipping charge`);
+  console.log(`[BUY] homeLoad=${(homeLoad??0).toFixed(2)}kW PV=${(pvPower??0).toFixed(2)}kW netDraw=${netDraw.toFixed(2)}kW → chargeKw=${chargeKw.toFixed(2)}kW (breaker=${MAX_GRID_TARGET}kW buffer=${CHARGE_SAFETY_BUFFER}kW)`);
+  if (chargeKw < MIN_CHARGE_KW) {
+    console.log(`[BUY] chargeKw=${chargeKw.toFixed(2)}kW < ${MIN_CHARGE_KW}kW min — skipping charge (grid headroom exhausted)`);
     return false;
   }
   const tag = throttled ? '[BUY-THROTTLE]' : '[BUY]';
-  console.log(`${tag} chargeKw=${chargeKw.toFixed(2)}kW (homeLoad=${(homeLoad??0).toFixed(2)}kW, PV=${(pvPower??0).toFixed(2)}kW, gridTarget=${MAX_GRID_TARGET}kW${throttled ? ', throttled=true' : ''})`);
   return setTimedChargeDischarge({ mode: 'charge', powerKw: chargeKw, tag, nextDemandMinutes });
 }
 
