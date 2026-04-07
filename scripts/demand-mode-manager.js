@@ -1473,22 +1473,21 @@ async function main() {
     const staleState = loadState();
     const lastAmber = staleState.lastAmberData;
     const lastAmberAge = lastAmber ? (Date.now() - new Date(lastAmber.ts).getTime()) / 60000 : 999;
-    // Validate cached data — reject if price is 0 (bad cache)
+    // Cache is valid only if price data is non-zero
     const cacheValid = lastAmber && lastAmberAge < AMBER_STALE_TOLERANCE_MIN &&
-      (lastAmber.current?.perKwh !== 0 || lastAmber.current?.renewables !== 0 || lastAmber.current?.nemTime != null);
+      lastAmber.current?.perKwh != null && lastAmber.current.perKwh !== 0;
 
     if (cacheValid) {
-      console.warn(`[WARN] Amber API returned invalid data — using cached data from ${lastAmberAge.toFixed(1)} min ago (buy=${lastAmber.current?.perKwh?.toFixed(2)}c)`);
-      // Inject stale data and continue — do NOT switch mode
-      general.push(...(lastAmber.general || []));
-      feedInCh.push(...(lastAmber.feedIn || []));
-      Object.assign(current, lastAmber.current || {});
+      console.warn(`[WARN] Amber API blip — holding current mode, using cached price ${lastAmber.current.perKwh.toFixed(2)}c from ${lastAmberAge.toFixed(1)}min ago`);
+      // Do NOT inject stale data into decision engine — just keep current inverter mode unchanged
+      // This prevents buy=0/spot=0 from triggering false "free charging" or wrong decisions
+      const holdState = loadState();
+      holdState.lastCheck = now.toISOString();
+      saveState(holdState);
+      console.log(`[DONE] (Amber blip — mode held)`);
+      return;
     } else {
-      if (lastAmber && !cacheValid) {
-        console.error(`[ERROR] Cached data also invalid (buy=0) — cannot use cache, safety fallback`);
-      } else {
-        console.error(`[ERROR] Amber API invalid + no usable cache (age=${lastAmberAge.toFixed(0)}min) — safety fallback`);
-      }
+      console.error(`[ERROR] Amber API invalid + no usable cache (age=${lastAmberAge.toFixed(0)}min, valid=${cacheValid}) — safety fallback`);
       const reportedMode = await getReportedMode();
       const fallbackState = loadState();
       if (reportedMode === MODE.TIMED || reportedMode === MODE.SELLING ||
