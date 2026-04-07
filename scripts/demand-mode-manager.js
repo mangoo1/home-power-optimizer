@@ -512,7 +512,12 @@ async function setTimedChargeDischarge({ mode, powerKw, tag, nextDemandMinutes }
   // tag: log prefix e.g. '[SELL]' or '[BUY]'
   if (!ESS_TOKEN) { console.log(`[SKIP] No ESS_TOKEN, would set ${tag} Timed mode`); return false; }
 
-  const { startHHMM, endHHMM, clockStr, yesterday, tomorrow } = timedModeTimeContext(nextDemandMinutes);
+  const { startHHMM, endHHMM: chargeEndHHMM, clockStr, yesterday, tomorrow } = timedModeTimeContext(nextDemandMinutes);
+
+  // Sell mode: end at SELL_STOP_HOUR (21:00) — fixed, not rolling +10min
+  // This ensures a missed cron run won't cut selling short mid-session
+  const sellEndHHMM = String(SELL_STOP_HOUR).padStart(2,'0') + '00';
+  const endHHMM = mode === 'sell' ? sellEndHHMM : chargeEndHHMM;
 
   console.log(`${tag} Setting Timed mode (${mode}): ${startHHMM}–${endHHMM} AEST, clock=${clockStr}, dates ${yesterday}–${tomorrow}, power=${powerKw}kW`);
 
@@ -614,10 +619,14 @@ async function setChargingMode(homeLoad, pvPower, nextDemandMinutes, throttled =
 
 // Update rolling end time window for active Selling mode (called each cron run while selling).
 async function updateSellingEndTime() {
-  const now = new Date();
+  // Set sell end to SELL_STOP_HOUR (21:00) instead of rolling +10min.
+  // Fixed end time is more robust — a missed cron run won't cut selling short.
+  const now  = new Date();
   const aest = new Date(now.getTime() + getSydneyOffsetMs(now));
-  const end = new Date(aest.getTime() + 10 * 60 * 1000);
-  const endHHMM = String(end.getUTCHours()).padStart(2,'0') + String(end.getUTCMinutes()).padStart(2,'0');
+  // If already past SELL_STOP_HOUR, extend to end of day (23:59)
+  const stopHour = aest.getUTCHours() < SELL_STOP_HOUR ? SELL_STOP_HOUR : 23;
+  const stopMin  = aest.getUTCHours() < SELL_STOP_HOUR ? 0 : 59;
+  const endHHMM  = String(stopHour).padStart(2,'0') + String(stopMin).padStart(2,'0');
   const ok = await setParam('0xC01A', endHHMM);
   console.log(`[SELL] Rolling end time -> ${endHHMM} ${ok ? 'OK' : 'FAILED'}`);
   return ok;
