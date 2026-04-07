@@ -589,9 +589,12 @@ function calcChargeKw(homeLoad, pvPower) {
 async function setChargingMode(homeLoad, pvPower, nextDemandMinutes, throttled = false, planOverrideKw = null) {
   let chargeKw;
   const netDraw = (homeLoad ?? 0) - (pvPower ?? 0);
-  if (planOverrideKw !== null && planOverrideKw > 0) {
-    // Plan pre-calculated the charge power — but still re-check against real-time homeLoad
-    // In case homeLoad is higher than plan assumed (e.g. extra appliance), re-calc dynamically
+
+  if (planOverrideKw === 0) {
+    // Grid-standby: chargeKw=0, discharge=0 — grid supplies home, battery idles
+    console.log(`[BUY] Grid-standby mode: chargeKw=0, discharge=0 (homeLoad=${(homeLoad??0).toFixed(2)}kW PV=${(pvPower??0).toFixed(2)}kW)`);
+    return setTimedChargeDischarge({ mode: 'charge', powerKw: 0, tag: '[STANDBY]', nextDemandMinutes });
+  } else if (planOverrideKw !== null && planOverrideKw > 0) {
     const dynKw = calcChargeKw(homeLoad, pvPower);
     chargeKw = Math.min(planOverrideKw, dynKw);
     console.log(`[BUY] chargeKw=${chargeKw.toFixed(2)}kW (plan=${planOverrideKw.toFixed(2)}kW, realtime=${dynKw.toFixed(2)}kW, using min)`);
@@ -1044,10 +1047,14 @@ function decide(ess, pvPower, amber, state, dailySummary) {
     return { targetMode, reason, alert };
   }
   if (!currentDemand && spotPrice <= CHARGE_SPOT_MAX && soc >= SOC_MAX_CHARGE) {
-    // Battery at target — exit Backup
-    if (state.currentMode === MODE.BACKUP) {
-      targetMode = MODE.SELF_USE;
-      reason = `SOC reached ${soc}% (>=${SOC_MAX_CHARGE}%) — stop charging`;
+    // SOC full but price is free/negative — stay in Timed with chargeKw=0 to prevent battery discharge
+    // Grid supplies home load, battery idles. Don't waste battery when grid is free.
+    if (state.currentMode !== MODE.BACKUP) {
+      targetMode = MODE.BACKUP;
+      reason = `spot=${spotPrice.toFixed(2)}c (<=0), SOC=${soc}% full — grid-standby (chargeKw=0, block discharge)`;
+      alert = { ...(alert||{}), planChargeKwOverride: 0 };
+    } else {
+      reason = `spot<=0, SOC full — holding grid-standby`;
     }
     return { targetMode, reason, alert };
   }
@@ -1216,13 +1223,21 @@ function decide(ess, pvPower, amber, state, dailySummary) {
     state.chargeEntryCount = 0;
   }
 
-  // Exit charging: SOC full or price too high (plan windows no longer used for execution)
+  // Exit charging: SOC full or price too high
   if (state.currentMode === MODE.BACKUP && !emergencyCharge) {
     const socFull = soc >= CHEAP_CHARGE_SOC;
 
+    if (socFull && currentPrice <= effectiveBuyMax) {
+      // SOC full but price still cheap — grid-standby: keep Timed mode, chargeKw=0, block discharge
+      // Grid supplies home load, battery idles. Preserves battery for evening sell.
+      reason = `SOC ${soc}% full, price=${currentPrice.toFixed(1)}c cheap — grid-standby (block discharge)`;
+      alert = { ...(alert||{}), planChargeKwOverride: 0 };
+      console.log(`[INFO] Grid-standby: SOC full + cheap price → chargeKw=0, blocking battery discharge`);
+      return { targetMode: MODE.BACKUP, reason, alert };
+    }
     if (socFull) {
       targetMode = MODE.SELF_USE;
-      reason = `SOC target ${CHEAP_CHARGE_SOC}% reached (SOC ${soc}%) — stop charging`;
+      reason = `SOC target ${CHEAP_CHARGE_SOC}% reached (SOC ${soc}%), price=${currentPrice.toFixed(1)}c not cheap — Self-use`;
       state.chargeExitCount = 0;
       return { targetMode, reason, alert };
     }
@@ -1560,7 +1575,7 @@ async function main() {
 
   if (targetMode !== null && targetMode !== state.currentMode) {
     console.log(`[ACTION] ${MODE_LABEL[state.currentMode] ?? "unknown"} -> ${MODE_LABEL[targetMode]}: ${reason}`);
-    const ok = await setModeWithVerify(targetMode, { homeLoad: ess.homeLoad, pvPower, nextDemandMinutes: amber.nextDemandMinutes, sellPowerKw: alert?.sellPowerKw, throttled: chargeThrottled, planChargeKw: planSlotChargeKw });
+    const ok = await setModeWithVerify(targetMode, { homeLoad: ess.homeLoad, pvPower, nextDemandMinutes: amber.nextDemandMinutes, sellPowerKw: alert?.sellPowerKw, throttled: chargeThrottled, planChargeKw: alert?.planChargeKwOverride ?? planSlotChargeKw });
     if (ok) {
       state.currentMode = targetMode;
       state.lastSwitchTime = now.toISOString();
