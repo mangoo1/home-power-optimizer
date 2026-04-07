@@ -23,7 +23,7 @@ const client = createClient({ url: TURSO_URL, authToken: TURSO_TOKEN });
 
 async function main() {
   const db = new Database(DB_PATH, { readonly: true });
-  const since = new Date(Date.now() - 2 * 24 * 3600 * 1000).toISOString();
+  const since = new Date(Date.now() - 2 * 3600 * 1000).toISOString(); // last 2 hours (cron runs every 5min, keep overlap)
 
   const rows = db.prepare(`
     SELECT ts, soc, batt_power, home_load, pv_power, grid_power,
