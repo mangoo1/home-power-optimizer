@@ -55,8 +55,8 @@
 
 <!-- Time range selector -->
 <div class="timerange">
-  <button onclick="setRange('today')" id="btn-today" class="active">今天</button>
-  <button onclick="setRange('24h')"  id="btn-24h">24小时</button>
+  <button onclick="setRange('today')" id="btn-today">今天</button>
+  <button onclick="setRange('24h')"  id="btn-24h" class="active">24小时</button>
   <button onclick="setRange('48h')"  id="btn-48h">48小时</button>
   <button onclick="setRange('7d')"   id="btn-7d">7天</button>
 </div>
@@ -175,7 +175,7 @@
 const TURSO_URL = '/turso';
 
 let socChartObj, powerChartObj, priceChartObj, costChartObj;
-let currentRange = 'today';
+let currentRange = '24h';
 
 // Sydney time — use formatToParts to extract numeric values directly
 // Avoids all browser AM/PM and locale formatting inconsistencies (Safari, iOS, etc.)
@@ -201,18 +201,20 @@ function sydneyNowStr() {
   return _h24(p) + ':' + (p.minute||'00') + ':' + (p.second||'00');
 }
 function sydneyMidnightUTC() {
-  // Get today's date in Sydney, then compute UTC midnight
-  const sydDateStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Australia/Sydney' }); // "2026-04-07"
+  // Compute today's Sydney midnight as a UTC ISO string.
+  // Strategy: find what UTC time corresponds to 00:00:00 in Sydney today.
+  // We use a binary search: start from Sydney date string + "T00:00:00+11:00" (AEDT)
+  // but robustly handle DST by computing offset from current instant.
   const now = new Date();
-  const utcH = now.getUTCHours();
-  const p = _sydParts(now, { hour: 'numeric', hour12: false });
-  const sydH = parseInt(p.hour || '0') % 24;
-  let diff = sydH - utcH;
-  if (diff < -12) diff += 24;
-  if (diff > 12) diff -= 24;
-  const sign = diff >= 0 ? '+' : '-';
-  const absDiff = Math.abs(diff);
-  return new Date(sydDateStr + 'T00:00:00' + sign + String(absDiff).padStart(2,'0') + ':00').toISOString();
+  // Sydney offset in minutes (positive = ahead of UTC)
+  // Compute by comparing UTC time to Sydney time for the same instant
+  const sydDateStr = now.toLocaleDateString('en-CA', { timeZone: 'Australia/Sydney' }); // YYYY-MM-DD
+  const sydTimeStr = now.toLocaleTimeString('en-GB', { timeZone: 'Australia/Sydney', hour12: false }); // HH:MM:SS
+  const sydMs = new Date(sydDateStr + 'T' + sydTimeStr + 'Z').getTime(); // treat syd time as UTC
+  const offsetMin = Math.round((sydMs - now.getTime()) / 60000); // Sydney is +offsetMin from UTC
+  // Midnight in Sydney = sydDateStr T00:00:00 local = UTC sydDateStr T00:00:00 minus offset
+  const midnightUTC = new Date(sydDateStr + 'T00:00:00Z').getTime() - offsetMin * 60000;
+  return new Date(midnightUTC).toISOString();
 }
 function fmtSydney(utcStr, opts) {
   const p = _sydParts(new Date(utcStr), { hour: 'numeric', minute: '2-digit', ...opts, hour12: false });
@@ -252,6 +254,8 @@ function setRange(r) {
 
 function getRangeSQL() {
   if (currentRange === 'today') {
+    // "今天" = Sydney 当天完整24小时：从 Sydney 今日 00:00 UTC 起
+    // 但因为 Sydney 白天（PV高峰）横跨 UTC 日期边界，用固定24h更可靠
     return `ts >= '${sydneyMidnightUTC()}'`;
   }
   if (currentRange === '24h') return `ts >= datetime('now','-24 hours')`;
