@@ -154,25 +154,51 @@ const ESS_HEADERS = {
   Origin: "https://euapp.ess-link.com", Referer: "https://euapp.ess-link.com/",
 };
 
-// ── Timezone helper — always use Australia/Sydney (handles DST automatically) ──
-function getSydneyHour() {
-  return parseInt(new Date().toLocaleString('en-AU', { timeZone: 'Australia/Sydney', hour: 'numeric', hour12: false }), 10);
-}
-function getSydneyDate(d = new Date()) {
-  // Returns a Date object shifted to Sydney local time (for getUTC* calls to give Sydney values)
-  const sydStr = d.toLocaleString('en-CA', { timeZone: 'Australia/Sydney',
+// ── Sydney time helpers ───────────────────────────────────────────────────────
+// Always use Intl/toLocaleString — no hardcoded offsets, DST-safe.
+function sydneyNow() {
+  // Returns a plain object with Sydney local time fields
+  const s = new Date().toLocaleString('en-AU', {
+    timeZone: 'Australia/Sydney', hour12: false,
     year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
-  return new Date(sydStr.replace(',', ''));
+    hour: '2-digit', minute: '2-digit', second: '2-digit'
+  });
+  // "07/04/2026, 19:39:45" → parse fields
+  const [datePart, timePart] = s.split(', ');
+  const [dd, mo, yyyy] = datePart.split('/');
+  const [hh, mm, ss] = timePart.replace('24:', '00:').split(':');
+  return {
+    year: parseInt(yyyy), month: parseInt(mo), day: parseInt(dd),
+    hour: parseInt(hh), minute: parseInt(mm), second: parseInt(ss),
+    hhmm: hh.padStart(2,'0') + mm.padStart(2,'0'),       // "1939"
+    hhmmss: hh.padStart(2,'0')+':'+mm.padStart(2,'0')+':'+ss.padStart(2,'0'), // "19:39:45"
+    dateStr: `${yyyy}-${mo.padStart(2,'0')}-${dd.padStart(2,'0')}`,  // "2026-04-07"
+  };
 }
+
+function getSydneyHour() {
+  return sydneyNow().hour;
+}
+
+function getSydneyDate(d = new Date()) {
+  const s = d.toLocaleString('en-AU', {
+    timeZone: 'Australia/Sydney', hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit'
+  });
+  const [datePart, timePart] = s.split(', ');
+  const [dd, mo, yyyy] = datePart.split('/');
+  const [hh, mm, ss] = timePart.replace('24:', '00:').split(':');
+  return new Date(`${yyyy}-${mo}-${dd}T${hh}:${mm}:${ss}`);
+}
+
 function getSydneyOffsetMs(d = new Date()) {
-  // Returns Sydney UTC offset in ms (e.g. +10h = 36000000, +11h = 39600000)
-  const utcMs = d.getTime();
-  const sydHour = parseInt(d.toLocaleString('en-AU', { timeZone: 'Australia/Sydney', hour: 'numeric', hour12: false }), 10);
-  const utcHour = d.getUTCHours();
-  let diff = sydHour - utcHour;
+  // Keep for backward compat — but prefer sydneyNow() for new code
+  const utcH = d.getUTCHours();
+  const sydH = parseInt(d.toLocaleString('en-AU', { timeZone: 'Australia/Sydney', hour: 'numeric', hour12: false }), 10);
+  let diff = sydH - utcH;
   if (diff < -12) diff += 24;
-  if (diff > 12) diff -= 24;
+  if (diff > 12)  diff -= 24;
   return diff * 3600 * 1000;
 }
 
@@ -465,34 +491,46 @@ async function setMode(mode) {
 // Using a fixed large window instead of rolling 10-min prevents charging from
 // dropping out between cron runs.
 function timedModeTimeContext(nextDemandMinutes) {
-  const now = new Date();
-  const aest = new Date(now.getTime() + getSydneyOffsetMs(now)); // DST-aware Sydney time
-  const fmt2 = n => String(n).padStart(2,'0');
+  const syd  = sydneyNow();
+  const fmt2 = n => String(n).padStart(2, '0');
 
   // start = now - 1 min (window already active)
-  const startDate = new Date(aest.getTime() - 1 * 60 * 1000);
-  const startHHMM = fmt2(startDate.getUTCHours()) + fmt2(startDate.getUTCMinutes());
+  const startTotalMins = syd.hour * 60 + syd.minute - 1;
+  const startH = Math.floor(((startTotalMins % 1440) + 1440) % 1440 / 60);
+  const startM = ((startTotalMins % 60) + 60) % 60;
+  const startHHMM = fmt2(startH) + fmt2(startM);
 
-  // end = demand window start - 5 min buffer, or 21:00 if no DW
-  let endDate;
+  // end = demand window start - 5 min, or 18:00 for charge / 21:00 for sell
+  // Caller passes mode via sellMode flag; here we default to charge end (18:00)
+  // Sell end is handled separately in setTimedChargeDischarge
+  let endHHMM;
   if (nextDemandMinutes != null && nextDemandMinutes > 15) {
-    // Convert nextDemandMinutes (from now in UTC) to AEST end time
-    const endUtc = new Date(now.getTime() + (nextDemandMinutes - 5) * 60 * 1000);
-    endDate = new Date(endUtc.getTime() + getSydneyOffsetMs(endUtc));
+    const nowMs  = Date.now();
+    const endMs  = nowMs + (nextDemandMinutes - 5) * 60 * 1000;
+    const endSyd = new Date(endMs).toLocaleString('en-AU', {
+      timeZone: 'Australia/Sydney', hour12: false, hour: '2-digit', minute: '2-digit'
+    }).replace('24:', '00:');
+    const [eh, em] = endSyd.split(':');
+    endHHMM = fmt2(parseInt(eh)) + fmt2(parseInt(em));
   } else {
-    // No demand window today — charge until 18:00 AEST (safe buffer before any potential DW)
-    endDate = new Date(aest);
-    endDate.setUTCHours(18, 0, 0, 0);
-    if (endDate <= aest) endDate.setUTCHours(23, 59, 0, 0); // past 18:00 → extend to end of day
+    // No demand window — charge until 18:00, sell until 21:00 (set by caller)
+    endHHMM = '1800';
+    const nowMins = syd.hour * 60 + syd.minute;
+    if (nowMins >= 18 * 60) endHHMM = '2359';
   }
-  const endHHMM = fmt2(endDate.getUTCHours()) + fmt2(endDate.getUTCMinutes());
 
-  const clockStr = aest.toISOString().replace('T',' ').substring(0,19);
-  const fmtDate = d => d.toISOString().substring(0,10);
-  const yesterday = fmtDate(new Date(aest.getTime() - 86400000));
-  const tomorrow  = fmtDate(new Date(aest.getTime() + 86400000));
+  // Clock string for inverter sync
+  const clockStr = `${syd.dateStr} ${syd.hhmmss}`;
+  const yesterday = (() => {
+    const d = new Date(); d.setDate(d.getDate() - 1);
+    return d.toISOString().substring(0, 10);
+  })();
+  const tomorrow = (() => {
+    const d = new Date(); d.setDate(d.getDate() + 1);
+    return d.toISOString().substring(0, 10);
+  })();
 
-  return { aest, fmt2, startHHMM, endHHMM, clockStr, yesterday, tomorrow };
+  return { startHHMM, endHHMM, clockStr, yesterday, tomorrow };
 }
 
 // Set Timed/Selling mode (discharge to grid).
@@ -619,13 +657,9 @@ async function setChargingMode(homeLoad, pvPower, nextDemandMinutes, throttled =
 
 // Update rolling end time window for active Selling mode (called each cron run while selling).
 async function updateSellingEndTime() {
-  // Set sell end to SELL_STOP_HOUR (21:00) instead of rolling +10min.
-  // Fixed end time is more robust — a missed cron run won't cut selling short.
-  const now  = new Date();
-  const aest = new Date(now.getTime() + getSydneyOffsetMs(now));
-  // If already past SELL_STOP_HOUR, extend to end of day (23:59)
-  const stopHour = aest.getUTCHours() < SELL_STOP_HOUR ? SELL_STOP_HOUR : 23;
-  const stopMin  = aest.getUTCHours() < SELL_STOP_HOUR ? 0 : 59;
+  const syd = sydneyNow();
+  const stopHour = syd.hour < SELL_STOP_HOUR ? SELL_STOP_HOUR : 23;
+  const stopMin  = syd.hour < SELL_STOP_HOUR ? 0 : 59;
   const endHHMM  = String(stopHour).padStart(2,'0') + String(stopMin).padStart(2,'0');
   const ok = await setParam('0xC01A', endHHMM);
   console.log(`[SELL] Rolling end time -> ${endHHMM} ${ok ? 'OK' : 'FAILED'}`);
