@@ -1567,7 +1567,7 @@ async function main() {
   })();
   const { targetMode, reason, alert, chargeThrottled, planSlotChargeKw } = decide(ess, pvPower, amber, state, todaySummary);
 
-  if (alert) console.log(`[ALERT] ${alert}`);
+  if (alert) console.log(`[ALERT] ${typeof alert === 'object' ? JSON.stringify(alert) : alert}`);
 
   let modeChanged = false;
   let modeVerifyOk = null;
