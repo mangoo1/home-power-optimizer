@@ -1367,18 +1367,42 @@ function decide(ess, pvPower, amber, state, dailySummary) {
     ? SOC_MIN_SELL_MORNING    // 00:00–13:59 → 12%
     : SOC_MIN_SELL_AFTERNOON; // 14:00–23:59 → 35%
 
-  if (afterSellStopHour) {
-    if (state.currentMode === MODE.SELLING) {
+  // ── Priority 5a: Already selling — hold unless exit condition met ─────────
+  // If we're currently selling, don't re-evaluate entry conditions each cron run.
+  // Only stop if: past stop hour / SOC too low / feedIn collapsed / emergency charge.
+  // This prevents Amber price blips or plan-slot changes from interrupting a sell session.
+  if (state.currentMode === MODE.SELLING) {
+    if (afterSellStopHour) {
       targetMode = MODE.SELF_USE;
-      reason = `stop selling — past ${SELL_STOP_HOUR}:00 Sydney time (overnight battery reserve)`;
+      reason = `stop selling — past ${SELL_STOP_HOUR}:00 (overnight reserve)`;
       return { targetMode, reason, alert };
     }
+    if (emergencyCharge) {
+      targetMode = MODE.BACKUP;
+      reason = `EMERGENCY stop selling — deficit ${projectedDeficit.toFixed(1)}kWh`;
+      return { targetMode, reason, alert };
+    }
+    if (soc <= socMinSell) {
+      targetMode = MODE.SELF_USE;
+      reason = `stop selling — SOC ${soc}% <= floor ${socMinSell}%`;
+      return { targetMode, reason, alert };
+    }
+    if (feedInPrice < effectiveSellMin) {
+      targetMode = MODE.SELF_USE;
+      reason = `stop selling — feedIn=${feedInPrice.toFixed(1)}c < ${effectiveSellMin.toFixed(1)}c`;
+      return { targetMode, reason, alert };
+    }
+    // All good — keep selling, just roll the window
+    const sellPower = INVERTER_MAX_DISCHARGE;
+    reason = `holding sell — feedIn=${feedInPrice.toFixed(1)}c SOC=${soc}% (floor=${socMinSell}%)`;
+    alert = { ...alert, sellPowerKw: sellPower };
+    return { targetMode: MODE.SELLING, reason, alert };
+  }
+
+  if (afterSellStopHour) {
     // Don't enter selling after stop hour
   } else if (emergencyCharge && state.currentMode === MODE.SELLING) {
-    // Emergency: battery will run out overnight — stop selling immediately, switch to charge
-    targetMode = MODE.BACKUP;
-    reason = `EMERGENCY stop selling — projected deficit ${projectedDeficit.toFixed(1)}kWh, switching to charge at ${currentPrice.toFixed(1)}c`;
-    return { targetMode, reason, alert };
+    // (handled above)
   } else if (feedInPrice >= effectiveSellMin && soc > socMinSell && !emergencyCharge) {
     // Max sell power = inverter discharge cap (independent of homeLoad — grid handles both simultaneously)
     const maxSellPower = INVERTER_MAX_DISCHARGE;
