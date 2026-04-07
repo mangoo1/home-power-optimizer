@@ -1245,10 +1245,12 @@ function decide(ess, pvPower, amber, state, dailySummary) {
       return { targetMode: MODE.BACKUP, reason, alert };
     }
     if (socFull) {
-      targetMode = MODE.SELF_USE;
-      reason = `SOC target ${CHEAP_CHARGE_SOC}% reached (SOC ${soc}%), price=${currentPrice.toFixed(1)}c — Self-use`;
+      // Don't return here — fall through to Priority 5 sell check
+      // If feedIn is high enough, selling is better than Self-use even when SOC is full
       state.chargeExitCount = 0;
-      return { targetMode, reason, alert };
+      targetMode = MODE.SELF_USE;
+      reason = `SOC target ${CHEAP_CHARGE_SOC}% reached (SOC ${soc}%), price=${currentPrice.toFixed(1)}c — checking sell...`;
+      // (sell logic below may override this)
     }
     // Exit when price rises above threshold — 3-interval buffer to avoid thrashing
     if (currentPrice > dynamicBuyMax) {
@@ -1462,16 +1464,22 @@ async function main() {
     const staleState = loadState();
     const lastAmber = staleState.lastAmberData;
     const lastAmberAge = lastAmber ? (Date.now() - new Date(lastAmber.ts).getTime()) / 60000 : 999;
+    // Validate cached data — reject if price is 0 (bad cache)
+    const cacheValid = lastAmber && lastAmberAge < AMBER_STALE_TOLERANCE_MIN &&
+      (lastAmber.current?.perKwh !== 0 || lastAmber.current?.renewables !== 0 || lastAmber.current?.nemTime != null);
 
-    if (lastAmber && lastAmberAge < AMBER_STALE_TOLERANCE_MIN) {
-      console.warn(`[WARN] Amber API returned invalid data — using cached data from ${lastAmberAge.toFixed(1)} min ago (tolerance=${AMBER_STALE_TOLERANCE_MIN}min)`);
+    if (cacheValid) {
+      console.warn(`[WARN] Amber API returned invalid data — using cached data from ${lastAmberAge.toFixed(1)} min ago (buy=${lastAmber.current?.perKwh?.toFixed(2)}c)`);
       // Inject stale data and continue — do NOT switch mode
       general.push(...(lastAmber.general || []));
       feedInCh.push(...(lastAmber.feedIn || []));
-      // Re-parse with stale data
       Object.assign(current, lastAmber.current || {});
     } else {
-      console.error(`[ERROR] Amber API invalid + no usable cache (age=${lastAmberAge.toFixed(0)}min) — safety fallback`);
+      if (lastAmber && !cacheValid) {
+        console.error(`[ERROR] Cached data also invalid (buy=0) — cannot use cache, safety fallback`);
+      } else {
+        console.error(`[ERROR] Amber API invalid + no usable cache (age=${lastAmberAge.toFixed(0)}min) — safety fallback`);
+      }
       const reportedMode = await getReportedMode();
       const fallbackState = loadState();
       if (reportedMode === MODE.TIMED || reportedMode === MODE.SELLING ||
