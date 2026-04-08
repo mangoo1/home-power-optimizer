@@ -1560,7 +1560,7 @@ async function main() {
 
     // Roll sell/charge window so inverter doesn't time out
     if (blipState.currentMode === MODE.SELLING) {
-      await updateSellingEndTime(state);
+      await updateSellingEndTime(blipState);
       console.log(`[DONE] (Amber blip — sell session held)`);
     } else if (blipState.currentMode === MODE.BACKUP) {
       // Re-apply charge window to prevent inverter reset
