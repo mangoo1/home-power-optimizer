@@ -656,13 +656,27 @@ async function setChargingMode(homeLoad, pvPower, nextDemandMinutes, throttled =
 }
 
 // Update rolling end time window for active Selling mode (called each cron run while selling).
-async function updateSellingEndTime() {
+// Skips the API call if the target end time hasn't changed since last successful send.
+async function updateSellingEndTime(state) {
   const syd = sydneyNow();
   const stopHour = syd.hour < SELL_STOP_HOUR ? SELL_STOP_HOUR : 23;
   const stopMin  = syd.hour < SELL_STOP_HOUR ? 0 : 59;
   const endHHMM  = String(stopHour).padStart(2,'0') + String(stopMin).padStart(2,'0');
-  const ok = await setParam('0xC01A', endHHMM);
+
+  // Skip if already successfully sent this exact value
+  if (state.lastSellEndSent === endHHMM) {
+    console.log(`[SELL] End time ${endHHMM} already set, skipping`);
+    return true;
+  }
+
+  let ok = await setParam('0xC01A', endHHMM);
+  if (!ok) {
+    // Retry once after short delay
+    await new Promise(r => setTimeout(r, 1000));
+    ok = await setParam('0xC01A', endHHMM);
+  }
   console.log(`[SELL] Rolling end time -> ${endHHMM} ${ok ? 'OK' : 'FAILED'}`);
+  if (ok) state.lastSellEndSent = endHHMM;
   return ok;
 }
 
@@ -1546,7 +1560,7 @@ async function main() {
 
     // Roll sell/charge window so inverter doesn't time out
     if (blipState.currentMode === MODE.SELLING) {
-      await updateSellingEndTime();
+      await updateSellingEndTime(state);
       console.log(`[DONE] (Amber blip — sell session held)`);
     } else if (blipState.currentMode === MODE.BACKUP) {
       // Re-apply charge window to prevent inverter reset
@@ -1630,7 +1644,7 @@ async function main() {
       console.log(`[INFO] Force mode active: ${MODE_LABEL[state.forceMode] ?? state.forceMode} until ${state.forceModeUntil} (${minsLeft} min remaining)`);
       // Roll sell end time if currently selling
       if (state.forceMode === MODE.SELLING) {
-        await updateSellingEndTime();
+        await updateSellingEndTime(state);
       }
       state.lastCheck = now.toISOString();
       saveState(state);
@@ -1673,6 +1687,7 @@ async function main() {
         await createSellingCron();
       } else {
         await deleteSellingCron();
+        state.lastSellEndSent = null; // reset so next sell session re-sends end time
       }
 
       // Mode verify: after a mode change, re-read reportedMode after 8s and retry if mismatch
@@ -1704,7 +1719,7 @@ async function main() {
   } else {
     // Already in Selling mode: roll the end time window forward (+10 min)
     if (state.currentMode === MODE.SELLING) {
-      await updateSellingEndTime();
+      await updateSellingEndTime(state);
     }
     // Already in Backup (charging) mode: roll the charge end time window forward (+10 min)
     if (state.currentMode === MODE.BACKUP) {
