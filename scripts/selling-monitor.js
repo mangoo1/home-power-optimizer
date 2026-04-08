@@ -102,16 +102,90 @@ function findVal(items, index) {
   return item?.value ?? null;
 }
 
-async function setMode(mode) {
-  if (!ESS_TOKEN) { console.log(`[SKIP] No ESS_TOKEN`); return false; }
+async function setParam(index, data) {
+  if (!ESS_TOKEN) return false;
   try {
     const r = await httpsPost(
       "https://eu.ess-link.com/api/app/deviceInfo/setDeviceParam",
-      { data: mode, macHex: MAC_HEX, index: "0x300C" },
+      { data, macHex: MAC_HEX, index },
       { Authorization: ESS_TOKEN, ...ESS_HEADERS }
     );
     return r.code === 200;
   } catch { return false; }
+}
+
+async function setWeekParam(index, data) {
+  if (!ESS_TOKEN) return false;
+  try {
+    const r = await httpsPost(
+      "https://eu.ess-link.com/api/app/deviceInfo/setDeviceWeekParam",
+      { data, macHex: MAC_HEX, index },
+      { Authorization: ESS_TOKEN, ...ESS_HEADERS }
+    );
+    return r.code === 200;
+  } catch { return false; }
+}
+
+async function setDateParam(index, data) {
+  if (!ESS_TOKEN) return false;
+  try {
+    const r = await httpsPost(
+      "https://eu.ess-link.com/api/app/deviceInfo/setDeviceDateOrTimeParam",
+      { data, macHex: MAC_HEX, index },
+      { Authorization: ESS_TOKEN, ...ESS_HEADERS }
+    );
+    return r.code === 200;
+  } catch { return false; }
+}
+
+async function setMode(mode) {
+  return setParam("0x300C", mode);
+}
+
+// Full Timed/Selling setup — sets mode=1 (Timed) + sell window + discharge power
+// This mirrors demand-mode-manager's setSellingMode to ensure proper Timed mode config
+const SELL_STOP_HOUR = 22; // sell until 22:00 by default
+async function setSellingModeFull(powerKw = 5) {
+  if (!ESS_TOKEN) { console.log(`[SKIP] No ESS_TOKEN`); return false; }
+  const now = new Date();
+  // Sydney time components
+  const sydStr = now.toLocaleString('en-AU', { timeZone: 'Australia/Sydney', hour: '2-digit', minute: '2-digit', hour12: false });
+  const [hRaw, mRaw] = sydStr.replace('24:', '00:').split(':').map(Number);
+  const startMins = hRaw * 60 + mRaw - 1;
+  const sh = String(Math.floor(((startMins + 1440) % 1440) / 60)).padStart(2, '0');
+  const sm = String(((startMins % 60) + 60) % 60).padStart(2, '0');
+  const startHHMM = sh + sm;
+  const endHHMM   = String(SELL_STOP_HOUR).padStart(2, '0') + '00';
+
+  // Date strings for start/end date params (yesterday–tomorrow window)
+  const sydDate    = now.toLocaleDateString('en-CA', { timeZone: 'Australia/Sydney' });
+  const yesterday  = new Date(new Date(sydDate).getTime() - 86400000).toISOString().substring(0, 10);
+  const tomorrow   = new Date(new Date(sydDate).getTime() + 86400000).toISOString().substring(0, 10);
+
+  const clampedPower = Math.min(5, Math.max(0, powerKw));
+  console.log(`[SELL] Full Timed/Selling setup: ${startHHMM}–${endHHMM}, discharge=${clampedPower}kW`);
+
+  const steps = [
+    { label: 'mode=Timed(1)',          fn: () => setParam('0x300C',  1) },
+    { label: `sellStart=${startHHMM}`, fn: () => setParam('0xC018', startHHMM) },
+    { label: `sellEnd=${endHHMM}`,     fn: () => setParam('0xC01A', endHHMM) },
+    { label: `discharge=${clampedPower}kW`, fn: () => setParam('0xC0BC', clampedPower) },
+    { label: 'charge=0kW',             fn: () => setParam('0xC0BA', 0) },
+    { label: 'chargeStart=0000',       fn: () => setParam('0xC014', '0000') },
+    { label: 'chargeEnd=0000',         fn: () => setParam('0xC016', '0000') },
+    { label: 'otherMode=0',            fn: () => setParam('0x314E', 0) },
+    { label: 'weekdays=all',           fn: () => setWeekParam('0xC0B4', [1,2,3,4,5,6,0]) },
+    { label: `startDate=${yesterday}`, fn: () => setDateParam('0xC0B6', yesterday) },
+    { label: `endDate=${tomorrow}`,    fn: () => setDateParam('0xC0B8', tomorrow) },
+  ];
+
+  for (const step of steps) {
+    const ok = await step.fn();
+    console.log(`[SELL]   ${step.label} -> ${ok ? 'OK' : 'FAILED'}`);
+    if (!ok && step.label === 'mode=Timed(1)') return false; // critical step
+    await new Promise(r => setTimeout(r, 300));
+  }
+  return true;
 }
 
 function loadState() {
@@ -246,11 +320,11 @@ async function main() {
 
     if (canSell) {
       console.log(`[ENTER SELL] feedIn:${feedInPrice.toFixed(1)}c  SOC:${soc}%  headroom:${maxSellPower.toFixed(2)}kW — switching to Selling`);
-      const ok = await setMode(MODE.SELLING);
+      const ok = await setSellingModeFull(Math.min(maxSellPower, 5));
       if (ok) {
         state.mode = MODE.SELLING;
         state.sellingSince = now.toISOString();
-        console.log(`[ACTION] Switched to Selling mode (max sell ${maxSellPower.toFixed(2)}kW)`);
+        console.log(`[ACTION] Switched to Timed/Selling mode (max sell ${maxSellPower.toFixed(2)}kW)`);
       }
     } else {
       const reasons = [];
