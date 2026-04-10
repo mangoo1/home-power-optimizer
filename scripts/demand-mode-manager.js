@@ -1223,7 +1223,30 @@ function decide(ess, pvPower, amber, state, dailySummary) {
     console.log(`[CHARGE] ⚠️ Emergency: deficit=${projectedDeficit.toFixed(1)}kWh (consume=${estimatedConsumption.toFixed(1)}kWh + reserve=${reserveKwh.toFixed(1)}kWh - have=${socKwh.toFixed(1)}kWh) — charging at ${currentPrice.toFixed(1)}c`);
   }
 
-  const cheapEntryOk = gridHeadroomOk && !currentDemand && soc < CHEAP_CHARGE_SOC && state.currentMode !== MODE.BACKUP;
+  // ── PV-only path: strong solar surplus → no need to buy grid power ───────
+  // When PV is generating more than homeLoad by a meaningful margin (>1kW headroom),
+  // and SOC is already reasonable (>= 65%), switch to Self-use and let solar do the work.
+  // No point paying for grid kWh when the sun is charging for free.
+  // Exception: keep buying if price is ultra-cheap (<=7c) AND PV surplus is small (<1kW) —
+  //   in that case grid top-up is still worthwhile.
+  const pvSurplusKw = Math.max(0, pvPowerVal2 - homeLoadVal2);
+  const PV_ONLY_SOC_MIN   = 65;  // % — don't switch to PV-only if SOC is still low
+  const PV_ONLY_SURPLUS_KW = 1.0; // kW — require at least this much PV headroom above homeLoad
+  const pvOnlyCondition = pvSurplusKw >= PV_ONLY_SURPLUS_KW
+    && soc >= PV_ONLY_SOC_MIN
+    && !currentDemand
+    && !(currentPrice <= ULTRACHEAP_PRICE_C && pvSurplusKw < PV_ONLY_SURPLUS_KW); // allow ultra-cheap if big surplus
+  if (pvOnlyCondition && state.currentMode === MODE.BACKUP) {
+    targetMode = MODE.SELF_USE;
+    reason = `PV surplus ${pvSurplusKw.toFixed(1)}kW (PV=${pvPowerVal2.toFixed(1)}kW load=${homeLoadVal2.toFixed(1)}kW), SOC=${soc}% — switching to Self-use, no grid charge needed`;
+    state.chargeEntryCount = 0;
+    return { targetMode, reason, alert };
+  }
+  if (pvOnlyCondition && state.currentMode !== MODE.BACKUP) {
+    console.log(`[PV-ONLY] PV surplus ${pvSurplusKw.toFixed(1)}kW, SOC=${soc}% — staying Self-use, skipping grid charge`);
+  }
+
+  const cheapEntryOk = gridHeadroomOk && !currentDemand && soc < CHEAP_CHARGE_SOC && state.currentMode !== MODE.BACKUP && !pvOnlyCondition;
 
 
   // ── Charge decision — driven by today's plan thresholds ─────────────────
@@ -1275,7 +1298,7 @@ function decide(ess, pvPower, amber, state, dailySummary) {
       ? `EMERGENCY SOC=${soc}% deficit=${projectedDeficit.toFixed(1)}kWh`
       : planSaysCharge
         ? `plan:charge buy=${currentPrice.toFixed(1)}c (≤${effectiveBuyMaxFull.toFixed(1)}c)`
-        : `buy=${currentPrice.toFixed(1)}c (≤${effectiveBuyMax.toFixed(1)}c fallback)`;
+        : `buy=${currentPrice.toFixed(1)}c (≤${effectiveBuyMaxFull.toFixed(1)}c fallback)`;
     if (entryCount >= 3 || emergencyCharge) {
       targetMode = MODE.BACKUP;
       reason = `${condLabel} — charging (SOC ${soc}% → ${CHEAP_CHARGE_SOC}%)`;
@@ -1551,24 +1574,42 @@ async function main() {
   const amberDataValid = general.length > 0 && (currentPrice !== 0 || renewables !== 0 || current.nemTime != null);
 
   if (!amberDataValid) {
-    // Amber API blip — NEVER change the inverter mode based on bad data.
-    // Just roll the active session window if needed, then exit.
+    // Amber API blip — use daily plan to decide, don't just hold stale mode.
     const blipState = loadState();
     const cacheAge = blipState.lastAmberData
       ? (Date.now() - new Date(blipState.lastAmberData.ts).getTime()) / 60000 : 999;
-    console.warn(`[WARN] Amber API blip — holding mode=${MODE_LABEL[blipState.currentMode]??blipState.currentMode}, cache age=${cacheAge.toFixed(0)}min`);
+    console.warn(`[WARN] Amber API blip (cache age=${cacheAge.toFixed(0)}min) — falling back to daily plan`);
 
-    // Roll sell/charge window so inverter doesn't time out
+    // Try to follow the daily plan even without live prices
+    const blipPlan = loadTodayPlan();
+    const nowSyd = new Date(new Date().toLocaleString('en-AU', { timeZone: 'Australia/Sydney' }));
+    const blipHour = nowSyd.getHours();
+    const blipMin  = nowSyd.getMinutes();
+    const blipSlotKey = `${String(blipHour).padStart(2,'0')}:${blipMin < 30 ? '00' : '30'}`;
+    const blipSlot = blipPlan?.intervals?.find(iv => iv.key === blipSlotKey)
+                  || blipPlan?.intervals?.find(iv => iv.key && blipSlotKey.startsWith(iv.key.substring(0,15)));
+    const blipAction = blipSlot?.action ?? null;
+    const blipInChargeWindow = blipPlan?.chargeWindows?.some(w => {
+      const [sh, sm] = w.start.split(':').map(Number);
+      const [eh, em] = w.end.split(':').map(Number);
+      const nowMins = blipHour * 60 + blipMin;
+      return nowMins >= sh * 60 + sm && nowMins < eh * 60 + em;
+    }) ?? false;
+
+    console.log(`[BLIP] plan slot=${blipAction ?? 'none'} inChargeWindow=${blipInChargeWindow} mode=${MODE_LABEL[blipState.currentMode]??blipState.currentMode}`);
+
     if (blipState.currentMode === MODE.SELLING) {
+      // Keep sell session alive
       await updateSellingEndTime(blipState);
       console.log(`[DONE] (Amber blip — sell session held)`);
-    } else if (blipState.currentMode === MODE.BACKUP) {
-      // Re-apply charge window to prevent inverter reset
-      const { startHHMM } = timedModeTimeContext(null);
-      const pwOk = await setParam('0xC016', '1800'); // keep charge end at 18:00 or similar
-      console.log(`[DONE] (Amber blip — charge session held)`);
+    } else if (blipState.currentMode === MODE.BACKUP || blipInChargeWindow || blipAction === 'charge') {
+      // Plan says charge (or already charging) — keep/start charging
+      const planChargeKw = blipSlot?.chargeKw ?? null;
+      await setModeWithVerify(MODE.BACKUP, { planChargeKw });
+      console.log(`[DONE] (Amber blip — charging per plan chargeKw=${planChargeKw ?? 'auto'})`);
     } else {
-      console.log(`[DONE] (Amber blip — Self-use held, no action needed)`);
+      // No plan action — hold Self-use
+      console.log(`[DONE] (Amber blip — Self-use held, no plan action for ${blipSlotKey})`);
     }
     return;
   }
@@ -1621,17 +1662,32 @@ async function main() {
   const state = loadState();
 
   // ── Sync state.currentMode from reportedMode ──────────────────────────────
-  // Exception: if we believe we're SELLING (state=6) but inverter reports TIMED(1),
-  // this is EXPECTED — ESS inverter reports mode=1 (Timed) for both charging and selling.
-  // Do NOT sync in this case, or we lose the SELLING context and fall into re-entry logic.
-  const sellingButTimedOk = state.currentMode === MODE.SELLING && ess.reportedMode === MODE.TIMED;
-  if (ess.reportedMode !== null && ess.reportedMode !== undefined &&
-      state.currentMode !== null && ess.reportedMode !== state.currentMode &&
-      !sellingButTimedOk) {
-    console.log(`[SYNC] reportedMode=${ess.reportedMode}(${MODE_LABEL[ess.reportedMode]??ess.reportedMode}) ≠ state=${state.currentMode}(${MODE_LABEL[state.currentMode]??state.currentMode}) — syncing state to reported`);
-    state.currentMode = ess.reportedMode;
-  } else if (sellingButTimedOk) {
-    console.log(`[SYNC] reportedMode=Timed(1) with state=Selling(6) — expected, not syncing`);
+  // The ESS inverter reports mode=1 (Timed) for BOTH charging and selling.
+  // We must distinguish them using grid power direction:
+  //   grid < -0.2kW  → exporting → treat as SELLING(6)
+  //   grid >= -0.2kW → not exporting → treat as BACKUP/charging(1)
+  // This prevents a "charging exit" from interrupting an active sell session.
+  if (ess.reportedMode !== null && ess.reportedMode !== undefined && state.currentMode !== null) {
+    if (ess.reportedMode === MODE.TIMED) {
+      // Disambiguate Timed: check grid direction
+      const gridKw = ess.gridPower ?? 0;
+      const isExporting = gridKw < -0.2; // negative = export
+      const inferredMode = isExporting ? MODE.SELLING : MODE.BACKUP;
+      if (state.currentMode !== inferredMode && state.currentMode !== MODE.SELLING && !isExporting) {
+        // Only sync BACKUP side (charging→charging is fine); don't clobber SELLING state with BACKUP
+        console.log(`[SYNC] reportedMode=Timed(1), grid=${gridKw.toFixed(2)}kW → inferred=${inferredMode===MODE.SELLING?'Selling':'Backup'}, state=${MODE_LABEL[state.currentMode]??state.currentMode} — syncing`);
+        state.currentMode = inferredMode;
+      } else if (isExporting && state.currentMode !== MODE.SELLING) {
+        console.log(`[SYNC] reportedMode=Timed(1), grid=${gridKw.toFixed(2)}kW → exporting → treating as Selling(6), syncing state`);
+        state.currentMode = MODE.SELLING;
+      } else {
+        console.log(`[SYNC] reportedMode=Timed(1), grid=${gridKw.toFixed(2)}kW → ${isExporting?'Selling':'Backup'} (state=${MODE_LABEL[state.currentMode]??state.currentMode}, no change needed)`);
+      }
+    } else if (ess.reportedMode !== state.currentMode) {
+      // Non-Timed mode: direct sync
+      console.log(`[SYNC] reportedMode=${ess.reportedMode}(${MODE_LABEL[ess.reportedMode]??ess.reportedMode}) ≠ state=${state.currentMode}(${MODE_LABEL[state.currentMode]??state.currentMode}) — syncing state to reported`);
+      state.currentMode = ess.reportedMode;
+    }
   }
 
   // ── Force mode override ───────────────────────────────────────────────────
