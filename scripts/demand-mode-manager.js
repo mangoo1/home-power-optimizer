@@ -1590,8 +1590,15 @@ async function main() {
                   || blipPlan?.intervals?.find(iv => iv.key && blipSlotKey.startsWith(iv.key.substring(0,15)));
     const blipAction = blipSlot?.action ?? null;
     const blipInChargeWindow = blipPlan?.chargeWindows?.some(w => {
-      const [sh, sm] = w.start.split(':').map(Number);
-      const [eh, em] = w.end.split(':').map(Number);
+      // Support both {start:'HH:MM', end:'HH:MM'} and {startHour:N, endHour:N} formats
+      let sh, sm, eh, em;
+      if (w.start != null) {
+        [sh, sm] = w.start.split(':').map(Number);
+        [eh, em] = w.end.split(':').map(Number);
+      } else {
+        sh = w.startHour ?? 0; sm = 0;
+        eh = w.endHour   ?? 0; em = 0;
+      }
       const nowMins = blipHour * 60 + blipMin;
       return nowMins >= sh * 60 + sm && nowMins < eh * 60 + em;
     }) ?? false;
