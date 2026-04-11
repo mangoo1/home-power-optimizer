@@ -1113,14 +1113,20 @@ function decide(ess, pvPower, amber, state, dailySummary) {
     return { targetMode, reason, alert };
   }
   if (!currentDemand && spotPrice <= CHARGE_SPOT_MAX && soc >= SOC_MAX_CHARGE) {
-    // SOC full but price is free/negative — stay in Timed with chargeKw=0 to prevent battery discharge
-    // Grid supplies home load, battery idles. Don't waste battery when grid is free.
+    // SOC full but price is free/negative
+    // If PV is generating surplus → switch to Self-use so PV charges battery (free solar, don't waste)
+    // If no PV surplus → grid-standby: grid supplies home load, battery idles
+    if (pvSurplus) {
+      targetMode = MODE.SELF_USE;
+      reason = `spot=${spotPrice.toFixed(2)}c (<=0), SOC=${soc}% full but PV surplus ${(pvPowerVal2 - homeLoadVal2).toFixed(1)}kW — Self-use (let PV charge battery)`;
+      return { targetMode, reason, alert };
+    }
     if (state.currentMode !== MODE.BACKUP) {
       targetMode = MODE.BACKUP;
-      reason = `spot=${spotPrice.toFixed(2)}c (<=0), SOC=${soc}% full — grid-standby (chargeKw=0, block discharge)`;
+      reason = `spot=${spotPrice.toFixed(2)}c (<=0), SOC=${soc}% full, no PV surplus — grid-standby (chargeKw=0, block discharge)`;
       alert = { ...(alert||{}), planChargeKwOverride: 0 };
     } else {
-      reason = `spot<=0, SOC full — holding grid-standby`;
+      reason = `spot<=0, SOC full, no PV surplus — holding grid-standby`;
     }
     return { targetMode, reason, alert };
   }
