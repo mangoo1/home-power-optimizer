@@ -418,4 +418,26 @@ async function main() {
   db.close();
 }
 
-main().catch(e => { console.error('[ERROR]', e.message); process.exit(1); });
+main().catch(async e => {
+  console.error('[ERROR]', e.message);
+  // Send WhatsApp alert via OpenClaw gateway
+  try {
+    const gatewayPort = process.env.OPENCLAW_GATEWAY_PORT || '18789';
+    const alertMsg = `⚠️ plan-today.js 失败！今天没有充电计划。\n错误：${e.message}\n请检查 Amber API token 是否有效。`;
+    const alertBody = JSON.stringify({ message: alertMsg });
+    await new Promise((resolve) => {
+      const http = require('http');
+      const req = http.request({
+        hostname: 'localhost', port: gatewayPort, path: '/send', method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(alertBody) }
+      }, res => { res.resume(); resolve(); });
+      req.on('error', () => resolve());
+      req.write(alertBody);
+      req.end();
+    });
+    console.log('[ALERT] WhatsApp notification sent');
+  } catch (alertErr) {
+    console.error('[ALERT] Failed to send notification:', alertErr.message);
+  }
+  process.exit(1);
+});
