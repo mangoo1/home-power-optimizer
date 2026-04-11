@@ -2,7 +2,7 @@
 """ESS Display via direct SPI + gpiod v2 - bypasses DRM entirely"""
 
 import spidev, gpiod
-from gpiod.line import Direction, Value
+from gpiod.line import Direction, Value, Edge, Bias
 import sqlite3, time, struct, sys
 from datetime import datetime, timezone, timedelta
 import zoneinfo
@@ -11,8 +11,12 @@ from PIL import Image, ImageDraw, ImageFont
 SPI_BUS, SPI_DEV = 0, 0
 DC_PIN    = 25
 RESET_PIN = 27
-GPIO_CHIP = "/dev/gpiochip4"
+GPIO_CHIP = "/dev/gpiochip4"  # display pins
+KEY_CHIP  = "/dev/gpiochip0"  # button pins
 BL_PIN    = 24  # backlight
+KEY1_PIN  = 21  # page switch
+KEY2_PIN  = 20  # manual refresh
+KEY3_PIN  = 16  # backlight toggle
 W, H = 128, 128   # physical dims after rotation
 
 DB_PATH     = "/home/pi/ess-data/energy.db"
@@ -129,7 +133,7 @@ def draw_bar(d,x,y,w,h,pct,color):
     fw=int(w*min(max(pct,0),100)/100)
     if fw>0: d.rectangle([x,y,x+fw,y+h],fill=color)
 
-def make_frame(data):
+def make_frame(data, page=0):
     img = Image.new("RGB",(W,H),BLACK)
     d = ImageDraw.Draw(img)
     try:
@@ -140,6 +144,34 @@ def make_frame(data):
 
     if not data:
         d.text((10,70),"No data",font=fn_lg,fill=RED); return img
+
+    # Page 1: price detail
+    if page == 1:
+        d.rectangle([0,0,W,H],fill=NAVY)
+        d.rectangle([0,0,W,16],fill=(20,40,80))
+        d.text((2,2),"Price Detail",font=fn_sm,fill=WHITE)
+        buy=data.get("buy_price",0)or 0
+        feedin=abs(data.get("feed_in_price",0)or 0)
+        dw=data.get("demand_window",0)or 0
+        d.text((2,22),f"Buy:  {buy:.1f}c/kWh",font=fn_md,fill=price_color(buy))
+        d.text((2,38),f"Sell: {feedin:.1f}c/kWh",font=fn_md,fill=YELLOW)
+        d.text((2,54),f"DW: {'YES' if dw else 'NO'}",font=fn_md,fill=(RED if dw else GREEN))
+        d.text((2,110),"KEY1=next KEY3=light",font=fn_sm,fill=GRAY)
+        return img
+
+    # Page 2: today stats
+    if page == 2:
+        d.rectangle([0,0,W,H],fill=NAVY)
+        d.rectangle([0,0,W,16],fill=(20,40,80))
+        d.text((2,2),"Today Stats",font=fn_sm,fill=WHITE)
+        load=data.get("home_load",0)or 0
+        pv=data.get("pv_power",0)or 0
+        grid=data.get("grid_power",0)or 0
+        d.text((2,22),f"Load:  {load:.2f} kW",font=fn_md,fill=WHITE)
+        d.text((2,38),f"Solar: {pv:.2f} kW",font=fn_md,fill=YELLOW)
+        d.text((2,54),f"Grid:  {grid:.2f} kW",font=fn_md,fill=(GREEN if grid<0 else ORANGE))
+        d.text((2,110),"KEY1=next KEY3=light",font=fn_sm,fill=GRAY)
+        return img
 
     soc=data.get("soc",0)or 0; mode=data.get("mode",0)or 0
     buy=data.get("buy_price",0)or 0; load=data.get("home_load",0)or 0
@@ -192,6 +224,11 @@ def main():
         DC_PIN:    gpiod.LineSettings(direction=Direction.OUTPUT, output_value=Value.INACTIVE),
         RESET_PIN: gpiod.LineSettings(direction=Direction.OUTPUT, output_value=Value.ACTIVE),
         BL_PIN:    gpiod.LineSettings(direction=Direction.OUTPUT, output_value=Value.ACTIVE),
+    })
+    key_req = gpiod.request_lines(KEY_CHIP, consumer="ess-keys", config={
+        KEY1_PIN:  gpiod.LineSettings(direction=Direction.INPUT, edge_detection=Edge.FALLING, bias=Bias.PULL_UP),
+        KEY2_PIN:  gpiod.LineSettings(direction=Direction.INPUT, edge_detection=Edge.FALLING, bias=Bias.PULL_UP),
+        KEY3_PIN:  gpiod.LineSettings(direction=Direction.INPUT, edge_detection=Edge.FALLING, bias=Bias.PULL_UP),
     })
 
     spi.open(SPI_BUS, SPI_DEV)
