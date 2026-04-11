@@ -1609,14 +1609,17 @@ async function main() {
       // Keep sell session alive
       await updateSellingEndTime(blipState);
       console.log(`[DONE] (Amber blip — sell session held)`);
-    } else if (blipState.currentMode === MODE.BACKUP || blipInChargeWindow || blipAction === 'charge') {
-      // Plan says charge (or already charging) — keep/start charging
+    } else if (blipInChargeWindow || blipAction === 'charge') {
+      // Plan explicitly says charge in this window — keep/start charging
+      // NOTE: do NOT use blipState.currentMode === BACKUP as a condition here,
+      //       because that would blindly continue charging even when price is now high.
       const planChargeKw = blipSlot?.chargeKw ?? null;
       await setModeWithVerify(MODE.BACKUP, { planChargeKw });
       console.log(`[DONE] (Amber blip — charging per plan chargeKw=${planChargeKw ?? 'auto'})`);
     } else {
-      // No plan action — hold Self-use
-      console.log(`[DONE] (Amber blip — Self-use held, no plan action for ${blipSlotKey})`);
+      // API blip + no plan action → safest option is Self-use (don't charge at unknown price)
+      await setModeWithVerify(MODE.SELF_USE);
+      console.log(`[DONE] (Amber blip — falling back to Self-use, no plan charge action for ${blipSlotKey})`);
     }
     return;
   }
