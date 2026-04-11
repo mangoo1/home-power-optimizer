@@ -87,8 +87,8 @@ def init_display():
     cmd(ST7735_VMCTR1); data([0x0E])
     cmd(0x20)  # INVOFF
 
-    # MADCTL: MX+MV = 90deg rotation, BGR order
-    cmd(ST7735_MADCTL); data([0x60])
+    # MADCTL: Waveshare 1.44" official = 0x68 (row/col swap + BGR)
+    cmd(ST7735_MADCTL); data([0x68])
     cmd(ST7735_COLMOD); data([0x05])  # RGB565
 
     cmd(ST7735_GMCTRP1)
@@ -98,6 +98,7 @@ def init_display():
     data([0x03,0x1d,0x07,0x06,0x2E,0x2C,0x29,0x2D,
           0x2E,0x2E,0x37,0x3F,0x00,0x00,0x02,0x10])
 
+    cmd(0x13)  # NORON
     cmd(ST7735_DISPON); time.sleep(0.1)
     print("Display initialized", flush=True)
 
@@ -226,10 +227,11 @@ def main():
         BL_PIN:    gpiod.LineSettings(direction=Direction.OUTPUT, output_value=Value.ACTIVE),
     })
     key_req = gpiod.request_lines(KEY_CHIP, consumer="ess-keys", config={
-        KEY1_PIN:  gpiod.LineSettings(direction=Direction.INPUT, edge_detection=Edge.FALLING, bias=Bias.PULL_UP),
-        KEY2_PIN:  gpiod.LineSettings(direction=Direction.INPUT, edge_detection=Edge.FALLING, bias=Bias.PULL_UP),
-        KEY3_PIN:  gpiod.LineSettings(direction=Direction.INPUT, edge_detection=Edge.FALLING, bias=Bias.PULL_UP),
+        KEY1_PIN:  gpiod.LineSettings(direction=Direction.INPUT, bias=Bias.PULL_UP),
+        KEY2_PIN:  gpiod.LineSettings(direction=Direction.INPUT, bias=Bias.PULL_UP),
+        KEY3_PIN:  gpiod.LineSettings(direction=Direction.INPUT, bias=Bias.PULL_UP),
     })
+    key_prev = {KEY1_PIN: Value.ACTIVE, KEY2_PIN: Value.ACTIVE, KEY3_PIN: Value.ACTIVE}
 
     spi.open(SPI_BUS, SPI_DEV)
     spi.max_speed_hz = 16000000
@@ -237,15 +239,40 @@ def main():
 
     init_display()
 
+    page = 0
+    bl_on = True
+    last_refresh = 0
+
     while True:
         try:
-            d = get_latest()
-            show_image(make_frame(d))
-            soc = d.get("soc","?") if d else "?"
-            print(f"Updated SOC={soc}%", flush=True)
+            # 轮询按键（FALLING = ACTIVE->INACTIVE）
+            for pin in [KEY1_PIN, KEY2_PIN, KEY3_PIN]:
+                cur = key_req.get_value(pin)
+                if key_prev[pin] == Value.ACTIVE and cur == Value.INACTIVE:
+                    if pin == KEY1_PIN:
+                        page = (page + 1) % 3
+                        print(f"Page -> {page}", flush=True)
+                        last_refresh = 0
+                    elif pin == KEY2_PIN:
+                        last_refresh = 0
+                        print("Manual refresh", flush=True)
+                    elif pin == KEY3_PIN:
+                        bl_on = not bl_on
+                        gpio_req.set_value(BL_PIN, Value.ACTIVE if bl_on else Value.INACTIVE)
+                        print(f"Backlight {'ON' if bl_on else 'OFF'}", flush=True)
+                key_prev[pin] = cur
+            time.sleep(0.1)  # 100ms 轮询间隔
+
+            now = time.time()
+            if now - last_refresh >= REFRESH_SEC:
+                d = get_latest()
+                show_image(make_frame(d, page=page))
+                soc = d.get("soc","?") if d else "?"
+                print(f"Updated SOC={soc}% page={page}", flush=True)
+                last_refresh = now
         except Exception as e:
             print(f"Error: {e}", flush=True)
-        time.sleep(REFRESH_SEC)
+            time.sleep(5)
 
 if __name__=="__main__":
     try:
