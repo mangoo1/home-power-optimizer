@@ -1104,29 +1104,29 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   console.log(`[SOC] target=${CHEAP_CHARGE_SOC}% (pvSurplus=${pvSurplus} cheapPrice=${cheapPrice} buy=${currentPrice.toFixed(1)}c ultraCheap=${currentPrice<=ULTRACHEAP_PRICE_C})`);
   // Note: spot<=0 grid-standby uses SOC_MAX_CHARGE (85%) — see Priority 3 below
 
-  // ── Priority 3: Free/negative-price charging (spot <= 0) ─────────────────
+  // ── Priority 3: Ultra-cheap price charging (currentPrice <= 7¢) ──────────
+  // Uses actual buy price (perKwh) — not spot price — so decisions match what you actually pay.
   // Guard: never charge during demand window (handled in priority 1)
-  // Use SOC_MAX_CHARGE (85%) as target — NOT the ultra-cheap 100% target
-  if (gridHeadroomOk && !currentDemand && spotPrice <= CHARGE_SPOT_MAX && soc < SOC_MAX_CHARGE) {
+  if (gridHeadroomOk && !currentDemand && currentPrice <= ULTRACHEAP_PRICE_C && soc < SOC_MAX_CHARGE) {
     targetMode = MODE.BACKUP;
-    reason = `spot=${spotPrice.toFixed(2)}c (<=0) — free charging (SOC ${soc}% -> ${SOC_MAX_CHARGE}%)`;
+    reason = `buy=${currentPrice.toFixed(2)}c (≤${ULTRACHEAP_PRICE_C}c ultra-cheap) — charging (SOC ${soc}% -> ${SOC_MAX_CHARGE}%)`;
     return { targetMode, reason, alert };
   }
-  if (!currentDemand && spotPrice <= CHARGE_SPOT_MAX && soc >= SOC_MAX_CHARGE) {
-    // SOC full but price is free/negative
-    // If PV is generating surplus → switch to Self-use so PV charges battery (free solar, don't waste)
+  if (!currentDemand && currentPrice <= ULTRACHEAP_PRICE_C && soc >= SOC_MAX_CHARGE) {
+    // SOC full but price is ultra-cheap
+    // If PV is generating surplus → switch to Self-use so PV charges battery for free
     // If no PV surplus → grid-standby: grid supplies home load, battery idles
     if (pvSurplus) {
       targetMode = MODE.SELF_USE;
-      reason = `spot=${spotPrice.toFixed(2)}c (<=0), SOC=${soc}% full but PV surplus ${(pvPowerVal2 - homeLoadVal2).toFixed(1)}kW — Self-use (let PV charge battery)`;
+      reason = `buy=${currentPrice.toFixed(2)}c (≤${ULTRACHEAP_PRICE_C}c), SOC=${soc}% full but PV surplus ${(pvPowerVal2 - homeLoadVal2).toFixed(1)}kW — Self-use (let PV charge battery)`;
       return { targetMode, reason, alert };
     }
     if (state.currentMode !== MODE.BACKUP) {
       targetMode = MODE.BACKUP;
-      reason = `spot=${spotPrice.toFixed(2)}c (<=0), SOC=${soc}% full, no PV surplus — grid-standby (chargeKw=0, block discharge)`;
+      reason = `buy=${currentPrice.toFixed(2)}c (≤${ULTRACHEAP_PRICE_C}c), SOC=${soc}% full, no PV surplus — grid-standby (chargeKw=0, block discharge)`;
       alert = { ...(alert||{}), planChargeKwOverride: 0 };
     } else {
-      reason = `spot<=0, SOC full, no PV surplus — holding grid-standby`;
+      reason = `buy=${currentPrice.toFixed(2)}c ultra-cheap, SOC full, no PV surplus — holding grid-standby`;
     }
     return { targetMode, reason, alert };
   }
