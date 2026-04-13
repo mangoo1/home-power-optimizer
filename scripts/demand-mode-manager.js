@@ -1611,12 +1611,27 @@ async function main() {
 
     console.log(`[BLIP] plan slot=${blipAction ?? 'none'} inChargeWindow=${blipInChargeWindow} mode=${MODE_LABEL[blipState.currentMode]??blipState.currentMode}`);
 
+    // During a blip, check last known SOC from DB
+    let blipSoc = null;
+    try {
+      const lastRow = db.prepare('SELECT soc FROM energy_log ORDER BY ts DESC LIMIT 1').get();
+      blipSoc = lastRow?.soc ?? null;
+    } catch(e) {}
+    const blipHourNow = nowSyd.getHours();
+    const socFull = blipSoc !== null && blipSoc >= 80;
+    const pastCheapWindow = blipHourNow >= 16; // after 16:00 prices start rising
+    const shouldStopCharging = socFull && pastCheapWindow;
+
     if (blipState.currentMode === MODE.SELLING) {
       // Keep sell session alive
       await updateSellingEndTime(blipState);
       console.log(`[DONE] (Amber blip — sell session held)`);
+    } else if ((blipState.currentMode === MODE.BACKUP || blipState.currentMode === 1) && shouldStopCharging) {
+      // SOC full + past cheap window → stop charging, wait for sell opportunity
+      await setModeWithVerify(MODE.SELF_USE);
+      console.log(`[DONE] (Amber blip — SOC ${blipSoc}% full + hour=${blipHourNow} >= 16, stopping charge → Self-use)`);
     } else if (blipState.currentMode === MODE.BACKUP || blipState.currentMode === 1) {
-      // Already charging — keep charging during blip (safe: we were already in charge mode)
+      // Already charging and still in cheap window — keep charging
       const planChargeKw = blipSlot?.chargeKw ?? null;
       await setModeWithVerify(MODE.BACKUP, { planChargeKw });
       console.log(`[DONE] (Amber blip — already charging, hold charge mode chargeKw=${planChargeKw ?? 'auto'})`);
