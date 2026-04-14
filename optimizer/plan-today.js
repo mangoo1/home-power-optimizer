@@ -39,7 +39,7 @@ const MAX_DISCHARGE_KW = 5.0;
 const CHARGE_EFF       = 0.95;
 const DISCHARGE_EFF    = 0.95;
 const PANEL_KWP        = 4.3;
-const PV_DISCOUNT      = 0.60;   // real-world derating factor
+const PV_DISCOUNT      = 0.90;   // real-world derating factor (calibrated 2026-04-15 from 8 days data)
 const INTERVAL_H       = 0.5;    // 30-min slots
 
 // Sell threshold: feedIn must be >= this to consider selling
@@ -183,8 +183,10 @@ function aggregateTo30min(priceIntervals) {
 
 // ── PV forecast per hour ──────────────────────────────────────────────────────
 function pvKwForHour(sw_wm2, cloud_pct) {
-  const cloudFactor = 1 - (cloud_pct / 100) * 0.5;
-  return Math.max(0, PANEL_KWP * (sw_wm2 / 1000) * cloudFactor * 0.85) * PV_DISCOUNT;
+  // Note: Open-Meteo shortwave_radiation already accounts for cloud cover (actual surface radiation).
+  // Do NOT apply a separate cloud correction factor — that would double-count cloud losses.
+  // PV_DISCOUNT covers: inverter efficiency, wiring losses, panel temperature, soiling (~10% total).
+  return Math.max(0, PANEL_KWP * (sw_wm2 / 1000)) * PV_DISCOUNT;
 }
 
 // ── Buy threshold: cheapest slots in daytime window ──────────────────────────
