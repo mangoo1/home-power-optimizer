@@ -1789,14 +1789,16 @@ async function main() {
         // re-fetch reportedMode
         const verifyEss = await getESSData().catch(() => null);
         const verifiedMode = verifyEss?.reportedMode ?? null;
-        const verifyOk = verifiedMode === targetMode;
+        // SELLING uses Timed(1) under the hood — inverter reports mode=1 not mode=6
+        const modeMatch = (m) => m === targetMode || (targetMode === MODE.SELLING && m === MODE.TIMED);
+        const verifyOk = modeMatch(verifiedMode);
         if (!verifyOk && verifiedMode !== null) {
           console.log(`[MODE VERIFY] Mismatch: set=${targetMode} reported=${verifiedMode}, retrying...`);
           await setMode(targetMode).catch(e => console.error('[MODE VERIFY] retry failed:', e));
           await new Promise(r => setTimeout(r, 5000));
           const verifyEss2 = await getESSData().catch(() => null);
           const verifiedMode2 = verifyEss2?.reportedMode ?? null;
-          const verifyOk2 = verifiedMode2 === targetMode;
+          const verifyOk2 = modeMatch(verifiedMode2);
           if (!verifyOk2) {
             console.log(`⚠️ Mode verify FAILED after retry: set=${targetMode} reported=${verifiedMode2}`);
           }
