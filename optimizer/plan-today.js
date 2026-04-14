@@ -23,6 +23,9 @@ const path     = require('path');
 const https    = require('https');
 const Database = require('better-sqlite3');
 
+// Load .env from project root
+try { require('dotenv').config({ path: path.join(__dirname, '..', '.env') }); } catch(e) {}
+
 const DB_PATH       = path.join(__dirname, '..', 'data', 'energy.db');
 const AMBER_TOKEN   = process.env.AMBER_API_TOKEN || process.env.AMBER_TOKEN;
 const AMBER_SITE_ID = process.env.AMBER_SITE_ID   || '01KMN0H71HS5SYAE5P3E9WDGCD';
