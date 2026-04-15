@@ -138,7 +138,7 @@ const ULTRACHEAP_PRICE_C = 7.0;   // ¢ — "ultra cheap" threshold
 //   11:00–23:59 Sydney → 35% (afternoon/evening, must reserve for demand window + overnight)
 // Cutoff changed from 14:00 to 11:00: after 11am there's not enough recharge time before 15:00 DW
 const SOC_MIN_SELL_MORNING  = 32;
-const SOC_MIN_SELL_AFTERNOON = 35;
+const SOC_MIN_SELL_AFTERNOON = 32;
 const SOC_MIN_SELL_CUTOFF_HOUR = 11; // switch to afternoon reserve at 11:00 Sydney time
 const SELL_STOP_HOUR = 21;        // Hard stop selling after this hour (Sydney time) — reserve battery for overnight
 const SOC_WARN = 20;              // Alert threshold: SOC too low during demand window
