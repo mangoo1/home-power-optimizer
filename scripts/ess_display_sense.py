@@ -19,6 +19,8 @@ import sys
 import threading
 import urllib.request
 import json
+import evdev
+from evdev import InputDevice, ecodes
 from sense_hat import SenseHat
 
 DB_PATH      = os.environ.get("DB_PATH", "/home/pi/ess-data/energy.db")
@@ -133,26 +135,39 @@ def flash_arrow(action):
 
 
 def joystick_thread():
-    """Background thread: listen for Sense HAT joystick events."""
+    """Background thread: read Sense HAT joystick via evdev (works without TTY)."""
     global _car_action
-    joy_map = {
-        "up":    "forward",
-        "down":  "backward",
-        "left":  "left",
-        "right": "right",
-        "middle":"stop",
+
+    # KEY codes used by Sense HAT joystick
+    KEY_MAP = {
+        ecodes.KEY_UP:     "forward",
+        ecodes.KEY_DOWN:   "backward",
+        ecodes.KEY_LEFT:   "left",
+        ecodes.KEY_RIGHT:  "right",
+        ecodes.KEY_ENTER:  "stop",
     }
-    print("[JOY] Joystick listener started")
-    for event in s.stick.get_events():
-        # Only act on 'pressed' (ignore held/released to avoid repeat spam)
-        if event.action != "pressed":
+
+    dev_path = "/dev/input/event4"
+    print(f"[JOY] Opening {dev_path}")
+    try:
+        dev = InputDevice(dev_path)
+        dev.grab()  # exclusive access
+    except Exception as e:
+        print(f"[JOY] Failed to open joystick: {e}", file=sys.stderr)
+        return
+
+    print("[JOY] Joystick listener started (evdev)")
+    for event in dev.read_loop():
+        if event.type != ecodes.EV_KEY:
             continue
-        action = joy_map.get(event.direction)
+        # value=1 → pressed, value=0 → released, value=2 → held
+        if event.value != 1:
+            continue
+        action = KEY_MAP.get(event.code)
         if not action:
             continue
         with _car_lock:
             _car_action = action
-        # Send HTTP in a fire-and-forget thread so joystick stays responsive
         threading.Thread(target=send_car_cmd, args=(action,), daemon=True).start()
         threading.Thread(target=flash_arrow, args=(action,), daemon=True).start()
 
