@@ -137,7 +137,7 @@ const ULTRACHEAP_PRICE_C = 7.0;   // ¢ — "ultra cheap" threshold
 //   00:00–10:59 Sydney → 12% (morning, enough time for grid/PV to recharge before demand window)
 //   11:00–23:59 Sydney → 35% (afternoon/evening, must reserve for demand window + overnight)
 // Cutoff changed from 14:00 to 11:00: after 11am there's not enough recharge time before 15:00 DW
-const SOC_MIN_SELL_MORNING  = 32;
+const SOC_MIN_SELL_MORNING  = 12;
 const SOC_MIN_SELL_AFTERNOON = 32;
 const SOC_MIN_SELL_CUTOFF_HOUR = 11; // switch to afternoon reserve at 11:00 Sydney time
 const SELL_STOP_HOUR = 21;        // Hard stop selling after this hour (Sydney time) — reserve battery for overnight
@@ -145,7 +145,7 @@ const SOC_WARN = 20;              // Alert threshold: SOC too low during demand 
 const SELL_FEEDIN_MIN = 0;        // Hard floor for selling (0 = rely solely on avg-buy+margin logic)
 const CHARGE_SPOT_MAX = 0;        // Max spot price for free charging (spot <= 0 = free)
 const BATTERY_CAPACITY = 42;      // kWh total battery capacity
-const BATTERY_MIN_SOC = 32;       // Min SOC % (reserve, never discharge below this)
+const BATTERY_MIN_SOC = 10;       // Min SOC % (reserve, never discharge below this)
 const INVERTER_MAX_DISCHARGE = 5; // kW max inverter discharge power
 
 // ESS app API headers
@@ -1221,7 +1221,7 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   // Hot water heater runs on grid at low price — NOT from battery. Exclude from estimate.
   // Battery only covers: evening home load + overnight standby + 12% morning reserve.
   const sydneyHourForCharge = getSydneyHour();
-  const OVERNIGHT_RESERVE_PCT = 32; // morning floor — will top up from PV/grid during day
+  const OVERNIGHT_RESERVE_PCT = 12; // morning floor — will top up from PV/grid during day
   let estimatedConsumption = 0;
   if (sydneyHourForCharge >= 17 && sydneyHourForCharge < 23) {
     const eveHours = 23 - sydneyHourForCharge;
