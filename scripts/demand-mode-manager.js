@@ -1098,11 +1098,17 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   const homeLoadVal2 = ess.homeLoad ?? 0;
   const pvSurplus    = pvPowerVal2 > homeLoadVal2;  // PV generating more than house needs
   const cheapPrice   = currentPrice <= 9.6; // early estimate — use 9.6c threshold before plan loads
-  // After 15:30, cap charge target at 85% even on ultra-cheap prices — preserve capacity for evening sell
+  // After 14:00, cap charge target at 85% even on ultra-cheap/PV-surplus — preserve capacity for evening sell.
+  // Rationale: sell window starts ~17:30, battery needs to be available. Topping to 100% at 14:00+
+  // wastes ~6kWh of sell capacity. Use plan's chargeCutoffHour if loaded (default cutoff=17 in plan,
+  // but we use 14 here so SOC target drops to 85% sooner — prevents over-charging in afternoon).
   const _sydNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'Australia/Sydney' }));
-  const pastSellWindow = _sydNow.getHours() > 15 || (_sydNow.getHours() === 15 && _sydNow.getMinutes() >= 30);
+  const _socCutoffHour = (todayPlan?.chargeCutoffHour != null)
+    ? Math.min(todayPlan.chargeCutoffHour - 3, 14)  // 3h before cutoff, max 14:00
+    : 14;
+  const pastSellWindow = _sydNow.getHours() >= _socCutoffHour;
   const CHEAP_CHARGE_SOC = (!pastSellWindow && (currentPrice <= ULTRACHEAP_PRICE_C || (pvSurplus && cheapPrice)))
-    ? SOC_MAX_CHARGE_ULTRACHEAP   // 100% — free solar surplus or ultra-cheap grid (before 15:30 only)
+    ? SOC_MAX_CHARGE_ULTRACHEAP   // 100% — free solar surplus or ultra-cheap grid (before cutoff only)
     : SOC_MAX_CHARGE;             // 85% — normal target
   console.log(`[SOC] target=${CHEAP_CHARGE_SOC}% (pvSurplus=${pvSurplus} cheapPrice=${cheapPrice} buy=${currentPrice.toFixed(1)}c ultraCheap=${currentPrice<=ULTRACHEAP_PRICE_C})`);
   // Note: spot<=0 grid-standby uses SOC_MAX_CHARGE (85%) — see Priority 3 below
