@@ -23,7 +23,7 @@ from sense_hat import SenseHat
 
 DB_PATH      = os.environ.get("DB_PATH", "/home/pi/ess-data/energy.db")
 YABOT_URL    = os.environ.get("YABOT_URL", "http://192.168.31.187:5000")
-CAR_SPEED    = int(os.environ.get("CAR_SPEED", "60"))
+CAR_SPEED    = int(os.environ.get("CAR_SPEED", "20"))
 REFRESH_SEC  = 30
 
 s = SenseHat()
