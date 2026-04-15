@@ -32,7 +32,7 @@ const AMBER_SITE_ID = process.env.AMBER_SITE_ID   || '01KMN0H71HS5SYAE5P3E9WDGCD
 
 // ── System constants ──────────────────────────────────────────────────────────
 const BATTERY_KWH      = 42;
-const SOC_MIN          = 0.10;   // never discharge below 10%
+const SOC_MIN          = 0.32;   // never discharge below 32%
 const SOC_MAX          = 0.85;   // charge target
 const MAX_CHARGE_KW    = 5.0;
 const MAX_DISCHARGE_KW = 5.0;
