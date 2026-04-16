@@ -1448,10 +1448,21 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   // today's avg buy often includes expensive intervals (hot water, DW), which incorrectly
   // raises the sell threshold and blocks profitable selling at 14c+.
   // Use plan's sellMinC if available, else absolute floor
-  const effectiveSellMin = planSellMinC ?? SELL_ABS_MIN;
-  const sellMinLabel = planSellMinC
-    ? `plan_sell_min=${planSellMinC.toFixed(1)}c`
-    : `abs_floor=${SELL_ABS_MIN}c`;
+  // effectiveSellMin: use avg buy price + margin when we have enough data,
+  // otherwise fall back to plan's sellMinC or absolute floor.
+  // This ensures we sell whenever feedIn > cost + margin, regardless of absolute price.
+  let effectiveSellMin;
+  let sellMinLabel;
+  if (avgBuyPrice !== null) {
+    const dynamicMin = avgBuyPrice + SELL_MIN_MARGIN;
+    effectiveSellMin = dynamicMin;
+    sellMinLabel = `avg_buy=${avgBuyPrice.toFixed(1)}c+margin=${SELL_MIN_MARGIN}c→${dynamicMin.toFixed(1)}c`;
+  } else {
+    effectiveSellMin = planSellMinC ?? SELL_ABS_MIN;
+    sellMinLabel = planSellMinC
+      ? `plan_sell_min=${planSellMinC.toFixed(1)}c`
+      : `abs_floor=${SELL_ABS_MIN}c`;
+  }
 
   // ── Priority 5: Sell to grid ─────────────────────────────────────────────
   // Hard stop: no selling after SELL_STOP_HOUR (Sydney time) — reserve battery overnight
