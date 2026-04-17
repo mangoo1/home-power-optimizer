@@ -1416,8 +1416,8 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   // Selling is allowed during demand window (exporting does NOT create demand charge).
   // Charging priorities 3/4/4b are NOT reached during demand window because
   // priority 1 either returns early (if was charging) or falls through here.
-  const SELL_MIN_MARGIN = 5;        // c/kWh minimum margin above avg buy price
-  const SELL_ABS_MIN = 13.5;        // c/kWh absolute floor
+  const SELL_MIN_MARGIN = 3;        // c/kWh minimum margin above avg buy price (lowered from 5 on 2026-04-17)
+  const SELL_ABS_MIN = 11.5;        // c/kWh absolute floor (lowered from 13.5 on 2026-04-17 to capture 12c+ periods)
   const SELL_MIN_SAMPLES_KWH = 1.0; // require at least 1 kWh bought today to have a reliable avg
 
   const avgBuyCalc = (() => {
@@ -1602,6 +1602,23 @@ async function main() {
   if (!amberDataValid) {
     // Amber API blip — use daily plan to decide, don't just hold stale mode.
     const blipState = loadState();
+
+    // ── ForceMode takes priority even during blip ──────────────────────────
+    if (blipState.forceMode != null && blipState.forceModeUntil) {
+      const forceUntil = new Date(blipState.forceModeUntil);
+      if (new Date() < forceUntil) {
+        const minsLeft = ((forceUntil - new Date()) / 60000).toFixed(0);
+        console.log(`[INFO] Force mode active during blip: ${MODE_LABEL[blipState.forceMode] ?? blipState.forceMode} until ${blipState.forceModeUntil} (${minsLeft} min remaining)`);
+        if (blipState.forceMode === MODE.SELLING) {
+          await updateSellingEndTime(blipState);
+        }
+        blipState.lastCheck = new Date().toISOString();
+        saveState(blipState);
+        console.log(`[DONE] (Amber blip — forceMode=${MODE_LABEL[blipState.forceMode]} held)`);
+        return;
+      }
+    }
+
     const cacheAge = blipState.lastAmberData
       ? (Date.now() - new Date(blipState.lastAmberData.ts).getTime()) / 60000 : 999;
     console.warn(`[WARN] Amber API blip (cache age=${cacheAge.toFixed(0)}min) — falling back to daily plan`);
