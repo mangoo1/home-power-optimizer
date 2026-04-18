@@ -24,6 +24,11 @@ const https = require("https");
 const fs = require("fs");
 const path = require("path");
 
+// Load .env if env vars not already set (e.g. when running directly vs via cron)
+if (!process.env.ESS_TOKEN || !process.env.AMBER_API_TOKEN) {
+  try { require("dotenv").config({ path: path.join(__dirname, "../.env") }); } catch {}
+}
+
 const AMBER_TOKEN = process.env.AMBER_API_TOKEN;
 const AMBER_SITE_ID = process.env.AMBER_SITE_ID || "01KMN0H71HS5SYAE5P3E9WDGCD";
 const ESS_TOKEN = process.env.ESS_TOKEN;
@@ -54,6 +59,7 @@ const SELLING_MONITOR_CRON_NAME = "selling-monitor-active";
 const ESS_HEADERS = {
   lang: "en", platform: "linux", projectType: "1", source: "app",
   Origin: "https://euapp.ess-link.com", Referer: "https://euapp.ess-link.com/",
+  "sys-mac-address": MAC_HEX, "sys-local-ip": "127.0.0.1",
 };
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────────
@@ -93,7 +99,7 @@ async function essGet(ep) {
       { Authorization: ESS_TOKEN, ...ESS_HEADERS }
     );
     return d.code === 200 ? d.data : null;
-  } catch { return null; }
+  } catch(e) { console.error(`[essGet] ${ep} error:`, e.message); return null; }
 }
 
 function findVal(items, index) {
