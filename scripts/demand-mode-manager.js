@@ -37,6 +37,7 @@ const DB_PATH = path.join(DATA_DIR, "energy.db");
 
 // SQLite (lazy-loaded)
 let _db = null;
+let todayPlan = null; // module-level, set in main()
 function getDb() {
   if (_db) return _db;
   try {
@@ -495,7 +496,7 @@ async function setMode(mode) {
 // 18:00 default ensures charging always stops before any potential DW (15:00–20:00).
 // Using a fixed large window instead of rolling 10-min prevents charging from
 // dropping out between cron runs.
-function timedModeTimeContext(nextDemandMinutes) {
+function timedModeTimeContext(nextDemandMinutes, plan = null) {
   const syd  = sydneyNow();
   const fmt2 = n => String(n).padStart(2, '0');
 
@@ -518,10 +519,11 @@ function timedModeTimeContext(nextDemandMinutes) {
     const [eh, em] = endSyd.split(':');
     endHHMM = fmt2(parseInt(eh)) + fmt2(parseInt(em));
   } else {
-    // No demand window — charge until 18:00, sell until 21:00 (set by caller)
-    endHHMM = '1800';
+    // No demand window — charge until plan cutoff hour (default 18:00), sell until 21:00 (set by caller)
+    const cutoffH = (plan?.chargeCutoffHour != null) ? plan.chargeCutoffHour : 18;
+    endHHMM = fmt2(cutoffH) + '00';
     const nowMins = syd.hour * 60 + syd.minute;
-    if (nowMins >= 18 * 60) endHHMM = '2359';
+    if (nowMins >= cutoffH * 60) endHHMM = '2359';
   }
 
   // Clock string for inverter sync
@@ -555,7 +557,7 @@ async function setTimedChargeDischarge({ mode, powerKw, tag, nextDemandMinutes }
   // tag: log prefix e.g. '[SELL]' or '[BUY]'
   if (!ESS_TOKEN) { console.log(`[SKIP] No ESS_TOKEN, would set ${tag} Timed mode`); return false; }
 
-  const { startHHMM, endHHMM: chargeEndHHMM, clockStr, yesterday, tomorrow } = timedModeTimeContext(nextDemandMinutes);
+  const { startHHMM, endHHMM: chargeEndHHMM, clockStr, yesterday, tomorrow } = timedModeTimeContext(nextDemandMinutes, todayPlan);
 
   // Sell mode: end at SELL_STOP_HOUR (21:00) — fixed, not rolling +10min
   // This ensures a missed cron run won't cut selling short mid-session
@@ -1004,7 +1006,7 @@ function updateDailySummary(record) {
 // ── Decision engine ───────────────────────────────────────────────────────────
 function decide(ess, pvPower, amber, state, dailySummary) {
   // Load today's LP plan (primary charge strategy)
-  const todayPlan = loadTodayPlan();
+  todayPlan = loadTodayPlan(); // set module-level var
   const planSydHour = getSydneyHour();
 
   // Is current hour within a plan charge window?
@@ -1884,7 +1886,7 @@ async function main() {
         console.log(`[INFO] Switched to Self-use due to high load`);
         return;
       }
-      const { startHHMM, endHHMM } = timedModeTimeContext(amber.nextDemandMinutes);
+      const { startHHMM, endHHMM } = timedModeTimeContext(amber.nextDemandMinutes, todayPlan);
       // Roll charge window
       const startOk = await setParam('0xC014', startHHMM);
       const endOk = await setParam('0xC016', endHHMM);
