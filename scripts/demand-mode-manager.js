@@ -14,6 +14,11 @@ const https = require("https");
 const fs = require("fs");
 const path = require("path");
 
+// Load .env if env vars not already set (e.g. when running directly vs via cron)
+if (!process.env.ESS_TOKEN || !process.env.AMBER_API_TOKEN) {
+  try { require("dotenv").config({ path: path.join(__dirname, "../.env") }); } catch {}
+}
+
 // ── Configuration ─────────────────────────────────────────────────────────────
 const AMBER_TOKEN = process.env.AMBER_API_TOKEN;
 const AMBER_SITE_ID = process.env.AMBER_SITE_ID || "01KMN0H71HS5SYAE5P3E9WDGCD";
@@ -1116,7 +1121,16 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   // ── Priority 3: Ultra-cheap price charging (currentPrice <= 7¢) ──────────
   // Uses actual buy price (perKwh) — not spot price — so decisions match what you actually pay.
   // Guard: never charge during demand window (handled in priority 1)
+  // Guard: skip grid charging if PV already covers the full charger capacity (PV surplus >= MAX_CHARGE_KW).
+  //   In that case, Self-use mode charges battery from PV for free — no need to pull from grid.
   if (gridHeadroomOk && !currentDemand && currentPrice <= ULTRACHEAP_PRICE_C && soc < SOC_MAX_CHARGE) {
+    const pvSurplusNow = Math.max(0, (pvPower ?? 0) - (ess.homeLoad ?? 0));
+    if (pvSurplusNow >= MAX_CHARGE_KW) {
+      // PV fully covers charger — switch to Self-use, free solar beats ultra-cheap grid
+      targetMode = MODE.SELF_USE;
+      reason = `buy=${currentPrice.toFixed(2)}c (≤${ULTRACHEAP_PRICE_C}c ultra-cheap) but PV surplus ${pvSurplusNow.toFixed(1)}kW >= ${MAX_CHARGE_KW}kW — Self-use, charging from solar for free`;
+      return { targetMode, reason, alert };
+    }
     targetMode = MODE.BACKUP;
     reason = `buy=${currentPrice.toFixed(2)}c (≤${ULTRACHEAP_PRICE_C}c ultra-cheap) — charging (SOC ${soc}% -> ${SOC_MAX_CHARGE}%)`;
     return { targetMode, reason, alert };
@@ -1245,10 +1259,15 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   // Exception: keep buying if price is ultra-cheap (<=7c) AND PV surplus is small (<1kW) —
   //   in that case grid top-up is still worthwhile.
   const pvSurplusKw = Math.max(0, pvPowerVal2 - homeLoadVal2);
-  const PV_ONLY_SOC_MIN   = 65;  // % — don't switch to PV-only if SOC is still low
   const PV_ONLY_SURPLUS_KW = 1.0; // kW — require at least this much PV headroom above homeLoad
-  const pvOnlyCondition = pvSurplusKw >= PV_ONLY_SURPLUS_KW
-    && soc >= PV_ONLY_SOC_MIN
+  // PV-only condition: switch to Self-use when PV can cover home load + battery charge on its own.
+  // Two tiers:
+  //   1. Large PV surplus (>= MAX_CHARGE_KW = 5kW above homeLoad): PV can fully saturate charger → no grid needed at any SOC.
+  //   2. Moderate PV surplus (>= 1kW): no grid charge if SOC >= 50% (enough reserve already built up).
+  // Exception: keep grid charging if price is ultra-cheap (<=7c) AND surplus is small (<1kW).
+  const pvFullyCovering = pvSurplusKw >= MAX_CHARGE_KW; // PV surplus > max charger power → grid contribution = 0
+  const pvModerateSoc   = pvSurplusKw >= PV_ONLY_SURPLUS_KW && soc >= 50;
+  const pvOnlyCondition = (pvFullyCovering || pvModerateSoc)
     && !currentDemand
     && !(currentPrice <= ULTRACHEAP_PRICE_C && pvSurplusKw < PV_ONLY_SURPLUS_KW); // allow ultra-cheap if big surplus
   if (pvOnlyCondition && state.currentMode === MODE.BACKUP) {
