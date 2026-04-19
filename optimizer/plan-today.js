@@ -532,25 +532,46 @@ async function applyPlanToInverter(intervals, today) {
     console.log('[INVERTER] No charge slots today — collapsing charge window');
   }
 
-  // ── Sell window: collapsed here, demand-mode-manager handles sell dynamically ──
-  // Sell decisions are real-time (price-dependent), so we don't pre-set a sell window.
-  // demand-mode-manager cron will open/close sell window as needed.
-  console.log('[INVERTER] Sell window: managed dynamically by demand-mode-manager (collapsed for now)');
+  // ── Sell window: first contiguous sell block only (inverter supports one sell window) ──
+  // Take the earliest sell slot and run to 21:00 (demand-mode-manager will fine-tune power).
+  // If there are two separate sell blocks (e.g. 07:30 and 17:00), we use the later one that
+  // starts after the charge window, to avoid covering non-sell hours.
+  let sellStartHHMM = '0000';
+  let sellEndHHMM   = '0000';
+  let sellKw        = 5;
+
+  if (sellSlots.length > 0) {
+    // Prefer sell window that starts at or after charge end (evening peak), fallback to earliest
+    const chargeEndMins = chargeEndHHMM === '0000' ? 0
+      : parseInt(chargeEndHHMM.substring(0,2))*60 + parseInt(chargeEndHHMM.substring(2,4));
+    const eveningSell = sellSlots.find(s => {
+      const sh = parseInt(s.nemTime.substring(11,13));
+      const sm = parseInt(s.nemTime.substring(14,16));
+      return sh*60+sm >= chargeEndMins;
+    });
+    const useSell = eveningSell ?? sellSlots[0];
+    const fh = parseInt(useSell.nemTime.substring(11,13));
+    const fm = parseInt(useSell.nemTime.substring(14,16));
+    sellStartHHMM = hhmm(fh, fm);
+    sellEndHHMM   = '2100';
+    console.log(`[INVERTER] Sell window: ${sellStartHHMM}–${sellEndHHMM}, power=${sellKw}kW`);
+  } else {
+    console.log('[INVERTER] No sell slots today — collapsing sell window');
+  }
 
   // ── Write to inverter (Timed mode) ────────────────────────────────────────
-  // Timed mode with charge window set. Outside the window, inverter holds — no grid charge.
-  // Sell window is cleared here; demand-mode-manager opens it in real time.
+  // Both charge and sell windows set. Outside windows = Self-use (no grid charge, no forced discharge).
   const steps = [
     { label: `syncClock=${clockStr}`,          fn: () => httpsPost('https://eu.ess-link.com/api/app/deviceInfo/setDeviceDateParam', { data: clockStr, macHex: ESS_MAC_HEX, index: '0x3050' }, ESS_HEADERS).then(r => r.code === 200).catch(() => false) },
     { label: 'mode=Timed(1)',                  fn: () => setParam('0x300C', 1) },
-    // Charge window (plan-defined)
+    // Charge window
     { label: `chargeStart=${chargeStartHHMM}`, fn: () => setParam('0xC014', chargeStartHHMM) },
     { label: `chargeEnd=${chargeEndHHMM}`,     fn: () => setParam('0xC016', chargeEndHHMM) },
     { label: `chargeKw=${chargeKw}`,           fn: () => setParam('0xC0BA', chargeKw) },
-    // Sell window: collapse (demand-mode-manager will set when needed)
-    { label: 'sellStart=0000',                 fn: () => setParam('0xC018', '0000') },
-    { label: 'sellEnd=0000',                   fn: () => setParam('0xC01A', '0000') },
-    { label: 'sellKw=0',                       fn: () => setParam('0xC0BC', 0) },
+    // Sell window
+    { label: `sellStart=${sellStartHHMM}`,     fn: () => setParam('0xC018', sellStartHHMM) },
+    { label: `sellEnd=${sellEndHHMM}`,         fn: () => setParam('0xC01A', sellEndHHMM) },
+    { label: `sellKw=${sellKw}`,               fn: () => setParam('0xC0BC', sellKw) },
     // Common
     { label: 'otherMode=0',                    fn: () => setParam('0x314E', 0) },
     { label: 'weekdays=all',                   fn: () => setWeekParam('0xC0B4', [1,2,3,4,5,6,0]) },
