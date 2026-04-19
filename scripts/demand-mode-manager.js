@@ -1792,7 +1792,7 @@ async function main() {
     }
     // Even during blip, write ESS data to DB if available (Amber data was fetched concurrently)
     if (ess?.soc != null) {
-      const blipPvPower = getPvPower(ess);
+      const blipPvPower = calcPVPower(ess);
       appendLog({
         ts: now.toISOString(), nemTime: null,
         soc: ess.soc, battPower: ess.battPower, homeLoad: ess.homeLoad,
