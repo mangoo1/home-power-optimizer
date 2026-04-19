@@ -108,6 +108,14 @@ function findVal(items, index) {
   return item?.value ?? null;
 }
 
+function findValStr(items, index) {
+  if (!items) return null;
+  const item = Array.isArray(items) ? items.find(i => i.index === index) : items[index];
+  // valueStr is more reliable for PV power (avoids float encoding bug where value=0 but valueStr="3.29")
+  const v = parseFloat(item?.valueStr ?? item?.value ?? null);
+  return isNaN(v) ? null : v;
+}
+
 async function setParam(index, data) {
   if (!ESS_TOKEN) return false;
   try {
@@ -235,10 +243,11 @@ async function main() {
   console.log(`[${now.toISOString()}] === selling-monitor ===`);
 
   // Fetch ESS + Amber data concurrently
-  const [battery, load, meter, amberRaw] = await Promise.all([
+  const [battery, load, meter, pv, amberRaw] = await Promise.all([
     essGet("getBatteryInfo"),
     essGet("getLoadInfo"),
     essGet("getMeterInfo"),
+    essGet("getPhotovoltaicInfo"),
     httpsGet(
       `https://api.amber.com.au/v1/sites/${AMBER_SITE_ID}/prices/current?resolution=30&next=4`,
       { Authorization: `Bearer ${AMBER_TOKEN}` }
@@ -248,12 +257,15 @@ async function main() {
   const soc       = findVal(battery, "0x1212");
   const battPower = findVal(battery, "0x1210");  // kW: positive=charging, negative=discharging
   const homeLoad  = findVal(load,    "0x1274");  // kW
-  const gridPower = findVal(meter,   "0xA112");  // kW: negative=import, positive=export
+  const gridPower = findVal(meter,   "0xA112");  // kW: negative=export, positive=import
 
-  // Estimate PV: homeLoad = pvPower + battDischarge + gridImport
-  const battDischarge = battPower != null ? -battPower : 0;
-  const gridImport    = gridPower != null ? gridPower  : 0;
-  const pvPower       = Math.max(0, (homeLoad ?? 0) - battDischarge - gridImport);
+  // PV: use direct API read (valueStr avoids float encoding bug where value=0 but valueStr="3.29")
+  // Fallback: estimate from energy balance (homeLoad + gridExport - battCharge)
+  const pvDirect = findValStr(pv, "0x1270");
+  const battCharge  = battPower != null ? Math.max(0, battPower) : 0;
+  const gridExport  = gridPower != null ? Math.max(0, -gridPower) : 0;  // gridPower<0 = exporting
+  const pvEstimate  = Math.max(0, (homeLoad ?? 0) + gridExport - battCharge);
+  const pvPower     = pvDirect ?? pvEstimate;
 
   // Parse Amber response
   const general  = Array.isArray(amberRaw) ? amberRaw.filter(p => p.channelType === "general") : [];
