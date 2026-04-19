@@ -2021,12 +2021,7 @@ async function main() {
   //   2. Dense logging window (2026-04-02 → 2026-04-16, 14 days): every 5-min run.
   //      Storage: 288 records/day × ~650 bytes ≈ 187 KB/day → ~2.6 MB total (SQLite ~4-5MB).
   //   3. After dense window: fall back to :01/:31 half-hour scheduled intervals.
-  const minOfHour = now.getMinutes();
-  const DENSE_LOG_END   = new Date('2026-04-16T00:00:00+11:00');
-  const inDenseWindow   = now < DENSE_LOG_END;
-  const isScheduledInterval = minOfHour === 1 || minOfHour === 31;
-  // ⚠️  Keep `modeChanged` as an independent OR — never fold it into inDenseWindow/isScheduledInterval.
-  const shouldLog = inDenseWindow || isScheduledInterval || modeChanged;
+  const shouldLog = true; // log every 5-min cron run (cron handles the interval)
 
   if (!shouldLog) {
     console.log(`[SKIP] Not a log interval (:${String(minOfHour).padStart(2,'0')}, no mode change) — skipping DB write`);
@@ -2035,8 +2030,8 @@ async function main() {
   }
 
   if (modeChanged) console.log(`[LOG] Mode change triggered record`);
-  else if (inDenseWindow) console.log(`[LOG] 5-min record (:${String(minOfHour).padStart(2,'0')})`);
-  else console.log(`[LOG] Scheduled record (~${isScheduledInterval ? 'half-hour' : 'on-the-hour'})`);
+  console.log(`[LOG] 5-min record (:${String(now.getMinutes()).padStart(2,'0')})`);
+
 
   const record = {
     ts: now.toISOString(),
@@ -2077,7 +2072,7 @@ async function main() {
     todayHomeKwh:      ess.todayHomeKwh      ?? null,
     todayCarbonKg:     ess.todayCarbonKg     ?? null,
     reportedMode:      ess.reportedMode      ?? null,
-    recordTrigger: modeChanged ? "mode_change" : isScheduledInterval ? "scheduled" : "5min",
+    recordTrigger: modeChanged ? "mode_change" : "5min",
     // Timed mode charge/discharge power set this interval (null if not in charge/sell mode)
     chargeKw:    state.currentMode === MODE.BACKUP  ? (chargeThrottled ? THROTTLE_CHARGE_KW : calcChargeKw(ess.homeLoad, pvPower)) : null,
     dischargeKw: state.currentMode === MODE.SELLING ? 5.0 : null,
