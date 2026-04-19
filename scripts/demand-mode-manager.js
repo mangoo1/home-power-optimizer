@@ -636,7 +636,77 @@ function calcChargeKw(homeLoad, pvPower) {
   return parseFloat(chargeKw.toFixed(2));
 }
 
-async function setChargingMode(homeLoad, pvPower, nextDemandMinutes, throttled = false, planOverrideKw = null) {
+/**
+ * calcOptimalChargeKw — dynamic charge power optimized for solar-first + price-aware charging.
+ *
+ * Strategy:
+ *   1. PV surplus first: always absorb PV that would otherwise be exported at low feedIn price.
+ *   2. Grid supplement: only add grid power if PV alone can't meet the minimum required rate
+ *      to reach SOC target by cutoff hour. Grid contribution scales with price (cheaper = more).
+ *   3. Result is capped by inverter max (5kW) and breaker headroom.
+ *
+ * @param {number} homeLoad      - kW current home consumption
+ * @param {number} pvPower       - kW current PV generation
+ * @param {number} soc           - % current state of charge
+ * @param {number} socTarget     - % target SOC to reach by cutoffHour
+ * @param {number} cutoffHour    - Sydney hour to reach target (e.g. 15)
+ * @param {number} buyPrice      - c/kWh current grid buy price
+ * @param {number} cheapCeiling  - c/kWh price threshold for full-speed grid charge (e.g. 7c)
+ * @returns {{ chargeKw: number, pvKw: number, gridKw: number, reason: string }}
+ */
+function calcOptimalChargeKw(homeLoad, pvPower, soc, socTarget, cutoffHour, buyPrice, cheapCeiling = 7) {
+  const BATT_KWH       = BATTERY_CAPACITY;  // 42 kWh
+  const BATT_EFF       = 0.95;              // round-trip efficiency
+
+  // How much energy still needed?
+  const kwhNeeded = Math.max(0, (socTarget - soc) / 100 * BATT_KWH);
+
+  // Hours remaining until cutoff
+  const nowSyd = new Date(new Date().toLocaleString('en-US', { timeZone: 'Australia/Sydney' }));
+  const hoursLeft = Math.max(0.08, cutoffHour - nowSyd.getHours() - nowSyd.getMinutes() / 60);
+
+  // Minimum charge rate to hit target on time
+  const minRequiredKw = Math.min(MAX_CHARGE_KW, (kwhNeeded / BATT_EFF) / hoursLeft);
+
+  // PV surplus available for battery (after home load)
+  const pvSurplus = Math.max(0, (pvPower ?? 0) - (homeLoad ?? 0));
+
+  // PV contribution: up to MAX_CHARGE_KW, limited by what the inverter can absorb
+  const pvChargeKw = Math.min(MAX_CHARGE_KW, pvSurplus);
+
+  // Grid supplement: only what PV can't cover, scaled by price
+  // - Price <= cheapCeiling (e.g. 7c): supplement up to full required rate
+  // - Price 7-12c: partial supplement proportional to price (more expensive = less grid)
+  // - Price > 12c: no grid charging (rely on PV only)
+  let gridChargeKw = 0;
+  const gridNeeded = Math.max(0, minRequiredKw - pvChargeKw);
+  if (gridNeeded > 0) {
+    if (buyPrice <= cheapCeiling) {
+      gridChargeKw = gridNeeded; // full supplement at cheap price
+    } else if (buyPrice <= 12) {
+      // Linear scale: at 7c → 100%, at 12c → 0%
+      const priceFactor = 1 - (buyPrice - cheapCeiling) / (12 - cheapCeiling);
+      gridChargeKw = gridNeeded * priceFactor;
+    }
+    // > 12c: gridChargeKw stays 0
+  }
+
+  // Total charge = PV + grid, capped at inverter max and breaker headroom
+  const breakerHeadroom = Math.max(0, MAX_GRID_TARGET - Math.max(0, (homeLoad ?? 0) - (pvPower ?? 0)) - CHARGE_SAFETY_BUFFER);
+  const totalChargeKw = Math.min(MAX_CHARGE_KW, pvChargeKw + gridChargeKw, breakerHeadroom);
+
+  const reason = `SOC:${soc}%→${socTarget}% in ${hoursLeft.toFixed(1)}h, need ${kwhNeeded.toFixed(1)}kWh, minRate:${minRequiredKw.toFixed(2)}kW | PV surplus:${pvSurplus.toFixed(1)}kW→pvCharge:${pvChargeKw.toFixed(2)}kW + grid:${gridChargeKw.toFixed(2)}kW @ ${buyPrice.toFixed(1)}¢ = total:${totalChargeKw.toFixed(2)}kW`;
+
+  return {
+    chargeKw: parseFloat(totalChargeKw.toFixed(2)),
+    pvKw:     parseFloat(pvChargeKw.toFixed(2)),
+    gridKw:   parseFloat(gridChargeKw.toFixed(2)),
+    reason,
+  };
+}
+
+async function setChargingMode(homeLoad, pvPower, nextDemandMinutes, throttled = false, planOverrideKw = null, opts = {}) {
+  // opts: { soc, socTarget, cutoffHour, buyPrice } — used by calcOptimalChargeKw
   let chargeKw;
   const netDraw = (homeLoad ?? 0) - (pvPower ?? 0);
 
@@ -650,6 +720,11 @@ async function setChargingMode(homeLoad, pvPower, nextDemandMinutes, throttled =
     console.log(`[BUY] chargeKw=${chargeKw.toFixed(2)}kW (plan=${planOverrideKw.toFixed(2)}kW, realtime=${dynKw.toFixed(2)}kW, using min)`);
   } else if (throttled) {
     chargeKw = THROTTLE_CHARGE_KW;
+  } else if (opts.soc != null && opts.cutoffHour != null && opts.buyPrice != null) {
+    // Solar-first + price-aware optimal charge
+    const optimal = calcOptimalChargeKw(homeLoad, pvPower, opts.soc, opts.socTarget ?? 85, opts.cutoffHour, opts.buyPrice);
+    chargeKw = optimal.chargeKw;
+    console.log(`[BUY-OPT] ${optimal.reason}`);
   } else {
     chargeKw = calcChargeKw(homeLoad, pvPower);
   }
@@ -708,7 +783,7 @@ async function getGridPower() {
 // For Charging mode (BACKUP), uses the Timed charge setup with dynamic power calc.
 // Also verifies grid is actually exporting (gridPower > 0) for Selling.
 // Returns true if mode was confirmed, false if all attempts failed.
-async function setModeWithVerify(targetMode, { homeLoad, pvPower, nextDemandMinutes, sellPowerKw, throttled = false, planChargeKw = null } = {}) {
+async function setModeWithVerify(targetMode, { homeLoad, pvPower, nextDemandMinutes, sellPowerKw, throttled = false, planChargeKw = null, chargeOpts = {} } = {}) {
   const label = MODE_LABEL[targetMode] ?? targetMode;
   const isTimed = targetMode === MODE.SELLING || targetMode === MODE.BACKUP;
   const maxAttempts = isTimed ? 2 : 5; // Timed setup: max 2 (multi-step × 2 costly); Self-use/others: up to 5
@@ -722,7 +797,7 @@ async function setModeWithVerify(targetMode, { homeLoad, pvPower, nextDemandMinu
     if (targetMode === MODE.SELLING) {
       ok = await setSellingMode(nextDemandMinutes, sellPowerKw);
     } else if (targetMode === MODE.BACKUP) {
-      ok = await setChargingMode(homeLoad, pvPower, nextDemandMinutes, throttled, planChargeKw);
+      ok = await setChargingMode(homeLoad, pvPower, nextDemandMinutes, throttled, planChargeKw, chargeOpts);
       if (!ok) {
         console.warn(`[WARN] Charging setup skipped or failed (attempt ${attempt}/${maxAttempts})`);
         if (attempt < maxAttempts) await new Promise(r => setTimeout(r, 3000));
@@ -1824,7 +1899,7 @@ async function main() {
 
   if (targetMode !== null && targetMode !== state.currentMode) {
     console.log(`[ACTION] ${MODE_LABEL[state.currentMode] ?? "unknown"} -> ${MODE_LABEL[targetMode]}: ${reason}`);
-    const ok = await setModeWithVerify(targetMode, { homeLoad: ess.homeLoad, pvPower, nextDemandMinutes: amber.nextDemandMinutes, sellPowerKw: alert?.sellPowerKw, throttled: chargeThrottled, planChargeKw: alert?.planChargeKwOverride ?? planSlotChargeKw });
+    const ok = await setModeWithVerify(targetMode, { homeLoad: ess.homeLoad, pvPower, nextDemandMinutes: amber.nextDemandMinutes, sellPowerKw: alert?.sellPowerKw, throttled: chargeThrottled, planChargeKw: alert?.planChargeKwOverride ?? planSlotChargeKw, chargeOpts: { soc: ess.soc, socTarget: todayPlan?.socTarget ?? 85, cutoffHour: todayPlan?.chargeCutoffHour ?? 18, buyPrice: currentPrice } });
     if (ok) {
       state.currentMode = targetMode;
       state.lastSwitchTime = now.toISOString();
@@ -1895,8 +1970,17 @@ async function main() {
       await setParam('0xC018', '0000');
       await setParam('0xC01A', '0000');
       await setParam('0xC0BC', 0); // ensure discharge power is zero while charging
-      // Recalculate and update charge power based on current load/PV (throttle if cheaper slot coming)
-      const chargeKw = chargeThrottled ? THROTTLE_CHARGE_KW : calcChargeKw(ess.homeLoad, pvPower);
+      // Recalculate and update charge power based on current load/PV — solar-first + price-aware
+      let chargeKw;
+      if (chargeThrottled) {
+        chargeKw = THROTTLE_CHARGE_KW;
+      } else if (ess.soc != null && todayPlan?.chargeCutoffHour != null) {
+        const optimal = calcOptimalChargeKw(ess.homeLoad, pvPower, ess.soc, todayPlan.socTarget ?? 85, todayPlan.chargeCutoffHour, currentPrice);
+        chargeKw = optimal.chargeKw;
+        console.log(`[BUY-OPT] ${optimal.reason}`);
+      } else {
+        chargeKw = calcChargeKw(ess.homeLoad, pvPower);
+      }
       const minKwForUpdate = chargeThrottled ? 0.1 : MIN_CHARGE_KW;
       const buyTag = chargeThrottled ? '[BUY-THROTTLE]' : '[BUY]';
       if (chargeKw >= minKwForUpdate) {
