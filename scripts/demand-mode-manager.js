@@ -1751,9 +1751,13 @@ async function main() {
       blipSoc = lastRow?.soc ?? null;
     } catch(e) {}
     const blipHourNow = nowSyd.getHours();
+    const blipMinNow  = nowSyd.getMinutes();
     const socFull = blipSoc !== null && blipSoc >= 80;
     const pastCheapWindow = blipHourNow >= 16; // after 16:00 prices start rising
-    const shouldStopCharging = socFull && pastCheapWindow;
+    // Also stop if past plan's chargeCutoffHour (e.g. 15:00 today)
+    const planCutoff = blipPlan?.chargeCutoffHour ?? 18;
+    const pastPlanCutoff = blipHourNow > planCutoff || (blipHourNow === planCutoff && blipMinNow >= 0);
+    const shouldStopCharging = (socFull && pastCheapWindow) || pastPlanCutoff;
 
     if (blipState.currentMode === MODE.SELLING) {
       // Keep sell session alive
