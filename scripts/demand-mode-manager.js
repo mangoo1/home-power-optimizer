@@ -1790,10 +1790,33 @@ async function main() {
       await setModeWithVerify(MODE.SELF_USE);
       console.log(`[DONE] (Amber blip — falling back to Self-use, no plan charge action for ${blipSlotKey})`);
     }
+    // Even during blip, write ESS data to DB if available (Amber data was fetched concurrently)
+    if (ess?.soc != null) {
+      const blipPvPower = getPvPower(ess);
+      appendLog({
+        ts: now.toISOString(), nemTime: null,
+        soc: ess.soc, battPower: ess.battPower, homeLoad: ess.homeLoad,
+        pvPower: blipPvPower, gridPower: ess.gridPower,
+        buyPrice: null, feedInPrice: null, spotPrice: null,
+        demandWindow: false, mode: blipState.currentMode, modeChanged: false,
+        modeReason: 'amber-blip', renewables: null, alert: null,
+        meterBuyTotal: ess.purchasedTotal ?? null, meterSellTotal: ess.feedInTotal ?? null,
+        battVoltage: ess.battVoltage ?? null, battCurrent: ess.battCurrent ?? null,
+        flowPV: null, flowGrid: null, flowBattery: null, flowLoad: null,
+        todayChargeKwh: null, todayDischargeKwh: null, todayPvKwh: null,
+        todayGridBuyKwh: null, todayGridSellKwh: null, todayHomeKwh: null, todayCarbonKg: null,
+        amberDescriptor: null, amberTariffPeriod: null,
+        amberClPrice: null, amberClDescriptor: null, amberClTariffPeriod: null,
+        amberFeedInPrice: null, amberSpotPrice: null,
+        nextDemandMin: null, reportedMode: blipState.currentMode,
+        intervalBuyAud: null, intervalSellAud: null, intervalNetAud: null,
+        meterBuyDelta: null, meterSellDelta: null, recordTrigger: 'amber-blip',
+        chargeKw: null, dischargeKw: null, modeVerifyOk: null, modeFrom: null, modeTo: null,
+        solarWm2: null, cloudCoverPct: null,
+      });
+    }
     return;
   }
-
-  // Cache this valid Amber response for stale-data tolerance
   {
     const cacheState = loadState();
     cacheState.lastAmberData = {
