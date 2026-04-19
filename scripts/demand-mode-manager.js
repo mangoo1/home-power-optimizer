@@ -1768,10 +1768,18 @@ async function main() {
       await setModeWithVerify(MODE.SELF_USE);
       console.log(`[DONE] (Amber blip — SOC ${blipSoc}% full + hour=${blipHourNow} >= 16, stopping charge → Self-use)`);
     } else if (blipState.currentMode === MODE.BACKUP || blipState.currentMode === 1) {
-      // Already charging and still in cheap window — keep charging
-      const planChargeKw = blipSlot?.chargeKw ?? null;
-      await setModeWithVerify(MODE.BACKUP, { planChargeKw });
-      console.log(`[DONE] (Amber blip — already charging, hold charge mode chargeKw=${planChargeKw ?? 'auto'})`);
+      // Already charging — only keep charging if cache is fresh (< 15 min) AND in plan window
+      // If cache is stale (>= 15 min), too risky: switch to Self-use to avoid buying expensive grid power
+      const blipCacheAge = blipState.lastAmberData
+        ? (Date.now() - new Date(blipState.lastAmberData.ts).getTime()) / 60000 : 999;
+      if (blipCacheAge < 15 && blipInChargeWindow) {
+        const planChargeKw = blipSlot?.chargeKw ?? null;
+        await setModeWithVerify(MODE.BACKUP, { planChargeKw });
+        console.log(`[DONE] (Amber blip — cache fresh ${blipCacheAge.toFixed(0)}min, in charge window, holding charge)`);
+      } else {
+        await setModeWithVerify(MODE.SELF_USE);
+        console.log(`[DONE] (Amber blip — cache stale ${blipCacheAge.toFixed(0)}min or not in charge window → Self-use, safer than risking expensive grid charge)`);
+      }
     } else if (blipInChargeWindow || blipAction === 'charge') {
       // Plan explicitly says charge in this window — keep/start charging
       const planChargeKw = blipSlot?.chargeKw ?? null;
