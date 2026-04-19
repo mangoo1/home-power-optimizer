@@ -129,10 +129,12 @@ function httpsGet(url, headers = {}) {
 
 // ── Fetch Amber prices ────────────────────────────────────────────────────────
 async function fetchAmberPrices() {
-  const data = await httpsGet(
+  const raw = await httpsGet(
     `https://api.amber.com.au/v1/sites/${AMBER_SITE_ID}/prices/current?next=350`,
     { Authorization: `Bearer ${AMBER_TOKEN}` }
   );
+  const data = Array.isArray(raw) ? raw : [];
+  if (!data.length) { console.warn('⚠️  Amber returned no price data'); }
   // Group by nemTime
   const byTime = {};
   data.forEach(x => {
@@ -421,6 +423,154 @@ async function main() {
 
   console.log(`\n✅ Plan v${newVersion} saved to DB (source=rules, hasDW=${hasDW}, chargeWindows=${chargeWindow.length})`);
   db.close();
+
+  // ── 6. Apply plan to inverter ──────────────────────────────────────────────
+  await applyPlanToInverter(intervals, today);
+}
+
+// ── Inverter helpers ──────────────────────────────────────────────────────────
+const ESS_TOKEN    = process.env.ESS_TOKEN;
+const ESS_MAC_HEX  = process.env.ESS_MAC_HEX  || '00534E0045FF';
+const ESS_STATION  = process.env.ESS_STATION_SN || 'EU1774416396356';
+const ESS_HEADERS  = { Authorization: ESS_TOKEN, lang: 'en', showloading: 'false',
+                       Referer: 'https://eu.ess-link.com/appViews/appHome',
+                       'User-Agent': 'Mozilla/5.0', 'Content-Type': 'application/json' };
+
+function httpsPost(url, body, headers) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const data = JSON.stringify(body);
+    const req = https.request({
+      hostname: u.hostname, path: u.pathname + u.search, method: 'POST',
+      headers: { ...headers, 'Content-Length': Buffer.byteLength(data) }
+    }, res => { let d = ''; res.on('data', c => d += c); res.on('end', () => { try { resolve(JSON.parse(d)); } catch { resolve({}); } }); });
+    req.on('error', reject);
+    req.write(data);
+    req.end();
+  });
+}
+
+async function setParam(index, data) {
+  try {
+    const r = await httpsPost('https://eu.ess-link.com/api/app/deviceInfo/setDeviceParam',
+      { macHex: ESS_MAC_HEX, index, data }, ESS_HEADERS);
+    return r.code === 200;
+  } catch { return false; }
+}
+
+async function setWeekParam(index, days) {
+  try {
+    const r = await httpsPost('https://eu.ess-link.com/api/app/deviceInfo/setDeviceWeekParam',
+      { macHex: ESS_MAC_HEX, index, data: days }, ESS_HEADERS);
+    return r.code === 200;
+  } catch { return false; }
+}
+
+async function setDateParam(index, dateStr) {
+  try {
+    const r = await httpsPost('https://eu.ess-link.com/api/app/deviceInfo/setDeviceDateOrTimeParam',
+      { macHex: ESS_MAC_HEX, index, data: dateStr }, ESS_HEADERS);
+    return r.code === 200;
+  } catch { return false; }
+}
+
+function fmt2(n) { return String(n).padStart(2, '0'); }
+function hhmm(h, m = 0) { return fmt2(h) + fmt2(m); }
+
+/**
+ * Apply today's plan directly to the inverter:
+ * - Set charge window = first charge slot start → last charge slot end
+ * - Set sell window   = first sell slot start  → last sell slot end (capped at 21:00)
+ * - Non-charge/sell time: collapse windows → inverter stays in Self-use with no grid activity
+ * - Mode is always set to Timed(1) so the windows are respected
+ */
+async function applyPlanToInverter(intervals, today) {
+  if (!ESS_TOKEN) { console.log('[INVERTER] ESS_TOKEN not set, skipping inverter apply'); return; }
+
+  console.log('\n[INVERTER] Applying plan to inverter...');
+
+  // Collect charge slots and sell slots for today
+  const todayIntervals = intervals.filter(i => i.key.startsWith(today));
+  const chargeSlots = todayIntervals.filter(i => i.action === 'charge' || i.action === 'charge+hw');
+  const sellSlots   = todayIntervals.filter(i => i.action === 'sell');
+
+  // Sydney "now" for clock sync
+  const now = new Date();
+  const sydStr = now.toLocaleString('en-AU', { timeZone: 'Australia/Sydney', hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  // Format: dd/mm/yyyy, hh:mm:ss → yyyyMMdd HHmmss
+  const [datePart, timePart] = sydStr.split(', ');
+  const [dd, mm, yyyy] = datePart.split('/');
+  const clockStr = `${yyyy}${mm}${dd} ${timePart.replace(/:/g, '')}`;
+  const yd = new Date(now); yd.setDate(yd.getDate() - 1);
+  const td = new Date(now); td.setDate(td.getDate() + 1);
+  const yesterday = yd.toISOString().substring(0, 10);
+  const tomorrow  = td.toISOString().substring(0, 10);
+
+  // ── Charge window ─────────────────────────────────────────────────────────
+  let chargeStartHHMM = '0000';
+  let chargeEndHHMM   = '0000';
+  let chargeKw        = 0;
+
+  if (chargeSlots.length > 0) {
+    // Parse start time from first charge slot's nemTime (e.g. "2026-04-20T09:30:00+10:00")
+    const firstNem = chargeSlots[0].nemTime;
+    const lastNem  = chargeSlots[chargeSlots.length - 1].nemTime;
+    const fh = parseInt(firstNem.substring(11, 13));
+    const fm = parseInt(firstNem.substring(14, 16));
+    // End = last slot start + 30min
+    const lh = parseInt(lastNem.substring(11, 13));
+    const lm = parseInt(lastNem.substring(14, 16));
+    const endMins = lh * 60 + lm + 30;
+    chargeStartHHMM = hhmm(fh, fm);
+    chargeEndHHMM   = hhmm(Math.floor(endMins / 60), endMins % 60);
+    // Use minimum chargeKw across slots (conservative — cron will adjust up/down)
+    chargeKw = Math.min(...chargeSlots.map(s => s.chargeKw ?? 5));
+    chargeKw = Math.max(0.5, parseFloat(chargeKw.toFixed(2)));
+    console.log(`[INVERTER] Charge window: ${chargeStartHHMM}–${chargeEndHHMM}, power=${chargeKw}kW`);
+  } else {
+    console.log('[INVERTER] No charge slots today — collapsing charge window');
+  }
+
+  // ── Sell window: collapsed here, demand-mode-manager handles sell dynamically ──
+  // Sell decisions are real-time (price-dependent), so we don't pre-set a sell window.
+  // demand-mode-manager cron will open/close sell window as needed.
+  console.log('[INVERTER] Sell window: managed dynamically by demand-mode-manager (collapsed for now)');
+
+  // ── Write to inverter (Timed mode) ────────────────────────────────────────
+  // Timed mode with charge window set. Outside the window, inverter holds — no grid charge.
+  // Sell window is cleared here; demand-mode-manager opens it in real time.
+  const steps = [
+    { label: `syncClock=${clockStr}`,          fn: () => httpsPost('https://eu.ess-link.com/api/app/deviceInfo/setDeviceDateParam', { data: clockStr, macHex: ESS_MAC_HEX, index: '0x3050' }, ESS_HEADERS).then(r => r.code === 200).catch(() => false) },
+    { label: 'mode=Timed(1)',                  fn: () => setParam('0x300C', 1) },
+    // Charge window (plan-defined)
+    { label: `chargeStart=${chargeStartHHMM}`, fn: () => setParam('0xC014', chargeStartHHMM) },
+    { label: `chargeEnd=${chargeEndHHMM}`,     fn: () => setParam('0xC016', chargeEndHHMM) },
+    { label: `chargeKw=${chargeKw}`,           fn: () => setParam('0xC0BA', chargeKw) },
+    // Sell window: collapse (demand-mode-manager will set when needed)
+    { label: 'sellStart=0000',                 fn: () => setParam('0xC018', '0000') },
+    { label: 'sellEnd=0000',                   fn: () => setParam('0xC01A', '0000') },
+    { label: 'sellKw=0',                       fn: () => setParam('0xC0BC', 0) },
+    // Common
+    { label: 'otherMode=0',                    fn: () => setParam('0x314E', 0) },
+    { label: 'weekdays=all',                   fn: () => setWeekParam('0xC0B4', [1,2,3,4,5,6,0]) },
+    { label: `startDate=${yesterday}`,         fn: () => setDateParam('0xC0B6', yesterday) },
+    { label: `endDate=${tomorrow}`,            fn: () => setDateParam('0xC0B8', tomorrow) },
+  ];
+
+  let allOk = true;
+  for (const step of steps) {
+    const ok = await step.fn();
+    console.log(`[INVERTER]   ${step.label} → ${ok ? 'OK' : 'FAILED'}`);
+    if (!ok) allOk = false;
+    await new Promise(r => setTimeout(r, 400));
+  }
+
+  if (allOk) {
+    console.log('[INVERTER] ✅ Inverter configured successfully');
+  } else {
+    console.warn('[INVERTER] ⚠️ Some steps failed — check inverter state');
+  }
 }
 
 main().catch(async e => {
