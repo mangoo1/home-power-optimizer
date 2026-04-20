@@ -1721,9 +1721,9 @@ async function main() {
 
     // Try to follow the daily plan even without live prices
     const blipPlan = loadTodayPlan();
-    const nowSyd = new Date(new Date().toLocaleString('en-AU', { timeZone: 'Australia/Sydney' }));
-    const blipHour = nowSyd.getHours();
-    const blipMin  = nowSyd.getMinutes();
+    const _sydStr = new Date().toLocaleString('en-AU', { timeZone: 'Australia/Sydney', hour: '2-digit', minute: '2-digit', hour12: false });
+    const blipHour = parseInt(_sydStr.split(':')[0], 10);
+    const blipMin  = parseInt(_sydStr.split(':')[1], 10);
     const blipSlotKey = `${String(blipHour).padStart(2,'0')}:${blipMin < 30 ? '00' : '30'}`;
     const blipSlot = blipPlan?.intervals?.find(iv => iv.key === blipSlotKey)
                   || blipPlan?.intervals?.find(iv => iv.key && blipSlotKey.startsWith(iv.key.substring(0,15)));
@@ -1750,8 +1750,8 @@ async function main() {
       const lastRow = db.prepare('SELECT soc FROM energy_log ORDER BY ts DESC LIMIT 1').get();
       blipSoc = lastRow?.soc ?? null;
     } catch(e) {}
-    const blipHourNow = nowSyd.getHours();
-    const blipMinNow  = nowSyd.getMinutes();
+    const blipHourNow = blipHour;
+    const blipMinNow  = blipMin;
     const socFull = blipSoc !== null && blipSoc >= 80;
     const pastCheapWindow = blipHourNow >= 16; // after 16:00 prices start rising
     // Also stop if past plan's chargeCutoffHour (e.g. 15:00 today)
