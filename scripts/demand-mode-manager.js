@@ -1865,14 +1865,14 @@ async function main() {
   // ── Sync state.currentMode from reportedMode ──────────────────────────────
   // The ESS inverter reports mode=1 (Timed) for BOTH charging and selling.
   // We must distinguish them using grid power direction:
-  //   grid < -0.2kW  → exporting → treat as SELLING(6)
-  //   grid >= -0.2kW → not exporting → treat as BACKUP/charging(1)
+  //   grid > 0.2kW   → exporting → treat as SELLING(6)
+  //   grid <= 0.2kW  → not exporting → treat as BACKUP/charging(1)
   // This prevents a "charging exit" from interrupting an active sell session.
   if (ess.reportedMode !== null && ess.reportedMode !== undefined && state.currentMode !== null) {
     if (ess.reportedMode === MODE.TIMED) {
       // Disambiguate Timed: check grid direction
       const gridKw = ess.gridPower ?? 0;
-      const isExporting = gridKw < -0.2; // negative = export
+      const isExporting = gridKw > 0.2; // positive = export (sell to grid)
       const inferredMode = isExporting ? MODE.SELLING : MODE.BACKUP;
       if (state.currentMode !== inferredMode && state.currentMode !== MODE.SELLING && !isExporting) {
         // Only sync BACKUP side (charging→charging is fine); don't clobber SELLING state with BACKUP
