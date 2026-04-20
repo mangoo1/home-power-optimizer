@@ -41,6 +41,8 @@ const SOC_TARGET     = 0.85;    // 充电目标
 const MAX_CHARGE_KW  = 5.0;     // 逆变器最大充电功率
 const MAX_SELL_KW    = 5.0;     // 逆变器最大放电功率
 const BREAKER_KW     = 7.7;     // 主断路器限制
+const PANEL_KWP      = 4.3;     // 系统峰值功率
+const MAX_DAILY_KWH  = 22.0;    // 晴天理论上限（4.3kWp × ~5h 有效日照）
 const CHARGE_BUFFER  = 0.5;     // 充电安全余量 kW
 const BUY_MAX_C      = 12.0;    // 买电上限（超过不充）
 const SELL_MIN_C     = 13.5;    // 卖电下限（低于不卖）
@@ -137,12 +139,20 @@ function calcPvCalibration(db) {
     ORDER BY date
   `).all();
 
+  // 用每小时平均值×1h 计算实际发电量（避免5分钟积分的重复计算误差）
   const actuals = db.prepare(`
-    SELECT date(ts, '+11 hours') as day,
-           SUM(pv_power * 5.0/60.0) as actual_kwh
-    FROM energy_log
-    WHERE ts >= datetime('now', '-15 days')
-      AND pv_power IS NOT NULL
+    WITH hourly AS (
+      SELECT 
+        date(ts, '+11 hours') as day,
+        CAST(strftime('%H', ts, '+11 hours') AS INTEGER) as hour,
+        AVG(pv_power) as avg_kw
+      FROM energy_log
+      WHERE ts >= datetime('now', '-15 days')
+        AND pv_power IS NOT NULL
+      GROUP BY date(ts, '+11 hours'), CAST(strftime('%H', ts, '+11 hours') AS INTEGER)
+    )
+    SELECT day, SUM(avg_kw) as actual_kwh
+    FROM hourly
     GROUP BY day
   `).all();
 
@@ -500,7 +510,7 @@ async function main() {
 
   // 3. 今日 PV 预测（按小时）
   const pvByHour = getPvForecast(db, today, calibFactor);
-  const pvForecastKwh = Object.values(pvByHour).reduce((s, v) => s + v, 0);
+  const pvForecastKwh = Math.min(MAX_DAILY_KWH, Object.values(pvByHour).reduce((s, v) => s + v, 0));
   const pvPeakKw = Math.max(...Object.values(pvByHour), 0);
   console.log(`[PV预测] 今日预计: ${pvForecastKwh.toFixed(1)}kWh, 峰值: ${pvPeakKw.toFixed(2)}kW`);
 
