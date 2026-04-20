@@ -1768,17 +1768,16 @@ async function main() {
       await setModeWithVerify(MODE.SELF_USE);
       console.log(`[DONE] (Amber blip — SOC ${blipSoc}% full + hour=${blipHourNow} >= 16, stopping charge → Self-use)`);
     } else if (blipState.currentMode === MODE.BACKUP || blipState.currentMode === 1) {
-      // Already charging — only keep charging if cache is fresh (< 15 min) AND in plan window
-      // If cache is stale (>= 15 min), too risky: switch to Self-use to avoid buying expensive grid power
-      const blipCacheAge = blipState.lastAmberData
-        ? (Date.now() - new Date(blipState.lastAmberData.ts).getTime()) / 60000 : 999;
-      if (blipCacheAge < 15 && blipInChargeWindow) {
-        const planChargeKw = blipSlot?.chargeKw ?? null;
-        await setModeWithVerify(MODE.BACKUP, { planChargeKw });
-        console.log(`[DONE] (Amber blip — cache fresh ${blipCacheAge.toFixed(0)}min, in charge window, holding charge)`);
+      // Already in Timed/charging mode.
+      // Since plan-today.js sets inverter windows directly, the inverter will charge
+      // on its own schedule — no need for us to intervene during a blip.
+      // Just hold the current mode; only stop if clearly past charge window.
+      if (blipInChargeWindow) {
+        // In plan charge window — inverter handles it, do nothing (don't touch mode)
+        console.log(`[DONE] (Amber blip — in charge window, inverter window set, holding Timed mode)`);
       } else {
         await setModeWithVerify(MODE.SELF_USE);
-        console.log(`[DONE] (Amber blip — cache stale ${blipCacheAge.toFixed(0)}min or not in charge window → Self-use, safer than risking expensive grid charge)`);
+        console.log(`[DONE] (Amber blip — not in charge window → Self-use)`);
       }
     } else if (blipInChargeWindow || blipAction === 'charge') {
       // Plan explicitly says charge in this window — keep/start charging
