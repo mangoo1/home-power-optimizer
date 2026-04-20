@@ -1942,6 +1942,59 @@ async function main() {
       saveState(state);
     }
   }
+  // ── Plan window guard: if inverter windows are set by plan-today.js,
+  // don't override during charge or sell windows — just update power if needed.
+  // ─────────────────────────────────────────────────────────────────────────
+  const _planGuardDb = getDb();
+  const _planGuardToday = new Date().toLocaleDateString('en-CA', { timeZone: 'Australia/Sydney' });
+  const _planGuardPlan = _planGuardDb?.prepare("SELECT intervals_json, charge_windows_json FROM daily_plan WHERE date=? AND is_active=1 ORDER BY rowid DESC LIMIT 1")?.get(_planGuardToday);
+  if (_planGuardPlan) {
+    const _sydTime = new Date().toLocaleString('en-AU', { timeZone: 'Australia/Sydney', hour: '2-digit', minute: '2-digit', hour12: false });
+    const [_gh, _gm] = _sydTime.split(':').map(Number);
+    const _nowMins = _gh * 60 + _gm;
+    const _ivs = JSON.parse(_planGuardPlan.intervals_json);
+    const _curSlot = _ivs.find(i => {
+      if (!i.key.startsWith(_planGuardToday)) return false;
+      const ih = parseInt(i.nemTime.substring(11,13));
+      const im = parseInt(i.nemTime.substring(14,16));
+      return _nowMins >= ih*60+im && _nowMins < ih*60+im+30;
+    });
+    const _inChargeSlot = _curSlot?.action === 'charge' || _curSlot?.action === 'charge+hw';
+    const _inSellSlot   = _curSlot?.action === 'sell';
+
+    if (_inChargeSlot) {
+      // In planned charge window — inverter is handling it via time window.
+      // Only adjust charge power if needed, do NOT switch mode.
+      console.log(`[GUARD] In plan charge window (slot=${_curSlot.action}) — skipping mode decision, inverter handles charging`);
+      // Optionally update charge power dynamically
+      const _planKw = _curSlot.chargeKw ?? 5;
+      const _dynKw  = calcChargeKw(ess.homeLoad ?? 0, pvPower ?? 0);
+      const _useKw  = parseFloat(Math.min(_planKw, _dynKw > 0 ? _dynKw : _planKw).toFixed(2));
+      if (Math.abs(_useKw - (state.lastChargeKw ?? 0)) > 0.3) {
+        const _setOk = await setParam('0xC0BA', _useKw);
+        console.log(`[GUARD] Updated charge power: ${_useKw}kW → ${_setOk?'OK':'FAILED'}`);
+        state.lastChargeKw = _useKw;
+      }
+      // Still log data
+      appendLog({ ts: now.toISOString(), nemTime: amber.nemTime, soc: ess.soc, battPower: ess.battPower,
+        homeLoad: ess.homeLoad, pvPower, gridPower: ess.gridPower, buyPrice: currentPrice,
+        feedInPrice: amber.feedInPrice, spotPrice: amber.spotPrice, demandWindow: amber.demandWindow,
+        mode: state.currentMode, modeChanged: false, modeReason: 'plan-charge-window',
+        renewables: amber.renewables, alert: null, reportedMode: ess.reportedMode ?? state.currentMode,
+        chargeKw: _useKw, dischargeKw: 0 });
+      state.lastCheck = now.toISOString();
+      saveState(state);
+      // today summary printed below at end of normal flow
+      console.log(`[DONE]`);
+      return;
+    }
+
+    if (_inSellSlot) {
+      // In planned sell window — let normal logic handle selling (price-dependent)
+      console.log(`[GUARD] In plan sell window — allowing normal sell logic`);
+    }
+  }
+
   const todaySummary = (() => {
     try {
       const _db = getDb();
