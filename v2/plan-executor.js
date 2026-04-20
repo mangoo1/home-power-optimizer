@@ -458,11 +458,10 @@ async function main() {
 
   }
 
-  // 6. SOC 底线保护
-  if (ess.soc !== null && ess.soc <= SOC_FLOOR && ess.battPower < 0) {
-    // 电池在放电且快触底
-    await emergencyStop(`SOC ${ess.soc}% ≤ 底线 ${SOC_FLOOR}%`);
-    action = 'soc-floor';
+  // 6. SOC 低电量记录（不强制停止——逆变器固件有自己的底线保护）
+  if (ess.soc !== null && ess.soc <= SOC_FLOOR) {
+    console.log(`[SOC] ${ess.soc}% 接近底线 ${SOC_FLOOR}%，逆变器固件会自动保护`);
+    action = action === 'monitor' ? 'soc-low' : action;
   }
 
   // 7. 记录数据（所有字段）
