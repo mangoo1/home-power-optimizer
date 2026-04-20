@@ -221,7 +221,14 @@ async function main() {
   const thresholdA = Math.min(BUY_MAX_C, Math.max(BUY_MIN_C, buySorted[p30idx] ?? BUY_MAX_C));
 
   // ── 算法 B: v2-spread（峰值价 × SPREAD_RATIO）───────────────
-  const peakBuyC    = Math.max(...slots.map(s => s.buyC));
+  // 优先用今天第一次跑时记录的峰值（早上 5:50 视野最全），避免下午只剩几个槽导致峰值被低估
+  const firstSimToday = db.prepare(
+    "SELECT notes FROM plan_ab_sim WHERE date=? AND algo='v2-spread' ORDER BY rowid ASC LIMIT 1"
+  ).get(today);
+  const firstNotes = firstSimToday ? JSON.parse(firstSimToday.notes || '{}') : null;
+  const peakBuyC = firstNotes?.peakBuyC
+    ? parseFloat(firstNotes.peakBuyC)
+    : Math.max(...slots.map(s => s.buyC));
   const thresholdB  = Math.min(BUY_MAX_C, parseFloat((peakBuyC * SPREAD_RATIO).toFixed(2)));
 
   console.log(`[A] v2-rules  阈值: ${thresholdA.toFixed(1)}¢  (30%分位=${buySorted[p30idx]?.toFixed(1)}¢, 保底=${BUY_MIN_C}¢)`);
