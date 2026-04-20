@@ -228,54 +228,83 @@ function homeLoadKw(hour) {
 
 // ── Step 5: 生成半小时充放电计划 ─────────────────────────────
 function buildPlan(slots, pvByHour, currentSoc, hasDW) {
-  // 买电阈值：取所有槽中便宜的30%分位
-  const buySorted = slots.map(s => s.buyC).filter(c => c > 0).sort((a,b) => a-b);
-  const p30idx = Math.floor(buySorted.length * 0.30);
-  const buyThreshold = Math.min(BUY_MAX_C, Math.max(BUY_MIN_C, buySorted[p30idx] ?? BUY_MAX_C));
+  const targetKwh  = SOC_TARGET * BATT_KWH;               // 目标 kWh（85%）
+  const currentKwh = currentSoc / 100 * BATT_KWH;
 
-  console.log(`\n[计划] 买电阈值: ${buyThreshold.toFixed(1)}¢ | 卖电下限: ${SELL_MIN_C}¢ | DW: ${hasDW}`);
+  // ── Phase 1: 倒推需要充多少，选最便宜的槽 ──────────────────
+  // 只考虑 15:00 前、非 DW 的候选槽，算出每槽可充 kWh
+  const candidateSlots = slots
+    .map(s => {
+      const h  = parseInt(s.key.split(':')[0]);
+      const pv = pvAt30min(pvByHour, h);
+      const hl = homeLoadKw(h);
+      const gridHeadroom = BREAKER_KW - Math.max(0, hl - pv) - CHARGE_BUFFER;
+      const maxChargeKw  = parseFloat(Math.min(MAX_CHARGE_KW, Math.max(0, gridHeadroom)).toFixed(2));
+      const chargeKwhPer = maxChargeKw * 0.5 * 0.95; // 半小时可充入 kWh（含效率）
+      return { ...s, h, pv, hl, maxChargeKw, chargeKwhPer };
+    })
+    .filter(s => s.h < SOC_TARGET_BY && !s.dw && s.maxChargeKw >= 0.5 && s.buyC > 0);
 
-  let socKwh = currentSoc / 100 * BATT_KWH;
+  // 按电价从低到高排，贪心选槽直到充够
+  const sortedByPrice = [...candidateSlots].sort((a, b) => a.buyC - b.buyC);
+  const chargeKeys = new Set();
+  let neededKwh = Math.max(0, targetKwh - currentKwh);
+
+  // 还要扣掉 PV 预计贡献（粗估：15:00 前 PV 总发电 × 自用比例）
+  const pvContrib = candidateSlots.reduce((s, x) => s + x.pv * 0.5 * 0.9, 0);
+  neededKwh = Math.max(0, neededKwh - pvContrib);
+
+  const buyThreshold_auto = sortedByPrice.length ? sortedByPrice[0].buyC : BUY_MIN_C;
+  let accumulated = 0;
+  for (const s of sortedByPrice) {
+    if (accumulated >= neededKwh) break;
+    chargeKeys.add(s.key);
+    accumulated += s.chargeKwhPer;
+  }
+
+  // 实际买电阈值 = 选中槽里最贵的那个（加保底 BUY_MIN_C）
+  const selectedPrices = sortedByPrice.filter(s => chargeKeys.has(s.key)).map(s => s.buyC);
+  const buyThreshold = Math.max(BUY_MIN_C, selectedPrices.length ? Math.max(...selectedPrices) : BUY_MIN_C);
+
+  console.log(`\n[计划] 目标: SOC ${currentSoc}% → ${Math.round(SOC_TARGET*100)}% (需充 ${neededKwh.toFixed(1)}kWh, PV贡献 ~${pvContrib.toFixed(1)}kWh)`);
+  console.log(`[计划] 选中 ${chargeKeys.size} 个充电槽 | 买电阈值: ${buyThreshold.toFixed(1)}¢ | 卖电下限: ${SELL_MIN_C}¢ | DW: ${hasDW}`);
+
+  // ── Phase 2: 顺序扫描生成计划 ──────────────────────────────
+  let socKwh = currentKwh;
   const plan = [];
 
   for (const s of slots) {
     const h   = parseInt(s.key.split(':')[0]);
     const pv  = pvAt30min(pvByHour, h);
     const hl  = homeLoadKw(h);
-    const net = hl - pv; // 正=需要外部补给，负=PV有剩余
+    const net = hl - pv;
 
-    // 可用充电功率（受断路器限制）
     const gridHeadroom = BREAKER_KW - Math.max(0, net) - CHARGE_BUFFER;
     const maxChargeKw  = parseFloat(Math.min(MAX_CHARGE_KW, Math.max(0, gridHeadroom)).toFixed(2));
 
-    // 当前可卖电量（保留 SOC_MIN）
-    const usableKwh  = socKwh - SOC_MIN * BATT_KWH;
-    const maxSellKwh = Math.max(0, usableKwh);
-    const maxSellKw  = parseFloat(Math.min(MAX_SELL_KW, maxSellKwh / 0.5).toFixed(2));
+    const usableKwh = Math.max(0, socKwh - SOC_MIN * BATT_KWH);
+    const maxSellKw = parseFloat(Math.min(MAX_SELL_KW, usableKwh / 0.5).toFixed(2));
 
-    let action, chargeKw = 0, sellKw = 0, reason = '';
+    let action = 'self-use', chargeKw = 0, sellKw = 0, reason = '';
 
     if (s.dw) {
-      // Demand Window：绝不充电，尽量少用电
       action = 'standby';
       reason = 'DW';
-    } else if (s.buyC <= buyThreshold && socKwh < SOC_TARGET * BATT_KWH && maxChargeKw >= 0.5 && h < SOC_TARGET_BY) {
-      // 低价充电，且在 15:00 前（15:00 后不再从电网充）
-      // 低价充电
+    } else if (chargeKeys.has(s.key) && socKwh < targetKwh && maxChargeKw >= 0.5) {
+      // 选中的充电槽
       action   = 'charge';
       chargeKw = maxChargeKw;
-      reason   = `buy=${s.buyC}c ≤ ${buyThreshold.toFixed(1)}c`;
+      reason   = `buy=${s.buyC}¢ selected(cheapest)`;
     } else if (s.feedInC >= SELL_MIN_C && maxSellKw >= 0.5) {
       // 高价卖电
       action = 'sell';
       sellKw = maxSellKw;
-      reason = `feedIn=${s.feedInC}c ≥ ${SELL_MIN_C}c`;
+      reason = `feedIn=${s.feedInC}¢ ≥ ${SELL_MIN_C}¢`;
     } else {
       action = 'self-use';
-      reason = `buy=${s.buyC}c feedIn=${s.feedInC}c`;
+      reason = `buy=${s.buyC}¢ feedIn=${s.feedInC}¢`;
     }
 
-    // SOC 模拟
     const deltaKwh = action === 'charge'
       ? chargeKw * 0.5 * 0.95
       : action === 'sell'
