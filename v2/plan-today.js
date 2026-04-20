@@ -425,8 +425,9 @@ function savePlan(db, today, plan, meta) {
       (date, version, generated_at, source, created_by, soc_at_gen,
        has_demand_window, charge_cutoff_hour,
        pv_forecast_kwh, pv_peak_kw,
-       charge_windows_json, intervals_json, notes, is_active)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,1)
+       charge_windows_json, intervals_json, notes,
+       buy_threshold_c, sell_min_c, is_active)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)
   `).run(
     today, version, new Date().toISOString(), 'v2-rules', 'v2/plan-today.js',
     meta.currentSocPct,
@@ -437,6 +438,8 @@ function savePlan(db, today, plan, meta) {
     JSON.stringify(chargeWindows),
     JSON.stringify(plan),
     JSON.stringify({ buyThreshold: meta.buyThreshold, sellMinC: SELL_MIN_C, calibFactor: meta.calibFactor }),
+    parseFloat(meta.buyThreshold.toFixed(2)),
+    SELL_MIN_C,
   );
 
   console.log(`\n✅ 计划 v${version} 已存入 DB (source=v2-rules)`);

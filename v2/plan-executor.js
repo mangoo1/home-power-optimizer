@@ -453,8 +453,28 @@ async function main() {
     action = 'hotwater';
 
   } else if (slot.action === 'standby' || slot.action === 'self-use') {
-    // 自用/待机：逆变器已按窗口运行，不干预
-    action = slot.action;
+    // 自用/待机：检查实时电价，若低于计划阈值则机会性充电
+    const planBuyThreshold = planRow?.buy_threshold_c ?? parseFloat(JSON.parse(planRow?.notes ?? '{}').buyThreshold ?? '8.0');
+    const SOC_TARGET_PCT = 85;
+    if (
+      slot.action === 'self-use' &&
+      amber && amber.buyPrice != null &&
+      amber.buyPrice <= planBuyThreshold &&
+      ess.soc < SOC_TARGET_PCT &&
+      !isDW
+    ) {
+      const safeKw = calcSafeChargeKw(homeLoad, pvPower);
+      if (safeKw >= 0.5) {
+        await updateChargeKw(safeKw);
+        extraChargeKw = safeKw;
+        console.log(`[机会充电] 实时买价 ${amber.buyPrice.toFixed(2)}¢ ≤ 阈值 ${planBuyThreshold}¢，充电 ${safeKw}kW`);
+        action = 'opportunistic-charge';
+      } else {
+        action = slot.action;
+      }
+    } else {
+      action = slot.action;
+    }
 
   }
 
