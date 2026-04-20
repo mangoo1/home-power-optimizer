@@ -1,0 +1,380 @@
+#!/usr/bin/env node
+/**
+ * v2/plan-executor.js — 每5分钟执行计划 + 记录数据
+ *
+ * 职责（仅此三件，不做其他决策）：
+ *   1. 读当前 ESS 状态 + Amber 价格 → 记录到 energy_log
+ *   2. 对照 daily_plan 当前时段：
+ *      - charge / sell 窗口已由 plan-today 写入逆变器，executor 只调功率
+ *      - standby / self-use：确保逆变器不在充放电
+ *      - DW 时段：紧急停止充放电
+ *   3. 安全检查：总功率不超断路器（BREAKER_KW）
+ *
+ * 不做的事：
+ *   - 不重新决定充不充电（那是 plan-today 的事）
+ *   - 不因 Amber blip 切模式（已有时间窗口保障）
+ *   - 不覆盖逆变器时间窗口
+ *
+ * 热水器预留：
+ *   plan 里 action='hotwater' 时段，executor 会通过 Tuya MCP 发开关指令（待实现）
+ */
+'use strict';
+
+require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
+
+const https    = require('https');
+const http     = require('http');
+const path     = require('path');
+const Database = require('better-sqlite3');
+
+// ── 环境变量（全部从 .env，绝不硬编码）────────────────────────
+const AMBER_TOKEN   = process.env.AMBER_API_TOKEN;
+const AMBER_SITE_ID = process.env.AMBER_SITE_ID;
+const ESS_TOKEN     = process.env.ESS_TOKEN;
+const ESS_MAC_HEX   = process.env.ESS_MAC_HEX;
+const ESS_STATION   = process.env.ESS_STATION_SN;
+const GW_PORT       = process.env.OPENCLAW_GATEWAY_PORT || '18789';
+
+if (!AMBER_TOKEN || !AMBER_SITE_ID) { console.error('[ERROR] Missing AMBER_API_TOKEN or AMBER_SITE_ID'); process.exit(1); }
+if (!ESS_TOKEN   || !ESS_MAC_HEX)   { console.error('[ERROR] Missing ESS_TOKEN or ESS_MAC_HEX');          process.exit(1); }
+
+// ── 系统常量 ──────────────────────────────────────────────────
+const BREAKER_KW      = parseFloat(process.env.MAIN_BREAKER_KW ?? '7.7');
+const BREAKER_BUFFER  = 0.3;   // kW 安全余量，不撞到断路器上限
+const MAX_CHARGE_KW   = 5.0;
+const MAX_SELL_KW     = 5.0;
+const SOC_FLOOR       = 20;    // % 绝对底线，不往下放
+const DB_PATH         = path.join(__dirname, '..', 'data', 'energy.db');
+
+// ── 工具 ──────────────────────────────────────────────────────
+function sydneyTime() {
+  const s = new Date().toLocaleString('en-AU', {
+    timeZone: 'Australia/Sydney',
+    year:'numeric', month:'2-digit', day:'2-digit',
+    hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false
+  });
+  const [datePart, timePart] = s.split(', ');
+  const [dd, mm, yyyy] = datePart.split('/');
+  const [hh, mi, ss]   = timePart.split(':').map(Number);
+  return { date:`${yyyy}-${mm}-${dd}`, hh, mi, hhmm:`${String(hh).padStart(2,'0')}${String(mi).padStart(2,'0')}` };
+}
+
+function httpsGet(url, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const req = https.request({ hostname:u.hostname, path:u.pathname+u.search, method:'GET', headers },
+      res => { let d=''; res.on('data',c=>d+=c); res.on('end',()=>{ try{resolve(JSON.parse(d));}catch(e){reject(e);} }); });
+    req.on('error', reject); req.end();
+  });
+}
+
+function httpsPost(url, body, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const data = JSON.stringify(body);
+    const req = https.request(
+      { hostname:u.hostname, path:u.pathname+u.search, method:'POST',
+        headers:{'Content-Type':'application/json','Content-Length':Buffer.byteLength(data),...headers} },
+      res => { let d=''; res.on('data',c=>d+=c); res.on('end',()=>{ try{resolve(JSON.parse(d));}catch{resolve({});} }); });
+    req.on('error', reject); req.write(data); req.end();
+  });
+}
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// ── ESS API ───────────────────────────────────────────────────
+const ESS_HEADERS = {
+  Authorization: ESS_TOKEN, lang:'en', showloading:'false',
+  Referer:'https://eu.ess-link.com/appViews/appHome', 'User-Agent':'Mozilla/5.0',
+};
+
+async function essGet(endpoint) {
+  try {
+    const r = await httpsGet(`https://eu.ess-link.com/api/app/deviceInfo/${endpoint}?macHex=${ESS_MAC_HEX}`, ESS_HEADERS);
+    return r.code === 200 ? r.data : null;
+  } catch { return null; }
+}
+
+async function essWebGet(path) {
+  try {
+    const r = await httpsGet(`https://eu.ess-link.com${path}`, { Authorization:`Bearer ${ESS_TOKEN}`, lang:'en', showloading:'false', Referer:'https://eu.ess-link.com/appViews/appHome', 'User-Agent':'Mozilla/5.0' });
+    return r.code === 200 ? r.data : null;
+  } catch { return null; }
+}
+
+function findVal(items, index) {
+  if (!items) return null;
+  const item = Array.isArray(items) ? items.find(i => i.index === index) : null;
+  return item?.value ?? null;
+}
+
+async function readEss() {
+  const [batt, load, meter, pv, runInfo] = await Promise.all([
+    essGet('getBatteryInfo'),
+    essGet('getLoadInfo'),
+    essGet('getMeterInfo'),
+    essGet('getPhotovoltaicInfo'),
+    essWebGet(`/api/web/deviceInfo/getDevicRunningInfo?stationSn=${ESS_STATION}`),
+  ]);
+
+  const soc        = findVal(batt, '0x1212') ?? findVal(batt, '0xB106') ?? null;  // % SOC
+  const battPower  = findVal(batt, '0x1210') ?? null;   // kW positive=charging
+  const homeLoad   = findVal(load, '0x1274') ?? null;   // kW total load power
+  const gridPower  = findVal(meter,'0xA112') ?? null;   // kW positive=import(buy), negative=export(sell)
+  const pvPower    = findVal(pv,   '0x1208') ?? null;   // kW
+  const meterBuy   = findVal(meter,'0x1240') ?? null;   // kWh cumulative
+  const meterSell  = findVal(meter,'0x1242') ?? null;   // kWh cumulative
+  const reportedMode = runInfo?.x300C ?? null;
+
+  return { soc, battPower, homeLoad, gridPower, pvPower, meterBuy, meterSell, reportedMode };
+}
+
+// ── Amber API ─────────────────────────────────────────────────
+async function readAmber() {
+  try {
+    const url = `https://api.amber.com.au/v1/sites/${AMBER_SITE_ID}/prices/current?next=1`;
+    const raw = await httpsGet(url, { Authorization:`Bearer ${AMBER_TOKEN}` });
+    if (!Array.isArray(raw)) return null;
+
+    let buyPrice = null, feedInPrice = null, demandWindow = false, nemTime = null, descriptor = null;
+    for (const p of raw) {
+      if (p.type === 'CurrentInterval') {
+        nemTime = p.nemTime;
+        if (p.channelType === 'general') { buyPrice = p.perKwh; descriptor = p.descriptor; }
+        if (p.channelType === 'feedIn')  feedInPrice = Math.abs(p.perKwh);
+        if (p.tariffInformation?.demandWindow) demandWindow = true;
+      }
+    }
+    return { buyPrice, feedInPrice, demandWindow, nemTime, descriptor };
+  } catch { return null; }
+}
+
+// ── 逆变器参数写入 ────────────────────────────────────────────
+async function setParam(index, data) {
+  const r = await httpsPost('https://eu.ess-link.com/api/app/deviceInfo/setDeviceParam',
+    { macHex:ESS_MAC_HEX, index, data }, ESS_HEADERS).catch(() => ({}));
+  return r.code === 200;
+}
+
+// 只调整充电功率（不动时间窗口）
+async function updateChargeKw(kw) {
+  const clamped = parseFloat(Math.min(MAX_CHARGE_KW, Math.max(0, kw)).toFixed(2));
+  const ok = await setParam('0xC0BA', clamped);
+  console.log(`[功率] 充电功率 → ${clamped}kW ${ok?'✅':'❌'}`);
+  return ok;
+}
+
+// 只调整放电功率（不动时间窗口）
+async function updateSellKw(kw) {
+  const clamped = parseFloat(Math.min(MAX_SELL_KW, Math.max(0, kw)).toFixed(2));
+  const ok = await setParam('0xC0BC', clamped);
+  console.log(`[功率] 放电功率 → ${clamped}kW ${ok?'✅':'❌'}`);
+  return ok;
+}
+
+// 紧急停止：清空充放电功率（DW 或超断路器）
+async function emergencyStop(reason) {
+  console.log(`[紧急] 停止充放电: ${reason}`);
+  await setParam('0xC0BA', 0);
+  await sleep(300);
+  await setParam('0xC0BC', 0);
+}
+
+// ── 计算动态充电功率（不超断路器）────────────────────────────
+function calcSafeChargeKw(homeLoad, pvPower) {
+  // 总电网进口 = homeLoad - pvPower + chargeKw ≤ BREAKER_KW - buffer
+  const netHouseFromGrid = (homeLoad ?? 0) - (pvPower ?? 0);
+  const headroom = BREAKER_KW - BREAKER_BUFFER - Math.max(0, netHouseFromGrid);
+  return parseFloat(Math.min(MAX_CHARGE_KW, Math.max(0, headroom)).toFixed(2));
+}
+
+// ── 记录数据到 energy_log ─────────────────────────────────────
+function logData(db, ess, amber, slot, action) {
+  const now = new Date().toISOString();
+  const syd = sydneyTime();
+
+  try {
+    db.prepare(`
+      INSERT OR REPLACE INTO energy_log (
+        ts, nem_time, soc, batt_power, home_load, pv_power, grid_power,
+        buy_price, feedin_price, demand_window,
+        mode, mode_changed, mode_reason,
+        meter_buy_total, meter_sell_total,
+        reported_mode, record_trigger,
+        charge_kw, discharge_kw
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    `).run(
+      now,
+      amber?.nemTime ?? null,
+      ess.soc, ess.battPower, ess.homeLoad, ess.pvPower, ess.gridPower,
+      amber?.buyPrice ?? null, amber?.feedInPrice ?? null,
+      amber?.demandWindow ? 1 : 0,
+      slot ? { charge:1, sell:6, 'self-use':0, standby:0, hotwater:0 }[slot.action] ?? 0 : null,
+      0, action ?? slot?.action ?? 'unknown',
+      ess.meterBuy, ess.meterSell,
+      ess.reportedMode, 'executor',
+      slot?.chargeKw ?? null, slot?.sellKw ?? null,
+    );
+  } catch(e) {
+    console.warn('[DB] 写入失败:', e.message);
+  }
+}
+
+// ── 热水器控制（预留，待 Tuya MCP 实现）─────────────────────
+async function controlHotWater(on) {
+  // TODO: 接入 Tuya MCP
+  // 当 plan action='hotwater' 时调用
+  console.log(`[热水器] ${on ? '开' : '关'}（待 Tuya MCP 实现）`);
+}
+
+// ── 主流程 ────────────────────────────────────────────────────
+async function main() {
+  const syd = sydneyTime();
+  const now = new Date();
+  console.log(`\n[${syd.date} ${syd.hh}:${String(syd.mi).padStart(2,'0')}] === plan-executor v2 ===`);
+
+  const db = new Database(DB_PATH);
+
+  // 1. 读今日计划
+  const planRow = db.prepare(
+    "SELECT * FROM daily_plan WHERE date=? AND is_active=1 ORDER BY rowid DESC LIMIT 1"
+  ).get(syd.date);
+
+  if (!planRow) {
+    console.log('[计划] 今天没有计划，仅记录数据');
+  }
+
+  const intervals = planRow ? JSON.parse(planRow.intervals_json) : [];
+
+  // 找当前半小时时段
+  const nowMins = syd.hh * 60 + syd.mi;
+  const slot = intervals.find(s => {
+    const h = parseInt(s.nemTime?.substring(11,13) ?? s.key?.substring(0,2) ?? '0');
+    const m = parseInt(s.nemTime?.substring(14,16) ?? s.key?.substring(3,5) ?? '0');
+    return nowMins >= h*60+m && nowMins < h*60+m+30;
+  });
+
+  console.log(`[时段] ${slot ? `${slot.key} action=${slot.action} chargeKw=${slot.chargeKw} sellKw=${slot.sellKw}` : '无匹配时段'}`);
+
+  // 2. 并行读取 ESS + Amber
+  const [ess, amber] = await Promise.all([ readEss(), readAmber() ]);
+
+  console.log(`[ESS] SOC:${ess.soc}% batt:${ess.battPower}kW home:${ess.homeLoad}kW pv:${ess.pvPower}kW grid:${ess.gridPower}kW mode:${ess.reportedMode}`);
+  if (amber) {
+    console.log(`[Amber] buy:${amber.buyPrice?.toFixed(2)}¢ feedIn:${amber.feedInPrice?.toFixed(2)}¢ DW:${amber.demandWindow} ${amber.descriptor??''}`);
+  } else {
+    console.log('[Amber] API blip — 继续按计划执行（时间窗口已设好）');
+  }
+
+  // 3. 安全检查：DW 时段 → 立刻停充放电
+  const isDW = amber?.demandWindow ?? (slot?.dw ?? false);
+  if (isDW) {
+    await emergencyStop('Demand Window 激活');
+    logData(db, ess, amber, slot, 'dw-stop');
+    db.close();
+    console.log('[完成] DW 紧急停止');
+    return;
+  }
+
+  // 4. 安全检查：总功率超断路器 → 降低充电功率
+  const homeLoad = ess.homeLoad ?? 0;
+  const pvPower  = ess.pvPower  ?? 0;
+  const gridImport = ess.gridPower ?? 0; // 正=买电(import)
+  if (gridImport > BREAKER_KW - BREAKER_BUFFER) {
+    const safeKw = calcSafeChargeKw(homeLoad, pvPower);
+    console.log(`[安全] 电网进口 ${gridImport.toFixed(2)}kW 超限，降充电至 ${safeKw}kW`);
+    await updateChargeKw(safeKw);
+    logData(db, ess, amber, slot, 'throttled');
+    db.close();
+    return;
+  }
+
+  // 5. 执行计划
+  let action = 'monitor'; // 默认只监控，不动逆变器
+
+  if (!slot) {
+    // 无计划时段：什么都不做，逆变器按已设时间窗口运行
+    action = 'no-slot';
+
+  } else if (slot.action === 'charge') {
+    // 充电时段：动态调整功率，不动窗口
+    const safeKw = calcSafeChargeKw(homeLoad, pvPower);
+    const targetKw = parseFloat(Math.min(slot.chargeKw || MAX_CHARGE_KW, safeKw).toFixed(2));
+    if (targetKw < 0.2) {
+      console.log(`[充电] homeLoad过高(${homeLoad.toFixed(1)}kW)，暂停充电`);
+      await updateChargeKw(0);
+      action = 'charge-paused';
+    } else {
+      await updateChargeKw(targetKw);
+      action = 'charge';
+    }
+
+  } else if (slot.action === 'sell') {
+    // 卖电时段：实时检查 feedIn 价格，动态决定是否卖
+    if (amber && amber.feedInPrice != null) {
+      const planSellMinC = JSON.parse(planRow?.notes ?? '{}').sellMinC ?? 13.5;
+      if (amber.feedInPrice >= planSellMinC) {
+        // 动态计算卖电功率（保留家用）
+        const maxSellKw = parseFloat(Math.min(MAX_SELL_KW, MAX_SELL_KW - homeLoad * 0.1).toFixed(2));
+        await updateSellKw(Math.max(0.5, maxSellKw));
+        action = 'sell';
+      } else {
+        // feedIn 太低，停止卖电
+        await updateSellKw(0);
+        console.log(`[卖电] feedIn=${amber.feedInPrice.toFixed(1)}¢ < ${planSellMinC}¢，停止卖电`);
+        action = 'sell-skip';
+      }
+    } else {
+      // Amber blip：维持当前状态（窗口已设好，逆变器自行处理）
+      console.log('[卖电] Amber blip，维持当前逆变器窗口');
+      action = 'sell-blip';
+    }
+
+  } else if (slot.action === 'hotwater') {
+    // 热水器时段（预留）
+    await controlHotWater(true);
+    action = 'hotwater';
+
+  } else if (slot.action === 'standby' || slot.action === 'self-use') {
+    // 自用/待机：逆变器已按窗口运行，不干预
+    action = slot.action;
+
+  }
+
+  // 6. SOC 底线保护
+  if (ess.soc !== null && ess.soc <= SOC_FLOOR && ess.battPower < 0) {
+    // 电池在放电且快触底
+    await emergencyStop(`SOC ${ess.soc}% ≤ 底线 ${SOC_FLOOR}%`);
+    action = 'soc-floor';
+  }
+
+  // 7. 记录数据
+  logData(db, ess, amber, slot, action);
+
+  // 8. 每小时整点打印今日汇总
+  if (syd.mi === 0) {
+    try {
+      const today = syd.date;
+      const summary = db.prepare(`
+        SELECT 
+          ROUND(SUM(CASE WHEN grid_power < 0 THEN ABS(grid_power) * 5.0/60.0 ELSE 0 END),2) as grid_buy_kwh,
+          ROUND(SUM(CASE WHEN grid_power > 0 THEN grid_power * 5.0/60.0 ELSE 0 END),2) as grid_sell_kwh,
+          ROUND(SUM(COALESCE(pv_power,0) * 5.0/60.0),2) as pv_kwh,
+          MIN(soc) as min_soc, MAX(soc) as max_soc,
+          ROUND(AVG(soc),0) as avg_soc
+        FROM energy_log
+        WHERE ts >= datetime('now','start of day','-10 hours')
+          AND ts < datetime('now','start of day','14 hours')
+      `).get();
+      console.log(`[今日] 买电:${summary?.grid_buy_kwh}kWh 卖电:${summary?.grid_sell_kwh}kWh PV:${summary?.pv_kwh}kWh SOC:${summary?.min_soc}%–${summary?.max_soc}%(avg ${summary?.avg_soc}%)`);
+    } catch {}
+  }
+
+  db.close();
+  console.log(`[完成] action=${action}`);
+}
+
+main().catch(e => {
+  console.error('[ERROR]', e.message, e.stack?.split('\n')[1]);
+  process.exit(1);
+});
