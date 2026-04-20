@@ -1885,9 +1885,36 @@ async function main() {
         console.log(`[SYNC] reportedMode=Timed(1), grid=${gridKw.toFixed(2)}kW → ${isExporting?'Selling':'Backup'} (state=${MODE_LABEL[state.currentMode]??state.currentMode}, no change needed)`);
       }
     } else if (ess.reportedMode !== state.currentMode) {
-      // Non-Timed mode: direct sync
-      console.log(`[SYNC] reportedMode=${ess.reportedMode}(${MODE_LABEL[ess.reportedMode]??ess.reportedMode}) ≠ state=${state.currentMode}(${MODE_LABEL[state.currentMode]??state.currentMode}) — syncing state to reported`);
-      state.currentMode = ess.reportedMode;
+      // Non-Timed mode mismatch.
+      // If we believe we're charging (state=1) but inverter reports Self-use(0),
+      // and we're within the plan charge window, DON'T sync — the inverter may be
+      // slow to update, or firmware reverted. We'll re-set on next cron run if needed.
+      const inChargeWindowNow = (() => {
+        try {
+          const todayPlanNow = db.prepare("SELECT intervals_json FROM daily_plan WHERE date=? AND is_active=1 ORDER BY rowid DESC LIMIT 1").get(today);
+          if (!todayPlanNow) return false;
+          const ivs = JSON.parse(todayPlanNow.intervals_json);
+          const sydH = parseInt(new Date().toLocaleString('en-AU',{timeZone:'Australia/Sydney',hour:'numeric',hour12:false}),10);
+          const sydM = parseInt(new Date().toLocaleString('en-AU',{timeZone:'Australia/Sydney',minute:'numeric',hour12:false}),10);
+          const nowMins = sydH*60+sydM;
+          return ivs.some(i => {
+            if (!i.key.startsWith(today)) return false;
+            if (i.action !== 'charge' && i.action !== 'charge+hw') return false;
+            const ih = parseInt(i.nemTime.substring(11,13));
+            const im = parseInt(i.nemTime.substring(14,16));
+            const slotMins = ih*60+im;
+            return nowMins >= slotMins && nowMins < slotMins+30;
+          });
+        } catch { return false; }
+      })();
+
+      if (state.currentMode === MODE.BACKUP && ess.reportedMode === MODE.SELF_USE && inChargeWindowNow) {
+        console.log(`[SYNC] reportedMode=Self-use but state=Charging and in charge window — NOT syncing, will re-set inverter`);
+        // Don't sync — next iteration will re-apply Timed mode
+      } else {
+        console.log(`[SYNC] reportedMode=${ess.reportedMode}(${MODE_LABEL[ess.reportedMode]??ess.reportedMode}) ≠ state=${state.currentMode}(${MODE_LABEL[state.currentMode]??state.currentMode}) — syncing state to reported`);
+        state.currentMode = ess.reportedMode;
+      }
     }
   }
 
