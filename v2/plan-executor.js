@@ -109,43 +109,94 @@ function findVal(items, index) {
 }
 
 async function readEss() {
-  const [batt, load, meter, pv, runInfo] = await Promise.all([
+  const [batt, load, meter, pv, runInfo, flowInfo] = await Promise.all([
     essGet('getBatteryInfo'),
     essGet('getLoadInfo'),
     essGet('getMeterInfo'),
     essGet('getPhotovoltaicInfo'),
     essWebGet(`/api/web/deviceInfo/getDevicRunningInfo?stationSn=${ESS_STATION}`),
+    essWebGet(`/api/web/station/totalFlowDiagram?stationSn=${ESS_STATION}`),
   ]);
 
-  const soc        = findVal(batt, '0x1212') ?? findVal(batt, '0xB106') ?? null;  // % SOC
-  const battPower  = findVal(batt, '0x1210') ?? null;   // kW positive=charging
-  const homeLoad   = findVal(load, '0x1274') ?? null;   // kW total load power
-  const gridPower  = findVal(meter,'0xA112') ?? null;   // kW positive=import(buy), negative=export(sell)
-  const pvPower    = findVal(pv,   '0x1208') ?? null;   // kW
-  const meterBuy   = findVal(meter,'0x1240') ?? null;   // kWh cumulative
-  const meterSell  = findVal(meter,'0x1242') ?? null;   // kWh cumulative
+  // 核心数据
+  const soc          = findVal(batt, '0x1212') ?? findVal(batt, '0xB106') ?? null;
+  const battPower    = findVal(batt, '0x1210') ?? null;   // kW positive=charging
+  const battVoltage  = findVal(batt, '0x120C') ?? null;   // V
+  const battCurrent  = findVal(batt, '0x120E') ?? null;   // A
+  const homeLoad     = findVal(load, '0x1274') ?? null;   // kW
+  const gridPower    = findVal(meter,'0xA112') ?? null;   // kW positive=import
+  const pvPower      = findVal(pv,   '0x1208') ?? null;   // kW
+  const meterBuy     = findVal(meter,'0x1240') ?? null;   // kWh cumulative bought
+  const meterSell    = findVal(meter,'0x1242') ?? null;   // kWh cumulative sold
   const reportedMode = runInfo?.x300C ?? null;
 
-  return { soc, battPower, homeLoad, gridPower, pvPower, meterBuy, meterSell, reportedMode };
+  // 今日汇总（来自 runInfo xc3xx 字段）
+  const todayChargeKwh    = runInfo?.xc304 ?? null;
+  const todayDischargeKwh = runInfo?.xc306 ?? null;
+  const todayPvKwh        = runInfo?.xc308 ?? null;
+  const todayGridBuyKwh   = runInfo?.xc30A ?? null;
+  const todayGridSellKwh  = runInfo?.xc30C ?? null;
+  const todayHomeKwh      = runInfo?.xc30E ?? null;
+
+  // 流量图（flow）
+  const flowPv       = flowInfo?.pvPower    ?? null;
+  const flowGrid     = flowInfo?.gridPower  ?? null;
+  const flowBattery  = flowInfo?.battPower  ?? null;
+  const flowLoad     = flowInfo?.loadPower  ?? null;
+
+  return {
+    soc, battPower, battVoltage, battCurrent,
+    homeLoad, gridPower, pvPower,
+    meterBuy, meterSell,
+    reportedMode,
+    todayChargeKwh, todayDischargeKwh, todayPvKwh,
+    todayGridBuyKwh, todayGridSellKwh, todayHomeKwh,
+    flowPv, flowGrid, flowBattery, flowLoad,
+  };
 }
 
 // ── Amber API ─────────────────────────────────────────────────
 async function readAmber() {
   try {
-    const url = `https://api.amber.com.au/v1/sites/${AMBER_SITE_ID}/prices/current?next=1`;
+    const url = `https://api.amber.com.au/v1/sites/${AMBER_SITE_ID}/prices/current?next=3`;
     const raw = await httpsGet(url, { Authorization:`Bearer ${AMBER_TOKEN}` });
     if (!Array.isArray(raw)) return null;
 
-    let buyPrice = null, feedInPrice = null, demandWindow = false, nemTime = null, descriptor = null;
+    let buyPrice = null, feedInPrice = null, spotPrice = null;
+    let clPrice = null, clDescriptor = null, clTariffPeriod = null;
+    let demandWindow = false, nemTime = null, descriptor = null, tariffPeriod = null;
+    let renewables = null, nextDemandMin = null;
+
     for (const p of raw) {
       if (p.type === 'CurrentInterval') {
-        nemTime = p.nemTime;
-        if (p.channelType === 'general') { buyPrice = p.perKwh; descriptor = p.descriptor; }
-        if (p.channelType === 'feedIn')  feedInPrice = Math.abs(p.perKwh);
-        if (p.tariffInformation?.demandWindow) demandWindow = true;
+        nemTime      = p.nemTime;
+        renewables   = p.renewables ?? null;
+        if (p.channelType === 'general') {
+          buyPrice     = p.perKwh;
+          spotPrice    = p.spotPerKwh ?? null;
+          descriptor   = p.descriptor;
+          tariffPeriod = p.tariffInformation?.period ?? null;
+          if (p.tariffInformation?.demandWindow) demandWindow = true;
+        }
+        if (p.channelType === 'feedIn')         feedInPrice = Math.abs(p.perKwh);
+        if (p.channelType === 'controlledLoad') {
+          clPrice       = p.perKwh;
+          clDescriptor  = p.descriptor;
+          clTariffPeriod = p.tariffInformation?.period ?? null;
+        }
+      }
+      // 找最近的 DW 开始时间
+      if (p.type === 'ForecastInterval' && p.tariffInformation?.demandWindow && nextDemandMin === null) {
+        const diffMs = new Date(p.startTime) - Date.now();
+        if (diffMs > 0) nextDemandMin = diffMs / 60000;
       }
     }
-    return { buyPrice, feedInPrice, demandWindow, nemTime, descriptor };
+    return {
+      buyPrice, feedInPrice, spotPrice,
+      clPrice, clDescriptor, clTariffPeriod,
+      demandWindow, nemTime, descriptor, tariffPeriod,
+      renewables, nextDemandMin,
+    };
   } catch { return null; }
 }
 
@@ -189,31 +240,95 @@ function calcSafeChargeKw(homeLoad, pvPower) {
 }
 
 // ── 记录数据到 energy_log ─────────────────────────────────────
-function logData(db, ess, amber, slot, action) {
+function logData(db, ess, amber, slot, action, extra = {}) {
   const now = new Date().toISOString();
-  const syd = sydneyTime();
+
+  // 计算本次与上次 meter 的增量（用于精确买卖电量统计）
+  let meterBuyDelta = null, meterSellDelta = null;
+  try {
+    const prev = db.prepare(
+      "SELECT meter_buy_total, meter_sell_total FROM energy_log WHERE meter_buy_total IS NOT NULL ORDER BY ts DESC LIMIT 1"
+    ).get();
+    if (prev && ess.meterBuy != null)  meterBuyDelta  = parseFloat((ess.meterBuy  - prev.meter_buy_total).toFixed(4));
+    if (prev && ess.meterSell != null) meterSellDelta = parseFloat((ess.meterSell - prev.meter_sell_total).toFixed(4));
+    // 防止负值（计数器重置）
+    if (meterBuyDelta  < 0) meterBuyDelta  = null;
+    if (meterSellDelta < 0) meterSellDelta = null;
+  } catch {}
+
+  const modeMap = { charge:1, 'charge+hw':1, sell:6, 'self-use':0, standby:0, hotwater:0 };
+  const modeNum = slot ? (modeMap[slot.action] ?? 0) : null;
 
   try {
     db.prepare(`
       INSERT OR REPLACE INTO energy_log (
-        ts, nem_time, soc, batt_power, home_load, pv_power, grid_power,
-        buy_price, feedin_price, demand_window,
+        ts, nem_time,
+        soc, batt_power, home_load, pv_power, grid_power,
+        batt_voltage, batt_current,
+        buy_price, feedin_price, spot_price, demand_window,
+        renewables, amber_descriptor, amber_tariff_period,
+        amber_cl_price, amber_cl_descriptor, amber_cl_tariff_period,
+        amber_feedin_price, amber_spot_price,
+        next_demand_min,
         mode, mode_changed, mode_reason,
         meter_buy_total, meter_sell_total,
+        meter_buy_delta, meter_sell_delta,
+        today_charge_kwh, today_discharge_kwh, today_pv_kwh,
+        today_grid_buy_kwh, today_grid_sell_kwh, today_home_kwh,
+        flow_pv, flow_grid, flow_battery, flow_load,
         reported_mode, record_trigger,
-        charge_kw, discharge_kw
-      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        charge_kw, discharge_kw,
+        solar_wm2, cloud_cover_pct,
+        alert
+      ) VALUES (
+        ?,?,
+        ?,?,?,?,?,
+        ?,?,
+        ?,?,?,?,
+        ?,?,?,
+        ?,?,?,
+        ?,?,
+        ?,
+        ?,?,?,
+        ?,?,
+        ?,?,
+        ?,?,?,
+        ?,?,?,
+        ?,?,?,?,
+        ?,?,
+        ?,?,
+        ?,?,
+        ?
+      )
     `).run(
-      now,
-      amber?.nemTime ?? null,
+      now, amber?.nemTime ?? null,
+      // ESS core
       ess.soc, ess.battPower, ess.homeLoad, ess.pvPower, ess.gridPower,
-      amber?.buyPrice ?? null, amber?.feedInPrice ?? null,
+      ess.battVoltage ?? null, ess.battCurrent ?? null,
+      // Amber prices
+      amber?.buyPrice ?? null, amber?.feedInPrice ?? null, amber?.spotPrice ?? null,
       amber?.demandWindow ? 1 : 0,
-      slot ? { charge:1, sell:6, 'self-use':0, standby:0, hotwater:0 }[slot.action] ?? 0 : null,
-      0, action ?? slot?.action ?? 'unknown',
-      ess.meterBuy, ess.meterSell,
-      ess.reportedMode, 'executor',
-      slot?.chargeKw ?? null, slot?.sellKw ?? null,
+      amber?.renewables ?? null, amber?.descriptor ?? null, amber?.tariffPeriod ?? null,
+      amber?.clPrice ?? null, amber?.clDescriptor ?? null, amber?.clTariffPeriod ?? null,
+      amber?.feedInPrice ?? null, amber?.spotPrice ?? null,
+      amber?.nextDemandMin ?? null,
+      // mode
+      modeNum, 0, action ?? slot?.action ?? 'unknown',
+      // meter
+      ess.meterBuy ?? null, ess.meterSell ?? null,
+      meterBuyDelta, meterSellDelta,
+      // today totals
+      ess.todayChargeKwh ?? null, ess.todayDischargeKwh ?? null, ess.todayPvKwh ?? null,
+      ess.todayGridBuyKwh ?? null, ess.todayGridSellKwh ?? null, ess.todayHomeKwh ?? null,
+      // flow
+      ess.flowPv ?? null, ess.flowGrid ?? null, ess.flowBattery ?? null, ess.flowLoad ?? null,
+      // meta
+      ess.reportedMode ?? null, 'executor-v2',
+      extra.chargeKw ?? slot?.chargeKw ?? null,
+      extra.sellKw   ?? slot?.sellKw   ?? null,
+      // solar forecast (filled by solar-forecast.js separately)
+      null, null,
+      extra.alert ?? null,
     );
   } catch(e) {
     console.warn('[DB] 写入失败:', e.message);
@@ -266,25 +381,26 @@ async function main() {
     console.log('[Amber] API blip — 继续按计划执行（时间窗口已设好）');
   }
 
-  // 3. 安全检查：DW 时段 → 立刻停充放电
-  const isDW = amber?.demandWindow ?? (slot?.dw ?? false);
-  if (isDW) {
-    await emergencyStop('Demand Window 激活');
-    logData(db, ess, amber, slot, 'dw-stop');
-    db.close();
-    console.log('[完成] DW 紧急停止');
-    return;
+  // 3. DW 检查：plan-today 已在计划里处理 DW，只需检查计划外的突发 DW
+  const isDW = amber?.demandWindow ?? false;
+  const slotIsDW = slot?.dw ?? false;
+  if (isDW && !slotIsDW) {
+    // 计划外的 DW 告警（不叫停，但发告警并记录）
+    console.warn(`[告警] 实时 DW=true 但计划未标注 DW，请检查 plan-today 是否需要重跑`);
   }
 
   // 4. 安全检查：总功率超断路器 → 降低充电功率
-  const homeLoad = ess.homeLoad ?? 0;
-  const pvPower  = ess.pvPower  ?? 0;
+  const homeLoad   = ess.homeLoad  ?? 0;
+  const pvPower    = ess.pvPower   ?? 0;
   const gridImport = ess.gridPower ?? 0; // 正=买电(import)
+  let extraChargeKw = null, extraSellKw = null;
+
   if (gridImport > BREAKER_KW - BREAKER_BUFFER) {
     const safeKw = calcSafeChargeKw(homeLoad, pvPower);
-    console.log(`[安全] 电网进口 ${gridImport.toFixed(2)}kW 超限，降充电至 ${safeKw}kW`);
+    console.log(`[安全] 电网进口 ${gridImport.toFixed(2)}kW 超断路器上限，降充电至 ${safeKw}kW`);
     await updateChargeKw(safeKw);
-    logData(db, ess, amber, slot, 'throttled');
+    extraChargeKw = safeKw;
+    logData(db, ess, amber, slot, 'throttled', { chargeKw: safeKw });
     db.close();
     return;
   }
@@ -314,13 +430,14 @@ async function main() {
     if (amber && amber.feedInPrice != null) {
       const planSellMinC = JSON.parse(planRow?.notes ?? '{}').sellMinC ?? 13.5;
       if (amber.feedInPrice >= planSellMinC) {
-        // 动态计算卖电功率（保留家用）
         const maxSellKw = parseFloat(Math.min(MAX_SELL_KW, MAX_SELL_KW - homeLoad * 0.1).toFixed(2));
-        await updateSellKw(Math.max(0.5, maxSellKw));
+        const actualSellKw = Math.max(0.5, maxSellKw);
+        await updateSellKw(actualSellKw);
+        extraSellKw = actualSellKw;
         action = 'sell';
       } else {
-        // feedIn 太低，停止卖电
         await updateSellKw(0);
+        extraSellKw = 0;
         console.log(`[卖电] feedIn=${amber.feedInPrice.toFixed(1)}¢ < ${planSellMinC}¢，停止卖电`);
         action = 'sell-skip';
       }
@@ -348,26 +465,16 @@ async function main() {
     action = 'soc-floor';
   }
 
-  // 7. 记录数据
-  logData(db, ess, amber, slot, action);
+  // 7. 记录数据（所有字段）
+  logData(db, ess, amber, slot, action, {
+    chargeKw: extraChargeKw,
+    sellKw:   extraSellKw,
+    alert:    (isDW && !slotIsDW) ? 'unexpected-DW' : null,
+  });
 
-  // 8. 每小时整点打印今日汇总
+  // 8. 每小时整点打印今日汇总（用 ESS 自带的今日累计，最准确）
   if (syd.mi === 0) {
-    try {
-      const today = syd.date;
-      const summary = db.prepare(`
-        SELECT 
-          ROUND(SUM(CASE WHEN grid_power < 0 THEN ABS(grid_power) * 5.0/60.0 ELSE 0 END),2) as grid_buy_kwh,
-          ROUND(SUM(CASE WHEN grid_power > 0 THEN grid_power * 5.0/60.0 ELSE 0 END),2) as grid_sell_kwh,
-          ROUND(SUM(COALESCE(pv_power,0) * 5.0/60.0),2) as pv_kwh,
-          MIN(soc) as min_soc, MAX(soc) as max_soc,
-          ROUND(AVG(soc),0) as avg_soc
-        FROM energy_log
-        WHERE ts >= datetime('now','start of day','-10 hours')
-          AND ts < datetime('now','start of day','14 hours')
-      `).get();
-      console.log(`[今日] 买电:${summary?.grid_buy_kwh}kWh 卖电:${summary?.grid_sell_kwh}kWh PV:${summary?.pv_kwh}kWh SOC:${summary?.min_soc}%–${summary?.max_soc}%(avg ${summary?.avg_soc}%)`);
-    } catch {}
+    console.log(`[今日] 买电:${ess.todayGridBuyKwh?.toFixed(2)}kWh 卖电:${ess.todayGridSellKwh?.toFixed(2)}kWh PV:${ess.todayPvKwh?.toFixed(2)}kWh 充电:${ess.todayChargeKwh?.toFixed(2)}kWh 放电:${ess.todayDischargeKwh?.toFixed(2)}kWh`);
   }
 
   db.close();

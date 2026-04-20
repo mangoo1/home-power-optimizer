@@ -37,7 +37,8 @@ if (!ESS_TOKEN   || !ESS_MAC_HEX)   throw new Error('Missing ESS_TOKEN or ESS_MA
 // ── 系统常量 ──────────────────────────────────────────────────
 const BATT_KWH       = 42;      // 电池总容量 kWh
 const SOC_MIN        = 0.20;    // 最低 SOC（不放电到这以下）
-const SOC_TARGET     = 0.85;    // 充电目标
+const SOC_TARGET     = 0.85;    // 充电目标（15:00前达到）
+const SOC_TARGET_BY  = 15;      // 目标达到时间（Sydney 小时，15:00）
 const MAX_CHARGE_KW  = 5.0;     // 逆变器最大充电功率
 const MAX_SELL_KW    = 5.0;     // 逆变器最大放电功率
 const BREAKER_KW     = 7.7;     // 主断路器限制
@@ -257,7 +258,8 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW) {
       // Demand Window：绝不充电，尽量少用电
       action = 'standby';
       reason = 'DW';
-    } else if (s.buyC <= buyThreshold && socKwh < SOC_TARGET * BATT_KWH && maxChargeKw >= 0.5) {
+    } else if (s.buyC <= buyThreshold && socKwh < SOC_TARGET * BATT_KWH && maxChargeKw >= 0.5 && h < SOC_TARGET_BY) {
+      // 低价充电，且在 15:00 前（15:00 后不再从电网充）
       // 低价充电
       action   = 'charge';
       chargeKw = maxChargeKw;
