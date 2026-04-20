@@ -46,6 +46,7 @@ const PANEL_KWP      = 4.3;     // 系统峰值功率
 const MAX_DAILY_KWH  = 22.0;    // 晴天理论上限（4.3kWp × ~5h 有效日照）
 const CHARGE_BUFFER  = 0.5;     // 充电安全余量 kW
 const BUY_MAX_C      = 12.0;    // 买电上限（超过不充）
+const BUY_MIN_C      = parseFloat(process.env.BUY_THRESHOLD_C || '8.0'); // 买电阈值下限（.env 可覆盖）
 const SELL_MIN_C     = 13.5;    // 卖电下限（低于不卖）
 const DB_PATH        = path.join(__dirname, '..', 'data', 'energy.db');
 
@@ -230,7 +231,7 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW) {
   // 买电阈值：取所有槽中便宜的30%分位
   const buySorted = slots.map(s => s.buyC).filter(c => c > 0).sort((a,b) => a-b);
   const p30idx = Math.floor(buySorted.length * 0.30);
-  const buyThreshold = Math.min(BUY_MAX_C, buySorted[p30idx] ?? BUY_MAX_C);
+  const buyThreshold = Math.min(BUY_MAX_C, Math.max(BUY_MIN_C, buySorted[p30idx] ?? BUY_MAX_C));
 
   console.log(`\n[计划] 买电阈值: ${buyThreshold.toFixed(1)}¢ | 卖电下限: ${SELL_MIN_C}¢ | DW: ${hasDW}`);
 
