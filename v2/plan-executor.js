@@ -223,6 +223,13 @@ async function updateSellKw(kw) {
   return ok;
 }
 
+// 切回 Self-use 模式（0x300C=0）
+async function switchToSelfUse() {
+  const ok = await setParam('0x300C', 0);
+  console.log(`[模式] 切回 Self-use ${ok?'✅':'❌'}`);
+  return ok;
+}
+
 // 紧急停止：清空充放电功率（DW 或超断路器）
 async function emergencyStop(reason) {
   console.log(`[紧急] 停止充放电: ${reason}`);
@@ -454,7 +461,11 @@ async function main() {
 
   } else if (slot.action === 'standby' || slot.action === 'self-use') {
     // 自用/待机：充电窗口由 plan-today 决定，executor 不做机会充电
+    // 若逆变器还在 Timed 模式，切回 Self-use
     {
+      if (ess.reportedMode === 1) {
+        await switchToSelfUse();
+      }
       action = slot.action;
     }
 
