@@ -179,7 +179,7 @@ function calcPvCalibration(db) {
   const calibFactor = ratioCount > 0 ? ratioSum / ratioCount : 0.6;
   console.log(`\n[PV校准] 过去${ratioCount}天有效数据，校准系数: ${calibFactor.toFixed(3)}`);
   calibLog.forEach(l => console.log(l));
-  return Math.min(1.0, Math.max(0.3, calibFactor)); // 限制在 0.3–1.0
+  return Math.min(1.0, Math.max(0.6, calibFactor)); // 限制在 0.6–1.0（下限调高，保守估算）
 }
 
 // ── Step 3: 从 solar_forecast 获取今天逐小时 PV 预测 ───────────
