@@ -95,12 +95,22 @@ function httpsPost(url, body, headers = {}) {
   });
 }
 
-// ── Step 1: 获取 Amber 价格预测 ───────────────────────────────
+// ── Step 1: 获取 Amber 价格预测（含重试，最多3次）────────────────
 async function fetchAmberPrices() {
   const url = `https://api.amber.com.au/v1/sites/${AMBER_SITE_ID}/prices/current?next=288`;
-  const data = await httpsGet(url, { Authorization: `Bearer ${AMBER_TOKEN}` });
-  if (!Array.isArray(data)) throw new Error('Amber API error: ' + JSON.stringify(data).slice(0, 200));
-  return data;
+  const MAX_RETRIES = 3;
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    const data = await httpsGet(url, { Authorization: `Bearer ${AMBER_TOKEN}` });
+    if (Array.isArray(data)) return data;
+    const msg = JSON.stringify(data).slice(0, 200);
+    if (attempt < MAX_RETRIES) {
+      const wait = attempt * 30000; // 30s, 60s
+      console.warn(`[Amber] 第${attempt}次失败（${msg}），${wait/1000}s 后重试...`);
+      await new Promise(r => setTimeout(r, wait));
+    } else {
+      throw new Error('Amber API error: ' + msg);
+    }
+  }
 }
 
 // 把5分钟 Amber 数据聚合成30分钟槽
