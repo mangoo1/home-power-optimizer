@@ -266,13 +266,17 @@ function logData(db, ess, amber, slot, action, extra = {}) {
   let meterBuyDelta = null, meterSellDelta = null;
   try {
     const prev = db.prepare(
-      "SELECT meter_buy_total, meter_sell_total FROM energy_log WHERE meter_buy_total IS NOT NULL ORDER BY ts DESC LIMIT 1"
+      "SELECT meter_buy_total, meter_sell_total, ts FROM energy_log WHERE meter_buy_total IS NOT NULL ORDER BY ts DESC LIMIT 1"
     ).get();
-    if (prev && ess.meterBuy != null)  meterBuyDelta  = parseFloat((ess.meterBuy  - prev.meter_buy_total).toFixed(4));
-    if (prev && ess.meterSell != null) meterSellDelta = parseFloat((ess.meterSell - prev.meter_sell_total).toFixed(4));
-    // 防止负值（计数器重置）
-    if (meterBuyDelta  < 0) meterBuyDelta  = null;
-    if (meterSellDelta < 0) meterSellDelta = null;
+    if (prev && ess.meterBuy != null) {
+      const delta = parseFloat((ess.meterBuy - prev.meter_buy_total).toFixed(4));
+      // 合理范围：0 ~ 5分钟最大可能（7.7kW × 10min / 60 ≈ 1.3kWh，留余量到2kWh）
+      if (delta >= 0 && delta < 2.0) meterBuyDelta = delta;
+    }
+    if (prev && ess.meterSell != null) {
+      const delta = parseFloat((ess.meterSell - prev.meter_sell_total).toFixed(4));
+      if (delta >= 0 && delta < 2.0) meterSellDelta = delta;
+    }
   } catch {}
 
   const modeMap = { charge:1, 'charge+hw':1, sell:6, 'self-use':0, standby:0, hotwater:0 };
