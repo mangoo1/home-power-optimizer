@@ -519,10 +519,12 @@ async function applyToInverter(plan, today) {
     console.log('[逆变器] 今天无卖电计划');
   }
 
-  const yd = new Date(); yd.setDate(yd.getDate()-1);
-  const td = new Date(); td.setDate(td.getDate()+1);
-  const yesterday = yd.toISOString().substring(0,10);
-  const tomorrow  = td.toISOString().substring(0,10);
+  // 用 Sydney 日期计算（避免 UTC 偏差导致日期错位）
+  const sydNowMs = Date.now() + 11*3600*1000; // UTC+11
+  const ydMs = sydNowMs - 86400*1000;
+  const tdMs = sydNowMs + 86400*1000;
+  const yesterday = new Date(ydMs).toISOString().slice(0,10);
+  const tomorrow  = new Date(tdMs).toISOString().slice(0,10);
 
   const steps = [
     ['mode=Timed(1)',                  () => setParam('0x300C', 1)],
