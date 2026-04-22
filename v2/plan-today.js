@@ -388,7 +388,7 @@ async function applyToInverter(plan, today) {
     console.log('[逆变器] 今天无充电计划');
   }
 
-  // 卖电窗口：取充电结束后的第一段卖电
+  // 卖电窗口：取充电结束后的第一段卖电，结束时间由可卖电量动态推算
   let sellStartHHMM = '0000', sellEndHHMM = '0000', sellKw = 5;
   if (sellPlan.length > 0) {
     const chargeEndMins = chargeEndHHMM === '0000' ? 0
@@ -401,8 +401,22 @@ async function applyToInverter(plan, today) {
     const fh = parseInt(eveningSell.nemTime.substring(11,13));
     const fm = parseInt(eveningSell.nemTime.substring(14,16));
     sellStartHHMM = hhmm(fh, fm);
-    sellEndHHMM   = '2100';
-    console.log(`[逆变器] 卖电: ${sellStartHHMM}–${sellEndHHMM}, ${sellKw}kW`);
+
+    // 动态推算卖电结束时间：峰值SOC - 过夜保留35% = 可卖电量
+    const peakSocKwh = Math.max(...sellPlan.map(s => {
+      // 找卖电开始前的最高 SOC
+      const idx = todaySlots.findIndex(x => x.key === s.key);
+      return idx > 0 ? (todaySlots[idx-1].socPct / 100 * BATT_KWH) : 0;
+    }));
+    const sellableKwh = Math.max(0, peakSocKwh - SOC_OVERNIGHT * BATT_KWH);
+    const sellDurationHours = sellableKwh / MAX_SELL_KW;
+    const sellStartMins = fh * 60 + fm;
+    const sellEndMins = Math.min(sellStartMins + Math.round(sellDurationHours * 60), 21 * 60); // 最晚21:00
+    const sellEndH = Math.floor(sellEndMins / 60);
+    const sellEndM = sellEndMins % 60;
+    sellEndHHMM = hhmm(sellEndH, sellEndM);
+
+    console.log(`[逆变器] 卖电: ${sellStartHHMM}–${sellEndHHMM}, ${sellKw}kW (可卖${sellableKwh.toFixed(1)}kWh, ${sellDurationHours.toFixed(1)}h)`);
   } else {
     console.log('[逆变器] 今天无卖电计划');
   }
