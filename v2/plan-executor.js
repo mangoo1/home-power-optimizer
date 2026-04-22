@@ -475,9 +475,19 @@ async function main() {
         action = 'sell-skip';
       }
     } else {
-      // Amber blip：维持当前状态（窗口已设好，逆变器自行处理）
-      console.log('[卖电] Amber blip，维持当前逆变器窗口');
-      action = 'sell-blip';
+      // Amber blip：无法获取价格，但仍需检查 SOC 底线
+      if (ess.soc !== null && ess.soc <= SOC_OVERNIGHT) {
+        await switchToSelfUse();
+        await setParam('0xC0BC', 0);
+        await setParam('0xC018', 0);
+        await setParam('0xC01A', 0);
+        extraSellKw = 0;
+        console.log(`[卖电] Amber blip 但 SOC=${ess.soc}% ≤ ${SOC_OVERNIGHT}%，强制停止卖电`);
+        action = 'sell-soc-floor';
+      } else {
+        console.log('[卖电] Amber blip，维持当前逆变器窗口');
+        action = 'sell-blip';
+      }
     }
 
   } else if (slot.action === 'hotwater') {
