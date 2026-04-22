@@ -37,6 +37,7 @@ if (!ESS_TOKEN   || !ESS_MAC_HEX)   throw new Error('Missing ESS_TOKEN or ESS_MA
 // ── 系统常量 ──────────────────────────────────────────────────
 const BATT_KWH       = 42;      // 电池总容量 kWh
 const SOC_MIN        = 0.20;    // 最低 SOC（不放电到这以下）
+const SOC_OVERNIGHT  = 0.35;    // 21:00后过夜保留 SOC（不卖电到这以下）
 const SOC_TARGET     = 0.85;    // 充电目标（15:00前达到）
 const SOC_TARGET_BY  = 15;      // 目标达到时间（Sydney 小时，15:00）
 const MAX_CHARGE_KW  = 5.0;     // 逆变器最大充电功率
@@ -283,7 +284,9 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW) {
     const maxChargeKw  = parseFloat(Math.min(MAX_CHARGE_KW, Math.max(0, gridHeadroom)).toFixed(2));
 
     const usableKwh = Math.max(0, socKwh - SOC_MIN * BATT_KWH);
-    const maxSellKw = parseFloat(Math.min(MAX_SELL_KW, usableKwh / 0.5).toFixed(2));
+    // 始终保留过夜电量（35% SOC），限制可卖电量
+    const sellableKwh = Math.max(0, socKwh - SOC_OVERNIGHT * BATT_KWH);
+    const maxSellKw = parseFloat(Math.min(MAX_SELL_KW, sellableKwh / 0.5).toFixed(2));
 
     let action = 'self-use', chargeKw = 0, sellKw = 0, reason = '';
 
