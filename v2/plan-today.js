@@ -36,10 +36,10 @@ if (!ESS_TOKEN   || !ESS_MAC_HEX)   throw new Error('Missing ESS_TOKEN or ESS_MA
 
 // ── 系统常量 ──────────────────────────────────────────────────
 const BATT_KWH       = 42;      // 电池总容量 kWh
-const SOC_MIN        = 0.20;    // 最低 SOC（不放电到这以下）
-const SOC_OVERNIGHT  = 0.35;    // 21:00后过夜保留 SOC（不卖电到这以下）
-const SOC_TARGET     = 0.85;    // 充电目标（15:00前达到）
-const SOC_TARGET_BY  = 15;      // 目标达到时间（Sydney 小时，15:00）
+const SOC_MIN        = 0.10;    // 最低 SOC 底线（不放电到这以下）
+const SOC_OVERNIGHT  = 0.35;    // 21:00 过夜保留目标（不卖电到这以下）
+const SOC_TARGET     = 0.85;    // 充电目标 SOC
+// SOC_TARGET_BY 不再硬编码，由运行时动态计算：有DW取DW前1小时，无DW取低电价结束时间
 const MAX_CHARGE_KW  = 5.0;     // 逆变器最大充电功率
 const MAX_SELL_KW    = 5.0;     // 逆变器最大放电功率
 const BREAKER_KW     = 7.7;     // 主断路器限制
@@ -232,6 +232,24 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW) {
   const targetKwh  = SOC_TARGET * BATT_KWH;               // 目标 kWh（85%）
   const currentKwh = currentSoc / 100 * BATT_KWH;
 
+  // ── 动态计算充电截止时间 ──────────────────────────────────
+  // 有 DW：在 DW 开始前 1 小时停止充电（避免 DW 时段还在充）
+  // 无 DW：取今天最后一个低电价时段结束时间（买价 < BUY_MAX_C 的最后一槽）
+  let chargeTargetBy; // Sydney 小时（exclusive）
+  if (hasDW) {
+    const dwSlot = slots.find(s => s.dw);
+    const dwHour = dwSlot ? parseInt(dwSlot.key.split(':')[0]) : 17;
+    chargeTargetBy = Math.max(9, dwHour - 1); // DW前1小时，最早9点
+    console.log(`[充电截止] DW模式，截止 ${chargeTargetBy}:00（DW开始 ${dwHour}:00）`);
+  } else {
+    // 找今天价格低于 BUY_MAX_C 的最后一个时段
+    const cheapSlots = slots.filter(s => s.buyC > 0 && s.buyC < BUY_MAX_C && !s.dw);
+    const lastCheap = cheapSlots.length ? cheapSlots[cheapSlots.length - 1] : null;
+    const lastH = lastCheap ? parseInt(lastCheap.key.split(':')[0]) + 1 : 15;
+    chargeTargetBy = Math.min(lastH, 17); // 最晚17点
+    console.log(`[充电截止] 无DW，按低电价截止 ${chargeTargetBy}:00（最后低价槽 ${lastCheap?.key ?? 'none'}）`);
+  }
+
   // ── Phase 1: 倒推需要充多少，选最便宜的槽 ──────────────────
   // 只考虑 15:00 前、非 DW 的候选槽，算出每槽可充 kWh
   const candidateSlots = slots
@@ -244,7 +262,7 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW) {
       const chargeKwhPer = maxChargeKw * 0.5 * 0.95; // 半小时可充入 kWh（含效率）
       return { ...s, h, pv, hl, maxChargeKw, chargeKwhPer };
     })
-    .filter(s => s.h < SOC_TARGET_BY && !s.dw && s.maxChargeKw >= 0.5 && s.buyC > 0);
+    .filter(s => s.h < chargeTargetBy && !s.dw && s.maxChargeKw >= 0.5 && s.buyC > 0);
 
   // 按电价从低到高排，贪心选槽直到充够
   const sortedByPrice = [...candidateSlots].sort((a, b) => a.buyC - b.buyC);
@@ -333,7 +351,7 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW) {
     });
   }
 
-  return { plan, buyThreshold };
+  return { plan, buyThreshold, chargeTargetBy };
 }
 
 // ── Step 6: 逆变器控制 ────────────────────────────────────────
@@ -477,7 +495,7 @@ function savePlan(db, today, plan, meta) {
     today, version, new Date().toISOString(), 'v2-rules', 'v2/plan-today.js',
     meta.currentSocPct,
     meta.hasDW ? 1 : 0,
-    17,
+    meta.chargeTargetBy,
     parseFloat(meta.pvForecastKwh.toFixed(2)),
     parseFloat(meta.pvPeakKw.toFixed(2)),
     JSON.stringify(chargeWindows),
@@ -573,7 +591,7 @@ async function main() {
   console.log(`[Amber] ${slots.length} 个半小时槽, DW: ${hasDW}`);
 
   // 5. 生成计划
-  const { plan, buyThreshold } = buildPlan(slots, pvByHour, currentSocPct, hasDW);
+  const { plan, buyThreshold, chargeTargetBy } = buildPlan(slots, pvByHour, currentSocPct, hasDW);
 
   // 6. 打印
   const report = printPlan(plan, currentSocPct, today);
@@ -581,7 +599,7 @@ async function main() {
 
   // 7. 存 DB
   const version = savePlan(db, today, plan, {
-    currentSocPct, hasDW, pvForecastKwh, pvPeakKw, calibFactor, buyThreshold
+    currentSocPct, hasDW, pvForecastKwh, pvPeakKw, calibFactor, buyThreshold, chargeTargetBy
   });
   db.close();
 

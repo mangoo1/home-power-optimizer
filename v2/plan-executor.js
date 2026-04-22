@@ -43,7 +43,7 @@ const BREAKER_KW      = parseFloat(process.env.MAIN_BREAKER_KW ?? '7.7');
 const BREAKER_BUFFER  = 0.3;   // kW 安全余量，不撞到断路器上限
 const MAX_CHARGE_KW   = 5.0;
 const MAX_SELL_KW     = 5.0;
-const SOC_FLOOR       = 20;    // % 绝对底线，不往下放
+const SOC_FLOOR       = 10;    // % 绝对底线，不往下放
 const SOC_OVERNIGHT   = 35;    // % 过夜保留底线，卖电不低于此值
 const DB_PATH         = path.join(__dirname, '..', 'data', 'energy.db');
 
