@@ -44,6 +44,7 @@ const BREAKER_BUFFER  = 0.3;   // kW 安全余量，不撞到断路器上限
 const MAX_CHARGE_KW   = 5.0;
 const MAX_SELL_KW     = 5.0;
 const SOC_FLOOR       = 20;    // % 绝对底线，不往下放
+const SOC_OVERNIGHT   = 35;    // % 过夜保留底线，卖电不低于此值
 const DB_PATH         = path.join(__dirname, '..', 'data', 'energy.db');
 
 // ── 工具 ──────────────────────────────────────────────────────
@@ -449,8 +450,14 @@ async function main() {
     }
 
   } else if (slot.action === 'sell') {
-    // 卖电时段：实时检查 feedIn 价格，动态决定是否卖
-    if (amber && amber.feedInPrice != null) {
+    // 卖电时段：实时检查 SOC 底线 + feedIn 价格
+    if (ess.soc !== null && ess.soc <= SOC_OVERNIGHT) {
+      // SOC 触底过夜保留线，立即停止放电切 Self-use
+      await switchToSelfUse();
+      extraSellKw = 0;
+      console.log(`[卖电] SOC=${ess.soc}% ≤ ${SOC_OVERNIGHT}%，停止卖电切 Self-use`);
+      action = 'sell-soc-floor';
+    } else if (amber && amber.feedInPrice != null) {
       const planSellMinC = JSON.parse(planRow?.notes ?? '{}').sellMinC ?? 13.5;
       if (amber.feedInPrice >= planSellMinC) {
         const maxSellKw = parseFloat(Math.min(MAX_SELL_KW, MAX_SELL_KW - homeLoad * 0.1).toFixed(2));
