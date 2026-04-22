@@ -382,8 +382,7 @@ async function applyToInverter(plan, today) {
     const endMins = lh*60+lm+30;
     chargeStartHHMM = hhmm(fh, fm);
     chargeEndHHMM   = hhmm(Math.floor(endMins/60), endMins%60);
-    chargeKw = Math.min(...chargePlan.map(s => s.chargeKw || 5));
-    chargeKw = Math.max(0.5, parseFloat(chargeKw.toFixed(2)));
+    chargeKw = MAX_CHARGE_KW; // 写满功率上限，由 executor 实时动态降速
     console.log(`[逆变器] 充电: ${chargeStartHHMM}–${chargeEndHHMM}, ${chargeKw}kW`);
   } else {
     console.log('[逆变器] 今天无充电计划');
