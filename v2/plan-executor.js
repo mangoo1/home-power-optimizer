@@ -282,6 +282,8 @@ function logData(db, ess, amber, slot, action, extra = {}) {
   const modeMap = { charge:1, 'charge+hw':1, sell:6, 'self-use':0, standby:0, hotwater:0 };
   const modeNum = slot ? (modeMap[slot.action] ?? 0) : null;
 
+  const modeChanged = (extra.modeFrom != null || extra.modeTo != null) ? 1 : 0;
+
   try {
     db.prepare(`
       INSERT OR REPLACE INTO energy_log (
@@ -293,7 +295,7 @@ function logData(db, ess, amber, slot, action, extra = {}) {
         amber_cl_price, amber_cl_descriptor, amber_cl_tariff_period,
         amber_feedin_price, amber_spot_price,
         next_demand_min,
-        mode, mode_changed, mode_reason,
+        mode, mode_changed, mode_reason, mode_from, mode_to,
         meter_buy_total, meter_sell_total,
         meter_buy_delta, meter_sell_delta,
         today_charge_kwh, today_discharge_kwh, today_pv_kwh,
@@ -312,6 +314,8 @@ function logData(db, ess, amber, slot, action, extra = {}) {
         ?,?,?,
         ?,?,
         ?,
+        ?,?,?,
+        ?,?,
         ?,?,?,
         ?,?,
         ?,?,
@@ -336,7 +340,8 @@ function logData(db, ess, amber, slot, action, extra = {}) {
       amber?.feedInPrice ?? null, amber?.spotPrice ?? null,
       amber?.nextDemandMin ?? null,
       // mode
-      modeNum, 0, action ?? slot?.action ?? 'unknown',
+      modeNum, modeChanged, action ?? slot?.action ?? 'unknown',
+      extra.modeFrom ?? null, extra.modeTo ?? null,
       // meter
       ess.meterBuy ?? null, ess.meterSell ?? null,
       meterBuyDelta, meterSellDelta,
@@ -441,6 +446,7 @@ async function main() {
       console.log(`[模式] charge时段但mode=${ess.reportedMode}，切回 Timed`);
       const chargeWindows = planRow ? JSON.parse(planRow.charge_windows_json || '[]') : [];
       await restoreTimedMode(chargeWindows);
+      logData(db, ess, amber, slot, 'mode-switch-timed', { modeFrom: ess.reportedMode, modeTo: 1 });
     }
     const safeKw = calcSafeChargeKw(homeLoad, pvPower);
     const targetKw = parseFloat(Math.min(slot.chargeKw || MAX_CHARGE_KW, safeKw).toFixed(2));
@@ -464,6 +470,7 @@ async function main() {
       extraSellKw = 0;
       console.log(`[卖电] SOC=${ess.soc}% ≤ ${SOC_OVERNIGHT}%，停止卖电，清卖电窗口`);
       action = 'sell-soc-floor';
+      logData(db, ess, amber, slot, 'mode-switch-selfuse', { modeFrom: ess.reportedMode, modeTo: 0, sellKw: 0 });
     } else if (amber && amber.feedInPrice != null) {
       const planSellMinC = JSON.parse(planRow?.notes ?? '{}').sellMinC ?? 9.9;
       if (amber.feedInPrice >= planSellMinC) {
@@ -490,6 +497,7 @@ async function main() {
         extraSellKw = 0;
         console.log(`[卖电] Amber blip 但 SOC=${ess.soc}% ≤ ${SOC_OVERNIGHT}%，强制停止卖电`);
         action = 'sell-soc-floor';
+      logData(db, ess, amber, slot, 'mode-switch-selfuse', { modeFrom: ess.reportedMode, modeTo: 0, sellKw: 0 });
       } else {
         console.log('[卖电] Amber blip，维持当前逆变器窗口');
         action = 'sell-blip';
@@ -507,6 +515,7 @@ async function main() {
     {
       if (ess.reportedMode === 1) {
         await switchToSelfUse();
+        logData(db, ess, amber, slot, 'mode-switch-selfuse', { modeFrom: 1, modeTo: 0 });
       }
       action = slot.action;
     }
