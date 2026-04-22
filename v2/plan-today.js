@@ -480,17 +480,17 @@ async function applyToInverter(plan, today) {
   const chargePlan  = todaySlots.filter(s => s.action === 'charge');
   const sellPlan    = todaySlots.filter(s => s.action === 'sell');
 
-  // 充电窗口
+  // 充电窗口（用槽 key "HH:MM" 而不是 nemTime，避免 5min 数据偏移导致时间不准）
   let chargeStartHHMM = '0000', chargeEndHHMM = '0000', chargeKw = 0;
   if (chargePlan.length > 0) {
-    const fh = parseInt(chargePlan[0].nemTime.substring(11,13));
-    const fm = parseInt(chargePlan[0].nemTime.substring(14,16));
-    const lh = parseInt(chargePlan[chargePlan.length-1].nemTime.substring(11,13));
-    const lm = parseInt(chargePlan[chargePlan.length-1].nemTime.substring(14,16));
+    const fKey = chargePlan[0].key;                            // "08:30"
+    const lKey = chargePlan[chargePlan.length-1].key;          // "16:30"
+    const fh = parseInt(fKey.substring(0,2)), fm = parseInt(fKey.substring(3,5));
+    const lh = parseInt(lKey.substring(0,2)), lm = parseInt(lKey.substring(3,5));
     const endMins = lh*60+lm+30;
     chargeStartHHMM = hhmm(fh, fm);
     chargeEndHHMM   = hhmm(Math.floor(endMins/60), endMins%60);
-    chargeKw = MAX_CHARGE_KW; // 写满功率上限，由 executor 实时动态降速
+    chargeKw = MAX_CHARGE_KW;
     console.log(`[逆变器] 充电: ${chargeStartHHMM}–${chargeEndHHMM}, ${chargeKw}kW`);
   } else {
     console.log('[逆变器] 今天无充电计划');
@@ -502,17 +502,16 @@ async function applyToInverter(plan, today) {
     const chargeEndMins = chargeEndHHMM === '0000' ? 0
       : parseInt(chargeEndHHMM.substring(0,2))*60 + parseInt(chargeEndHHMM.substring(2,4));
     const eveningSell = sellPlan.find(s => {
-      const sh = parseInt(s.nemTime.substring(11,13));
-      const sm = parseInt(s.nemTime.substring(14,16));
+      const sh = parseInt(s.key.substring(0,2));
+      const sm = parseInt(s.key.substring(3,5));
       return sh*60+sm >= chargeEndMins;
     }) ?? sellPlan[0];
-    const fh = parseInt(eveningSell.nemTime.substring(11,13));
-    const fm = parseInt(eveningSell.nemTime.substring(14,16));
+    const fh = parseInt(eveningSell.key.substring(0,2));
+    const fm = parseInt(eveningSell.key.substring(3,5));
     sellStartHHMM = hhmm(fh, fm);
 
     // 动态推算卖电结束时间：峰值SOC - 过夜保留35% = 可卖电量
     const peakSocKwh = Math.max(...sellPlan.map(s => {
-      // 找卖电开始前的最高 SOC
       const idx = todaySlots.findIndex(x => x.key === s.key);
       return idx > 0 ? (todaySlots[idx-1].socPct / 100 * BATT_KWH) : 0;
     }));
