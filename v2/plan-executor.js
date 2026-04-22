@@ -230,6 +230,17 @@ async function switchToSelfUse() {
   return ok;
 }
 
+// 恢复 Timed 模式并写入正确的充电时间窗口
+async function restoreTimedMode(chargeWindows) {
+  const w = chargeWindows?.[0];
+  const startHHMM = w ? w.startHour * 100 : 900;
+  const endHHMM   = w ? w.endHour * 100 - 30 : 1430; // endHour是exclusive，减30min
+  await setParam('0x300C', 1);
+  await setParam('0xC014', startHHMM);
+  await setParam('0xC016', endHHMM);
+  console.log(`[模式] 切回 Timed ✅ 充电窗口: ${String(startHHMM).padStart(4,'0')}–${String(endHHMM).padStart(4,'0')}`);
+}
+
 // 紧急停止：清空充放电功率（DW 或超断路器）
 async function emergencyStop(reason) {
   console.log(`[紧急] 停止充放电: ${reason}`);
@@ -420,10 +431,11 @@ async function main() {
     action = 'no-slot';
 
   } else if (slot.action === 'charge') {
-    // 充电时段：确保 Timed 模式，动态调整功率
+    // 充电时段：确保 Timed 模式+正确窗口，动态调整功率
     if (ess.reportedMode !== 1) {
       console.log(`[模式] charge时段但mode=${ess.reportedMode}，切回 Timed`);
-      await setParam('0x300C', 1);
+      const chargeWindows = planRow ? JSON.parse(planRow.charge_windows_json || '[]') : [];
+      await restoreTimedMode(chargeWindows);
     }
     const safeKw = calcSafeChargeKw(homeLoad, pvPower);
     const targetKw = parseFloat(Math.min(slot.chargeKw || MAX_CHARGE_KW, safeKw).toFixed(2));
