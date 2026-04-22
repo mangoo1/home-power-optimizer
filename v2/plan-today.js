@@ -487,6 +487,8 @@ async function applyToInverter(plan, today) {
     const lKey = chargePlan[chargePlan.length-1].key;          // "16:30"
     const fh = parseInt(fKey.substring(0,2)), fm = parseInt(fKey.substring(3,5));
     const lh = parseInt(lKey.substring(0,2)), lm = parseInt(lKey.substring(3,5));
+    // chargeEnd = 最后充电槽的结束时间（槽开始 + 30min）
+    // 逆变器在 chargeEnd 时刻停止充电，所以最后一个槽能跑完整 30 分钟
     const endMins = lh*60+lm+30;
     chargeStartHHMM = hhmm(fh, fm);
     chargeEndHHMM   = hhmm(Math.floor(endMins/60), endMins%60);
@@ -703,7 +705,12 @@ async function main() {
     : `✅ 21:00 预计 ${overnight.plannedSoc21}% (${overnight.plannedKwh21?.toFixed(1)}kWh)，近7天夜间均耗 ${overnight.avgNightKwh ?? '?'}kWh，过夜充足`;
   console.log('\n[过夜检阅] ' + overnightLine);
 
-  // 7. 存 DB
+  // 7. 存 DB（先拿旧计划的窗口用于对比）
+  const prevPlan = db.prepare("SELECT charge_windows_json, intervals_json FROM daily_plan WHERE date=? AND is_active=1").get(today);
+  const prevChargeW = prevPlan?.charge_windows_json ?? '[]';
+  const prevSellSlots = prevPlan ? JSON.parse(prevPlan.intervals_json ?? '[]').filter(s=>s.action==='sell').map(s=>s.key).join(',') : '';
+  const prevChargeSlots = prevPlan ? JSON.parse(prevPlan.intervals_json ?? '[]').filter(s=>s.action==='charge').map(s=>s.key).join(',') : '';
+
   const version = savePlan(db, today, plan, {
     currentSocPct, hasDW, pvForecastKwh, pvPeakKw, calibFactor, buyThreshold, chargeTargetBy, sellMinC
   });
@@ -712,9 +719,17 @@ async function main() {
   // 8. 写逆变器
   await applyToInverter(plan, today);
 
-  // 9. 发 WhatsApp
-  await sendWhatsApp(report + '\n\n' + overnightLine);
-  console.log('\n[完成] 计划已发送到 WhatsApp');
+  // 9. 只在充电/卖电窗口有变化时才发 WhatsApp（避免每30分钟刷屏）
+  const newChargeSlots = plan.filter(s=>s.action==='charge').map(s=>s.key).join(',');
+  const newSellSlots   = plan.filter(s=>s.action==='sell').map(s=>s.key).join(',');
+  const windowChanged  = newChargeSlots !== prevChargeSlots || newSellSlots !== prevSellSlots;
+
+  if (windowChanged) {
+    await sendWhatsApp(report + '\n\n' + overnightLine);
+    console.log('\n[完成] 计划已发送到 WhatsApp（窗口有变化）');
+  } else {
+    console.log('\n[完成] 计划无变化，静默跳过 WhatsApp');
+  }
 }
 
 main().catch(async e => {
