@@ -420,7 +420,11 @@ async function main() {
     action = 'no-slot';
 
   } else if (slot.action === 'charge') {
-    // 充电时段：动态调整功率，不动窗口
+    // 充电时段：确保 Timed 模式，动态调整功率
+    if (ess.reportedMode !== 1) {
+      console.log(`[模式] charge时段但mode=${ess.reportedMode}，切回 Timed`);
+      await setParam('0x300C', 1);
+    }
     const safeKw = calcSafeChargeKw(homeLoad, pvPower);
     const targetKw = parseFloat(Math.min(slot.chargeKw || MAX_CHARGE_KW, safeKw).toFixed(2));
     if (targetKw < 0.2) {
