@@ -465,12 +465,14 @@ async function main() {
       console.log(`[卖电] SOC=${ess.soc}% ≤ ${SOC_OVERNIGHT}%，停止卖电，清卖电窗口`);
       action = 'sell-soc-floor';
     } else if (amber && amber.feedInPrice != null) {
-      const planSellMinC = JSON.parse(planRow?.notes ?? '{}').sellMinC ?? 13.5;
+      const planSellMinC = JSON.parse(planRow?.notes ?? '{}').sellMinC ?? 9.9;
       if (amber.feedInPrice >= planSellMinC) {
-        const maxSellKw = parseFloat(Math.min(MAX_SELL_KW, MAX_SELL_KW - homeLoad * 0.1).toFixed(2));
-        const actualSellKw = Math.max(0.5, maxSellKw);
+        // 用计划里该槽的 sellKw，fallback 到 MAX_SELL_KW
+        const plannedSellKw = slot.sellKw > 0 ? slot.sellKw : MAX_SELL_KW;
+        const actualSellKw = parseFloat(Math.max(0.5, Math.min(MAX_SELL_KW, plannedSellKw)).toFixed(2));
         await updateSellKw(actualSellKw);
         extraSellKw = actualSellKw;
+        console.log(`[卖电] feedIn=${amber.feedInPrice.toFixed(1)}¢ ≥ ${planSellMinC}¢，卖电 ${actualSellKw}kW`);
         action = 'sell';
       } else {
         await updateSellKw(0);
