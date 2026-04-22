@@ -452,10 +452,13 @@ async function main() {
   } else if (slot.action === 'sell') {
     // 卖电时段：实时检查 SOC 底线 + feedIn 价格
     if (ess.soc !== null && ess.soc <= SOC_OVERNIGHT) {
-      // SOC 触底过夜保留线，立即停止放电切 Self-use
+      // SOC 触底过夜保留线：切 Self-use + 清卖电功率 + 清卖电窗口，防止逆变器自动恢复
       await switchToSelfUse();
+      await setParam('0xC0BC', 0);   // 卖电功率清零
+      await setParam('0xC018', 0);   // 卖电开始时间清零
+      await setParam('0xC01A', 0);   // 卖电结束时间清零
       extraSellKw = 0;
-      console.log(`[卖电] SOC=${ess.soc}% ≤ ${SOC_OVERNIGHT}%，停止卖电切 Self-use`);
+      console.log(`[卖电] SOC=${ess.soc}% ≤ ${SOC_OVERNIGHT}%，停止卖电，清卖电窗口`);
       action = 'sell-soc-floor';
     } else if (amber && amber.feedInPrice != null) {
       const planSellMinC = JSON.parse(planRow?.notes ?? '{}').sellMinC ?? 13.5;
