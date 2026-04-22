@@ -543,8 +543,8 @@ async function applyToInverter(plan, today) {
     [`chargeKw=${chargeKw}`,           () => setParam('0xC0BA', chargeKw)],
     [`sellStart=${sellStartHHMM}`,     () => setParam('0xC018', sellStartHHMM)],
     [`sellEnd=${sellEndHHMM}`,         () => setParam('0xC01A', sellEndHHMM)],
-    // 0xC0BC = 放电/卖电功率：充电时段初始设 0（executor 到卖电时段再写入），无充电计划则直接写卖电功率
-    [`sellKw(0xC0BC)=${chargePlan.length > 0 ? 0 : sellKw}`, () => setParam('0xC0BC', chargePlan.length > 0 ? 0 : sellKw)],
+    // 0xC0BC = 放电/卖电功率：始终写入计划的 sellKw（executor 会在充电时段保护，不会误放电）
+    [`sellKw(0xC0BC)=${sellKw}`, () => setParam('0xC0BC', sellKw)],
     ['otherMode=0',                    () => setParam('0x314E', 0)],
     ['weekdays=all',                   () => setWeekParam('0xC0B4', [1,2,3,4,5,6,0])],
     [`startDate=${yesterday}`,         () => setDateParam('0xC0B6', yesterday)],
