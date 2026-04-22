@@ -49,7 +49,7 @@ const CHARGE_BUFFER  = 0.5;     // 充电安全余量 kW
 const BUY_MAX_C      = 12.0;    // 买电上限（超过不充）
 const BUY_MIN_C      = parseFloat(process.env.BUY_THRESHOLD_C || '8.0'); // 买电阈值下限（.env 可覆盖）
 const SELL_MIN_MARGIN_C = parseFloat(process.env.SELL_MIN_MARGIN_C || '3.0'); // 卖电最低利润（¢/kWh，相对买入均价）
-const SELL_FLOOR_C   = parseFloat(process.env.SELL_FLOOR_C || '8.0');   // 卖电绝对下限（再便宜不卖）
+const SELL_FLOOR_C   = parseFloat(process.env.SELL_FLOOR_C || '9.9');   // 卖电绝对下限（再便宜不卖）
 const DB_PATH        = path.join(__dirname, '..', 'data', 'energy.db');
 
 // ── 工具函数 ──────────────────────────────────────────────────
@@ -390,6 +390,50 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5) {
   return { plan, buyThreshold, chargeTargetBy, sellMinC };
 }
 
+// ── 21:00 过夜电量检阅 ────────────────────────────────────────
+function reviewOvernightReserve(plan, db) {
+  // 计划中 21:00 的预计 SOC
+  const slot21 = plan.find(s => s.key === '21:00') ?? plan.find(s => s.hour === 21);
+  const plannedSoc21 = slot21?.socPct ?? null;
+  const plannedKwh21 = plannedSoc21 != null ? (plannedSoc21 / 100 * BATT_KWH) : null;
+
+  // 从过去7天 energy_log 里统计 21:00–次日07:00 的实际用电（夜间消耗）
+  // ts 字段是 ISO 字符串，用 JS 处理避免 SQLite 版本差异
+  let avgNightKwh = null;
+  try {
+    const cutoff = new Date(Date.now() - 8*86400*1000).toISOString();
+    const nightRows = db.prepare(
+      'SELECT ts, home_load FROM energy_log WHERE ts > ? AND home_load IS NOT NULL AND home_load > 0'
+    ).all(cutoff);
+    const nightByDay = {};
+    for (const r of nightRows) {
+      const d = new Date(r.ts);
+      const sydHour = (d.getUTCHours() + 11) % 24;
+      const sydDate = new Date(d.getTime() + 11*3600*1000).toISOString().slice(0,10);
+      if (sydHour >= 21 || sydHour < 7) {
+        nightByDay[sydDate] = (nightByDay[sydDate] || 0) + r.home_load * (5/60);
+      }
+    }
+    // 只取数据充分的天（>5kWh，排除记录不全的天）
+    const validNights = Object.values(nightByDay).filter(v => v > 5);
+    if (validNights.length > 0) {
+      avgNightKwh = parseFloat((validNights.reduce((a,b)=>a+b,0) / validNights.length).toFixed(1));
+    }
+  } catch {}
+
+  const minNeeded = avgNightKwh ?? (SOC_OVERNIGHT * BATT_KWH);
+  const reserve35pct = SOC_OVERNIGHT * BATT_KWH; // 14.7kWh
+
+  let warning = null;
+  if (plannedKwh21 != null && avgNightKwh != null) {
+    if (plannedKwh21 < avgNightKwh * 1.1) {
+      warning = `⚠️ 21:00 预计 ${plannedSoc21}% (${plannedKwh21.toFixed(1)}kWh)，低于近7天夜间用电均值 ${avgNightKwh}kWh × 1.1 = ${(avgNightKwh*1.1).toFixed(1)}kWh，过夜可能不够！`;
+    }
+  }
+
+  return { plannedSoc21, plannedKwh21, avgNightKwh, reserve35pct, warning };
+}
+
 // ── Step 6: 逆变器控制 ────────────────────────────────────────
 const ESS_HEADERS = {
   Authorization: ESS_TOKEN,
@@ -641,6 +685,13 @@ async function main() {
   const report = printPlan(plan, currentSocPct, today);
   console.log(report);
 
+  // 6b. 21:00 过夜电量检阅
+  const overnight = reviewOvernightReserve(plan, db);
+  const overnightLine = overnight.warning
+    ? overnight.warning
+    : `✅ 21:00 预计 ${overnight.plannedSoc21}% (${overnight.plannedKwh21?.toFixed(1)}kWh)，近7天夜间均耗 ${overnight.avgNightKwh ?? '?'}kWh，过夜充足`;
+  console.log('\n[过夜检阅] ' + overnightLine);
+
   // 7. 存 DB
   const version = savePlan(db, today, plan, {
     currentSocPct, hasDW, pvForecastKwh, pvPeakKw, calibFactor, buyThreshold, chargeTargetBy, sellMinC
@@ -651,7 +702,7 @@ async function main() {
   await applyToInverter(plan, today);
 
   // 9. 发 WhatsApp
-  await sendWhatsApp(report);
+  await sendWhatsApp(report + '\n\n' + overnightLine);
   console.log('\n[完成] 计划已发送到 WhatsApp');
 }
 
