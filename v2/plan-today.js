@@ -251,7 +251,23 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW) {
   }
 
   // ── Phase 1: 倒推需要充多少，选最便宜的槽 ──────────────────
-  // 只考虑 15:00 前、非 DW 的候选槽，算出每槽可充 kWh
+  // 只考虑 chargeTargetBy 前、非 DW 的候选槽，算出每槽可充 kWh
+  const nowHour = parseInt(slots[0]?.key?.split(':')[0] ?? '0');  // 当前时间近似（取第一个槽）
+
+  // 估算从现在到第一个候选充电槽之间的电池消耗（防止 SOC 跌到底线）
+  const waitSlots = slots.filter(s => {
+    const h = parseInt(s.key.split(':')[0]);
+    return h < chargeTargetBy && !s.dw && s.buyC > 0 && s.buyC >= BUY_MAX_C;
+  });
+  // 等待期消耗：每个非充电半小时槽，电池需要供 homeLoad - pv
+  const waitConsumptionKwh = waitSlots.reduce((sum, s) => {
+    const h  = parseInt(s.key.split(':')[0]);
+    const pv = pvAt30min(pvByHour, h);
+    const hl = homeLoadKw(h);
+    const net = Math.max(0, hl - pv); // 需要电池供的净负荷
+    return sum + net * 0.5 * (1 / 0.85); // 放电效率折算
+  }, 0);
+
   const candidateSlots = slots
     .map(s => {
       const h  = parseInt(s.key.split(':')[0]);
@@ -267,11 +283,15 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW) {
   // 按电价从低到高排，贪心选槽直到充够
   const sortedByPrice = [...candidateSlots].sort((a, b) => a.buyC - b.buyC);
   const chargeKeys = new Set();
-  let neededKwh = Math.max(0, targetKwh - currentKwh);
 
-  // 还要扣掉 PV 预计贡献（粗估：15:00 前 PV 总发电 × 自用比例）
+  // neededKwh = 目标 - 当前 + 等待期消耗（防止跌底）
+  let neededKwh = Math.max(0, targetKwh - currentKwh + waitConsumptionKwh);
+
+  // 还要扣掉 PV 预计贡献（候选槽期间 PV 总发电 × 自用比例）
   const pvContrib = candidateSlots.reduce((s, x) => s + x.pv * 0.5 * 0.9, 0);
   neededKwh = Math.max(0, neededKwh - pvContrib);
+
+  console.log(`[计划] 等待期消耗估算: ${waitConsumptionKwh.toFixed(1)}kWh, PV贡献: ${pvContrib.toFixed(1)}kWh`);
 
   const buyThreshold_auto = sortedByPrice.length ? sortedByPrice[0].buyC : BUY_MIN_C;
   let accumulated = 0;
@@ -279,6 +299,17 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW) {
     if (accumulated >= neededKwh) break;
     chargeKeys.add(s.key);
     accumulated += s.chargeKwhPer;
+  }
+
+  // ── 补充：把买价 < BUY_MAX_C 且在充电时间窗口内的"早期低价槽"也纳入 ──
+  // 防止贪心算法因为"够了"就跳过早上可充的廉价时段，导致 SOC 白白消耗
+  // 逻辑：如果一个槽 buyC <= 已选最贵的槽，但时间早（在第一个已选槽之前），也加进来
+  const firstChargeKey = [...chargeKeys].sort()[0];
+  for (const s of candidateSlots) {
+    if (chargeKeys.has(s.key)) continue;
+    if (firstChargeKey && s.key < firstChargeKey && s.buyC <= BUY_MAX_C) {
+      chargeKeys.add(s.key);
+    }
   }
 
   // 实际买电阈值 = 选中槽里最贵的那个（加保底 BUY_MIN_C）
