@@ -239,7 +239,7 @@ function homeLoadKw(hour) {
 }
 
 // ── Step 5: 生成半小时充放电计划 ─────────────────────────────
-function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5) {
+function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5, nightReserveKwh = null) {
   const targetKwh  = SOC_TARGET * BATT_KWH;               // 目标 kWh（85%）
   const currentKwh = currentSoc / 100 * BATT_KWH;
 
@@ -348,8 +348,11 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5) {
     const maxChargeKw  = parseFloat(Math.min(MAX_CHARGE_KW, Math.max(0, gridHeadroom)).toFixed(2));
 
     const usableKwh = Math.max(0, socKwh - SOC_MIN * BATT_KWH);
-    // 始终保留过夜电量（35% SOC），限制可卖电量
-    const sellableKwh = Math.max(0, socKwh - SOC_OVERNIGHT * BATT_KWH);
+    // 过夜保留 = max(35%电量, 实际夜间用电均值×1.1)，防止卖超
+    const overnightFloorKwh = nightReserveKwh
+      ? Math.max(SOC_OVERNIGHT * BATT_KWH, nightReserveKwh * 1.1)
+      : SOC_OVERNIGHT * BATT_KWH;
+    const sellableKwh = Math.max(0, socKwh - overnightFloorKwh);
     const maxSellKw = parseFloat(Math.min(MAX_SELL_KW, sellableKwh / 0.5).toFixed(2));
 
     let action = 'self-use', chargeKw = 0, sellKw = 0, reason = '';
@@ -362,9 +365,8 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5) {
       action   = 'charge';
       chargeKw = maxChargeKw;
       reason   = `buy=${s.buyC}¢ selected(cheapest)`;
-    } else if (s.feedInC >= sellMinC && maxSellKw >= 0.5 && socKwh >= targetKwh) {
-      // 高价卖电：feedIn 够高 + SOC 高于过夜底线 + 已充到目标电量
-      // 未充到目标时不卖电，保电优先
+    } else if (s.feedInC >= sellMinC && maxSellKw >= 0.5) {
+      // 高价卖电：feedIn 够高 + 卖后剩余 > 过夜保留量（含夜间用电安全系数）
       action = 'sell';
       sellKw = maxSellKw;
       reason = `feedIn=${s.feedInC}¢ ≥ ${sellMinC.toFixed(1)}¢`;
@@ -402,6 +404,30 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5) {
 }
 
 // ── 21:00 过夜电量检阅 ────────────────────────────────────────
+function calcAvgNightKwh(db) {
+  // 过去7天 21:00–次日07:00 实际用电均值
+  try {
+    const cutoff = new Date(Date.now() - 8*86400*1000).toISOString();
+    const nightRows = db.prepare(
+      'SELECT ts, home_load FROM energy_log WHERE ts > ? AND home_load IS NOT NULL AND home_load > 0'
+    ).all(cutoff);
+    const nightByDay = {};
+    for (const r of nightRows) {
+      const d = new Date(r.ts);
+      const sydHour = (d.getUTCHours() + 11) % 24;
+      const sydDate = new Date(d.getTime() + 11*3600*1000).toISOString().slice(0,10);
+      if (sydHour >= 21 || sydHour < 7) {
+        nightByDay[sydDate] = (nightByDay[sydDate] || 0) + r.home_load * (5/60);
+      }
+    }
+    const validNights = Object.values(nightByDay).filter(v => v > 5);
+    if (validNights.length > 0) {
+      return parseFloat((validNights.reduce((a,b)=>a+b,0) / validNights.length).toFixed(1));
+    }
+  } catch {}
+  return null;
+}
+
 function reviewOvernightReserve(plan, db) {
   // 计划中 21:00 的预计 SOC
   const slot21 = plan.find(s => s.key === '21:00') ?? plan.find(s => s.hour === 21);
@@ -693,7 +719,11 @@ async function main() {
     : BUY_MIN_C + 1;
   console.log(`[买入均价] 充电槽均价: ${realAvgBuyC.toFixed(2)}¢ (${dryChargeSlots.length}槽)`);
 
-  const { plan, buyThreshold, chargeTargetBy, sellMinC } = buildPlan(slots, pvByHour, currentSocPct, hasDW, realAvgBuyC);
+  // 过去7天夜间实际用电均值，用于限制可卖电量（不卖到晚上不够用）
+  const avgNightKwh = calcAvgNightKwh(db);
+  console.log(`[过夜用电] 近7天均值: ${avgNightKwh ?? '无数据'}kWh，保底: ${avgNightKwh ? (avgNightKwh*1.1).toFixed(1) : (SOC_OVERNIGHT*BATT_KWH).toFixed(1)}kWh`);
+
+  const { plan, buyThreshold, chargeTargetBy, sellMinC } = buildPlan(slots, pvByHour, currentSocPct, hasDW, realAvgBuyC, avgNightKwh);
 
   // 6. 打印
   const report = printPlan(plan, currentSocPct, today);
