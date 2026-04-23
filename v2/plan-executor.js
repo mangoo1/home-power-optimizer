@@ -446,16 +446,11 @@ async function main() {
       await restoreTimedMode(chargeWindows);
       logData(db, ess, amber, slot, 'mode-switch-timed', { modeFrom: ess.reportedMode, modeTo: 1 });
     }
-    const safeKw = calcSafeChargeKw(homeLoad, pvPower);
-    const targetKw = parseFloat(Math.min(slot.chargeKw || MAX_CHARGE_KW, safeKw).toFixed(2));
-    if (targetKw < 0.2) {
-      console.log(`[充电] homeLoad过高(${homeLoad.toFixed(1)}kW)，暂停充电`);
-      await updateChargeKw(0);
-      action = 'charge-paused';
-    } else {
-      await updateChargeKw(targetKw);
-      action = 'charge';
-    }
+    // 充电时段固定 5kW，不做动态降速
+    // 断路器保护已在上方安全检查（gridImport > BREAKER_KW - BUFFER）处理
+    const targetKw = slot.chargeKw || MAX_CHARGE_KW;
+    await updateChargeKw(targetKw);
+    action = 'charge';
 
   } else if (slot.action === 'sell') {
     // 卖电时段：实时检查 SOC 底线 + feedIn 价格
