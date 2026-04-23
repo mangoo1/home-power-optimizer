@@ -202,52 +202,84 @@ async function readAmber() {
 }
 
 // ── 逆变器参数写入 ────────────────────────────────────────────
+// 全局 db 引用，供 setParam 记录日志（main() 里赋值）
+let _db = null;
+let _setParamReason = 'unknown'; // 调用前设置，记录写入原因
+
 async function setParam(index, data) {
   const r = await httpsPost('https://eu.ess-link.com/api/app/deviceInfo/setDeviceParam',
     { macHex:ESS_MAC_HEX, index, data }, ESS_HEADERS).catch(() => ({}));
-  return r.code === 200;
+  const ok = r.code === 200;
+  // 记录到数据库
+  try {
+    if (_db) {
+      _db.prepare(`
+        INSERT OR IGNORE INTO ess_param_log (ts, param_index, param_value, ok, reason, caller)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(new Date().toISOString(), index, String(data), ok ? 1 : 0, _setParamReason, 'plan-executor');
+    }
+  } catch(e) { /* 日志失败不影响主流程 */ }
+  return ok;
+}
+
+// 确保 ess_param_log 表存在
+function ensureParamLogTable(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS ess_param_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts TEXT NOT NULL,
+      param_index TEXT NOT NULL,
+      param_value TEXT,
+      ok INTEGER,
+      reason TEXT,
+      caller TEXT
+    )
+  `);
 }
 
 // 只调整充电功率（不动时间窗口）
-async function updateChargeKw(kw) {
+async function updateChargeKw(kw, reason = _setParamReason) {
   const clamped = parseFloat(Math.min(MAX_CHARGE_KW, Math.max(0, kw)).toFixed(2));
+  _setParamReason = reason;
   const ok = await setParam('0xC0BA', clamped);
-  console.log(`[功率] 充电功率 → ${clamped}kW ${ok?'✅':'❌'}`);
+  console.log(`[功率] 充电功率 → ${clamped}kW ${ok?'✅':'❌'} (${reason})`);
   return ok;
 }
 
 // 只调整放电功率（不动时间窗口）
-async function updateSellKw(kw) {
+async function updateSellKw(kw, reason = _setParamReason) {
   const clamped = parseFloat(Math.min(MAX_SELL_KW, Math.max(0, kw)).toFixed(2));
+  _setParamReason = reason;
   const ok = await setParam('0xC0BC', clamped);
-  console.log(`[功率] 放电功率 → ${clamped}kW ${ok?'✅':'❌'}`);
+  console.log(`[功率] 放电功率 → ${clamped}kW ${ok?'✅':'❌'} (${reason})`);
   return ok;
 }
 
 // 切回 Self-use 模式（0x300C=0）
-async function switchToSelfUse() {
+async function switchToSelfUse(reason = _setParamReason) {
+  _setParamReason = reason;
   const ok = await setParam('0x300C', 0);
-  console.log(`[模式] 切回 Self-use ${ok?'✅':'❌'}`);
+  console.log(`[模式] 切回 Self-use ${ok?'✅':'❌'} (${reason})`);
   return ok;
 }
 
 // 恢复 Timed 模式并写入正确的充电时间窗口
-async function restoreTimedMode(chargeWindows) {
+async function restoreTimedMode(chargeWindows, reason = _setParamReason) {
   const w = chargeWindows?.[0];
   const startHHMM = w ? w.startHour * 100 : 900;
-  // endHour 是 exclusive（如17表示充到16:30截止），转成 HHMM 格式
-  // 16:30 = 1630，不能用 17*100-30=1670（非法）
-  const endHHMM   = w ? (w.endHour - 1) * 100 + 30 : 1430; // endHour是exclusive，减半小时
+  const endHHMM   = w ? (w.endHour - 1) * 100 + 30 : 1430;
+  _setParamReason = reason;
   await setParam('0x300C', 1);
   await setParam('0xC014', startHHMM);
   await setParam('0xC016', endHHMM);
-  await setParam('0xC0BA', MAX_CHARGE_KW);  // 恢复 Timed 后必须重写充电功率
-  console.log(`[模式] 切回 Timed ✅ 充电窗口: ${String(startHHMM).padStart(4,'0')}–${String(endHHMM).padStart(4,'0')} chargeKw=${MAX_CHARGE_KW}`);
+  await setParam('0xC0BA', MAX_CHARGE_KW);
+  console.log(`[模式] 切回 Timed ✅ 充电窗口: ${String(startHHMM).padStart(4,'0')}–${String(endHHMM).padStart(4,'0')} chargeKw=${MAX_CHARGE_KW} (${reason})`);
 }
 
 // 紧急停止：清空充放电功率（DW 或超断路器）
 async function emergencyStop(reason) {
   console.log(`[紧急] 停止充放电: ${reason}`);
+  _setParamReason = `emergencyStop: ${reason}`;
   await setParam('0xC0BA', 0);
   await sleep(300);
   await setParam('0xC0BC', 0);
@@ -378,6 +410,8 @@ async function main() {
   console.log(`\n[${syd.date} ${syd.hh}:${String(syd.mi).padStart(2,'0')}] === plan-executor v2 ===`);
 
   const db = new Database(DB_PATH);
+  _db = db;
+  ensureParamLogTable(db);
 
   // 1. 读今日计划
   const planRow = db.prepare(
@@ -427,7 +461,7 @@ async function main() {
   if (gridImport > BREAKER_KW - BREAKER_BUFFER) {
     const safeKw = calcSafeChargeKw(homeLoad, pvPower);
     console.log(`[安全] 电网进口 ${gridImport.toFixed(2)}kW 超断路器上限，降充电至 ${safeKw}kW`);
-    await updateChargeKw(safeKw);
+    await updateChargeKw(safeKw, `breaker-throttle: gridImport=${gridImport.toFixed(2)}kW home=${homeLoad.toFixed(2)}kW`);
     extraChargeKw = safeKw;
     logData(db, ess, amber, slot, 'throttled', { chargeKw: safeKw });
     db.close();
@@ -446,7 +480,7 @@ async function main() {
     if (ess.reportedMode !== 1) {
       console.log(`[模式] charge时段但mode=${ess.reportedMode}，切回 Timed`);
       const chargeWindows = planRow ? JSON.parse(planRow.charge_windows_json || '[]') : [];
-      await restoreTimedMode(chargeWindows);
+      await restoreTimedMode(chargeWindows, `restore-timed: mode-was-${ess.reportedMode}`);
       logData(db, ess, amber, slot, 'mode-switch-timed', { modeFrom: ess.reportedMode, modeTo: 1 });
     }
     // 充电时段：动态计算安全充电功率
@@ -456,7 +490,7 @@ async function main() {
     if (targetKw < MAX_CHARGE_KW - 0.2) {
       console.log(`[功率] homeLoad=${homeLoad.toFixed(2)}kW 高负载，充电降至 ${targetKw}kW（安全上限 ${safeChargeKw}kW）`);
     }
-    await updateChargeKw(targetKw);
+    await updateChargeKw(targetKw, `charge-slot: home=${homeLoad.toFixed(2)}kW safe=${safeChargeKw}kW`);
     action = 'charge';
 
   } else if (slot.action === 'sell') {
@@ -477,12 +511,12 @@ async function main() {
         // 用计划里该槽的 sellKw，fallback 到 MAX_SELL_KW
         const plannedSellKw = slot.sellKw > 0 ? slot.sellKw : MAX_SELL_KW;
         const actualSellKw = parseFloat(Math.max(0.5, Math.min(MAX_SELL_KW, plannedSellKw)).toFixed(2));
-        await updateSellKw(actualSellKw);
+        await updateSellKw(actualSellKw, `sell-slot: feedIn=${amber.feedInPrice.toFixed(1)}c`);
         extraSellKw = actualSellKw;
         console.log(`[卖电] feedIn=${amber.feedInPrice.toFixed(1)}¢ ≥ ${planSellMinC}¢，卖电 ${actualSellKw}kW`);
         action = 'sell';
       } else {
-        await updateSellKw(0);
+        await updateSellKw(0, `sell-skip: feedIn-too-low`);
         extraSellKw = 0;
         console.log(`[卖电] feedIn=${amber.feedInPrice.toFixed(1)}¢ < ${planSellMinC}¢，停止卖电`);
         action = 'sell-skip';
