@@ -2013,7 +2013,12 @@ async function main() {
 
   if (targetMode !== null && targetMode !== state.currentMode) {
     console.log(`[ACTION] ${MODE_LABEL[state.currentMode] ?? "unknown"} -> ${MODE_LABEL[targetMode]}: ${reason}`);
-    const ok = await setModeWithVerify(targetMode, { homeLoad: ess.homeLoad, pvPower, nextDemandMinutes: amber.nextDemandMinutes, sellPowerKw: alert?.sellPowerKw, throttled: chargeThrottled, planChargeKw: alert?.planChargeKwOverride ?? planSlotChargeKw, chargeOpts: { soc: ess.soc, socTarget: todayPlan?.socTarget ?? 85, cutoffHour: todayPlan?.chargeCutoffHour ?? 18, buyPrice: currentPrice } });
+    // Emergency charge: skip calcOptimalChargeKw (price-aware) — use calcChargeKw (breaker headroom only)
+    const isEmergencyCharge = reason?.includes('EMERGENCY');
+    const chargeOpts = isEmergencyCharge
+      ? {}  // no soc/cutoffHour/buyPrice → falls through to calcChargeKw
+      : { soc: ess.soc, socTarget: todayPlan?.socTarget ?? 85, cutoffHour: todayPlan?.chargeCutoffHour ?? 18, buyPrice: currentPrice };
+    const ok = await setModeWithVerify(targetMode, { homeLoad: ess.homeLoad, pvPower, nextDemandMinutes: amber.nextDemandMinutes, sellPowerKw: alert?.sellPowerKw, throttled: chargeThrottled, planChargeKw: alert?.planChargeKwOverride ?? planSlotChargeKw, chargeOpts });
     if (ok) {
       state.currentMode = targetMode;
       state.lastSwitchTime = now.toISOString();
