@@ -362,8 +362,9 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5) {
       action   = 'charge';
       chargeKw = maxChargeKw;
       reason   = `buy=${s.buyC}¢ selected(cheapest)`;
-    } else if (s.feedInC >= sellMinC && maxSellKw >= 0.5) {
-      // 高价卖电：feedIn > 买入均价+margin，且当前SOC高于过夜底线
+    } else if (s.feedInC >= sellMinC && maxSellKw >= 0.5 && socKwh >= targetKwh) {
+      // 高价卖电：feedIn 够高 + SOC 高于过夜底线 + 已充到目标电量
+      // 未充到目标时不卖电，保电优先
       action = 'sell';
       sellKw = maxSellKw;
       reason = `feedIn=${s.feedInC}¢ ≥ ${sellMinC.toFixed(1)}¢`;
