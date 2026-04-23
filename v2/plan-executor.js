@@ -239,7 +239,8 @@ async function restoreTimedMode(chargeWindows) {
   await setParam('0x300C', 1);
   await setParam('0xC014', startHHMM);
   await setParam('0xC016', endHHMM);
-  console.log(`[模式] 切回 Timed ✅ 充电窗口: ${String(startHHMM).padStart(4,'0')}–${String(endHHMM).padStart(4,'0')}`);
+  await setParam('0xC0BA', MAX_CHARGE_KW);  // 恢复 Timed 后必须重写充电功率
+  console.log(`[模式] 切回 Timed ✅ 充电窗口: ${String(startHHMM).padStart(4,'0')}–${String(endHHMM).padStart(4,'0')} chargeKw=${MAX_CHARGE_KW}`);
 }
 
 // 紧急停止：清空充放电功率（DW 或超断路器）
