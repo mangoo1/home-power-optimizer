@@ -235,7 +235,9 @@ async function switchToSelfUse() {
 async function restoreTimedMode(chargeWindows) {
   const w = chargeWindows?.[0];
   const startHHMM = w ? w.startHour * 100 : 900;
-  const endHHMM   = w ? w.endHour * 100 - 30 : 1430; // endHour是exclusive，减30min
+  // endHour 是 exclusive（如17表示充到16:30截止），转成 HHMM 格式
+  // 16:30 = 1630，不能用 17*100-30=1670（非法）
+  const endHHMM   = w ? (w.endHour - 1) * 100 + 30 : 1430; // endHour是exclusive，减半小时
   await setParam('0x300C', 1);
   await setParam('0xC014', startHHMM);
   await setParam('0xC016', endHHMM);
