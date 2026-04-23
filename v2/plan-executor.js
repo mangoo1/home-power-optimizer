@@ -449,9 +449,13 @@ async function main() {
       await restoreTimedMode(chargeWindows);
       logData(db, ess, amber, slot, 'mode-switch-timed', { modeFrom: ess.reportedMode, modeTo: 1 });
     }
-    // 充电时段固定 5kW，不做动态降速
-    // 断路器保护已在上方安全检查（gridImport > BREAKER_KW - BUFFER）处理
-    const targetKw = slot.chargeKw || MAX_CHARGE_KW;
+    // 充电时段：动态计算安全充电功率
+    // 正常情况满功率(5kW)，有大功率设备(热水器等)时自动降速
+    const safeChargeKw = calcSafeChargeKw(homeLoad, pvPower);
+    const targetKw = Math.min(slot.chargeKw || MAX_CHARGE_KW, safeChargeKw);
+    if (targetKw < MAX_CHARGE_KW - 0.2) {
+      console.log(`[功率] homeLoad=${homeLoad.toFixed(2)}kW 高负载，充电降至 ${targetKw}kW（安全上限 ${safeChargeKw}kW）`);
+    }
     await updateChargeKw(targetKw);
     action = 'charge';
 
