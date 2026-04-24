@@ -133,12 +133,12 @@ async function readEss() {
   const reportedMode = runInfo?.x300C ?? null;
 
   // 今日汇总（来自 runInfo xc3xx 字段）
-  const todayChargeKwh    = runInfo?.xc304 ?? null;
-  const todayDischargeKwh = runInfo?.xc306 ?? null;
-  const todayPvKwh        = runInfo?.x1264 ?? null;  // 今日PV发电（x1264=正确字段，xc308已确认错误）
-  const todayGridBuyKwh   = runInfo?.xc30A ?? null;
-  const todayGridSellKwh  = runInfo?.xc30C ?? null;
-  const todayHomeKwh      = runInfo?.xc30E ?? null;
+  const todayChargeKwh    = runInfo?.x126A ?? null;  // 今日电池充电（x126A，与App吻合）
+  const todayDischargeKwh = runInfo?.x126C ?? null;  // 今日电池放电（x126C）
+  const todayPvKwh        = runInfo?.x1264 ?? null;  // 今日PV发电（x1264，与App吻合）
+  const todayGridBuyKwh   = runInfo?.x1266 ?? null;  // 今日买电（x1266，与App吻合）
+  const todayGridSellKwh  = runInfo?.x1268 ?? null;  // 今日卖电（x1268）
+  const todayHomeKwh      = runInfo?.x126E ?? null;  // 今日用电（x126E）
 
   // 流量图（flow）
   const flowPv       = flowInfo?.pvPower    ?? null;
