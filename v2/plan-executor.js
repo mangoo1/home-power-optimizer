@@ -342,11 +342,73 @@ function logData(db, ess, amber, slot, action, extra = {}) {
   }
 }
 
-// ── 热水器控制（预留，待 Tuya MCP 实现）─────────────────────
+// ── 热水器控制（Tuya MCP）────────────────────────────────────
+// 主热水器：bf160bbe78f4f1ce6dpkdp（每天在最低价2小时窗口开）
+// GF热水器：bf3c28e8181e5e980eoobm（暂不自动控制，避免冲突）
+const HW_MAIN_ID = 'bf160bbe78f4f1ce6dpkdp';
+const HW_TUYA_CWD = '/home/deven/.openclaw/workspace';
+
 async function controlHotWater(on) {
-  // TODO: 接入 Tuya MCP
-  // 当 plan action='hotwater' 时调用
-  console.log(`[热水器] ${on ? '开' : '关'}（待 Tuya MCP 实现）`);
+  const cmd = on ? 'tuya_turn_on_device' : 'tuya_turn_off_device';
+  try {
+    const { execSync } = require('child_process');
+    const result = execSync(
+      `npx mcporter call tuya ${cmd} ${HW_MAIN_ID} switch`,
+      { cwd: HW_TUYA_CWD, timeout: 15000, encoding: 'utf8' }
+    );
+    const r = JSON.parse(result);
+    if (r.success) {
+      console.log(`[热水器] 主热水器已${on ? '开' : '关'} ✅`);
+      return true;
+    } else {
+      console.warn(`[热水器] ${on ? '开' : '关'}失败:`, r.message);
+      return false;
+    }
+  } catch(e) {
+    console.warn('[热水器] Tuya 命令失败:', e.message);
+    return false;
+  }
+
+}
+
+// 检查当前时间是否在热水器窗口内，并发出开/关指令
+async function handleHotWaterWindow(planRow, db, syd) {
+  if (!planRow?.hw_window_json) return;
+  let hw;
+  try { hw = JSON.parse(planRow.hw_window_json); } catch { return; }
+  if (!hw?.startKey || !hw?.endKey) return;
+
+  const nowMins = syd.hh * 60 + syd.mi;
+  const [sh, sm] = hw.startKey.split(':').map(Number);
+  const [eh, em] = hw.endKey.split(':').map(Number);
+  const startMins = sh * 60 + sm;
+  const endMins   = eh * 60 + em;
+
+  // 状态追踪（避免重复开关）
+  const stateRow = db.prepare("SELECT value FROM kv_store WHERE key='hw_action_date'").get();
+  const today = syd.date;
+
+  // 到了开始时间（±5分钟容忍）且今天还没开过
+  if (nowMins >= startMins - 5 && nowMins < startMins + 5) {
+    if (stateRow?.value !== today + '-on') {
+      console.log(`[热水器] 到达开启时间 ${hw.startKey}，开主热水器`);
+      const ok = await controlHotWater(true);
+      if (ok) {
+        db.prepare("INSERT OR REPLACE INTO kv_store (key,value) VALUES ('hw_action_date',?)").run(today + '-on');
+      }
+    }
+  }
+
+  // 到了结束时间（±5分钟容忍）且今天还没关过
+  if (nowMins >= endMins - 5 && nowMins < endMins + 5) {
+    if (stateRow?.value !== today + '-off') {
+      console.log(`[热水器] 到达关闭时间 ${hw.endKey}，关主热水器`);
+      const ok = await controlHotWater(false);
+      if (ok) {
+        db.prepare("INSERT OR REPLACE INTO kv_store (key,value) VALUES ('hw_action_date',?)").run(today + '-off');
+      }
+    }
+  }
 }
 
 // ── 主流程 ────────────────────────────────────────────────────
@@ -357,6 +419,9 @@ async function main() {
 
   const db = new Database(DB_PATH);
   essApi.init({ db, mac: ESS_MAC_HEX, token: ESS_TOKEN });
+
+  // 确保 kv_store 表存在（用于热水器状态追踪）
+  db.exec("CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT)");
 
   // 1. 读今日计划
   const planRow = db.prepare(
@@ -523,7 +588,10 @@ async function main() {
     alert:    (isDW && !slotIsDW) ? 'unexpected-DW' : null,
   });
 
-  // 8. 每小时整点打印今日汇总（用 ESS 自带的今日累计，最准确）
+  // 8. 热水器窗口控制（基于 plan-today 的 hw_window_json，每5分钟检查一次）
+  await handleHotWaterWindow(planRow, db, syd);
+
+  // 9. 每小时整点打印今日汇总（用 ESS 自带的今日累计，最准确）
   if (syd.mi === 0) {
     console.log(`[今日] 买电:${ess.todayGridBuyKwh?.toFixed(2)}kWh 卖电:${ess.todayGridSellKwh?.toFixed(2)}kWh PV:${ess.todayPvKwh?.toFixed(2)}kWh 充电:${ess.todayChargeKwh?.toFixed(2)}kWh 放电:${ess.todayDischargeKwh?.toFixed(2)}kWh`);
   }
