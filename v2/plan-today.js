@@ -4,7 +4,7 @@
  *
  * 输入：
  *   1. Amber API 价格预测（24h，含 demandWindow）
- *   2. Open-Meteo 太阳辐射预测（solar_forecast 表）
+ *   2. Open-Meteo 太阳辐射预测（内嵌 fetchSolarForecast，自动更新 solar_forecast 表）
  *   3. 过去14天实际 vs 预测 PV 校准系数
  *   4. 当前 SOC（energy_log 最新记录）
  *
@@ -46,7 +46,8 @@ const BREAKER_KW     = 7.7;     // 主断路器限制
 const PANEL_KWP      = 4.3;     // 系统峰值功率
 const MAX_DAILY_KWH  = 22.0;    // 晴天理论上限（4.3kWp × ~5h 有效日照）
 const CHARGE_BUFFER  = 0.5;     // 充电安全余量 kW
-const BUY_MAX_C      = 12.0;    // 买电上限（超过不充）
+const HW_LOAD_KW     = 5.0;     // 主热水器运行时附加负荷（单台约5kW）
+const BUY_MAX_C      = 14.0;    // 买电上限（超过不充，放宽到14¢覆盖更多时段）
 const BUY_MIN_C      = parseFloat(process.env.BUY_THRESHOLD_C || '8.0'); // 买电阈值下限（.env 可覆盖）
 const SELL_MIN_MARGIN_C = parseFloat(process.env.SELL_MIN_MARGIN_C || '3.0'); // 卖电最低利润（¢/kWh，相对买入均价）
 const SELL_FLOOR_C   = parseFloat(process.env.SELL_FLOOR_C || '9.9');   // 卖电绝对下限（再便宜不卖）
@@ -93,6 +94,49 @@ function httpsPost(url, body, headers = {}) {
     req.write(data);
     req.end();
   });
+}
+
+// ── Step 1b: 获取 Solar Forecast（内嵌，自动写 solar_forecast 表）──
+const SOLAR_LATITUDE  = -33.87;
+const SOLAR_LONGITUDE = 151.21;
+const SOLAR_TIMEZONE  = 'Australia/Sydney';
+
+async function fetchSolarForecast(db, today) {
+  try {
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${SOLAR_LATITUDE}&longitude=${SOLAR_LONGITUDE}` +
+      `&hourly=shortwave_radiation,cloud_cover` +
+      `&timezone=${encodeURIComponent(SOLAR_TIMEZONE)}&forecast_days=3&models=best_match`;
+
+    const data = await httpsGet(url);
+    if (!data?.hourly?.time) throw new Error('Invalid Open-Meteo response');
+    const hourly = data.hourly;
+
+    // 存入 solar_forecast 表（ON CONFLICT 更新）
+    try { db.prepare('ALTER TABLE solar_forecast ADD COLUMN forecast_json TEXT').run(); } catch {}
+    db.prepare(`
+      INSERT INTO solar_forecast (date, fetched_at, forecast_json, today_kwh_est, tomorrow_kwh_est, today_peak_wm2, tomorrow_peak_wm2, today_cloud_avg, tomorrow_cloud_avg)
+      VALUES (@date, @fetchedAt, @json, 0, 0, 0, 0, 0, 0)
+      ON CONFLICT(date) DO UPDATE SET fetched_at=@fetchedAt, forecast_json=@json
+    `).run({
+      date: today,
+      fetchedAt: new Date().toISOString(),
+      json: JSON.stringify({ time: hourly.time, sw: hourly.shortwave_radiation, cloud: hourly.cloud_cover }),
+    });
+
+    // 统计今天峰值和云量用于日志
+    let peakWm2 = 0, cloudSum = 0, cloudCount = 0;
+    hourly.time.forEach((t, i) => {
+      if (!t.startsWith(today)) return;
+      const h = parseInt(t.substring(11, 13));
+      if (h < 6 || h > 20) return;
+      peakWm2 = Math.max(peakWm2, hourly.shortwave_radiation[i] ?? 0);
+      cloudSum += hourly.cloud_cover[i] ?? 0;
+      cloudCount++;
+    });
+    console.log(`[solar-forecast] 已更新 DB ✓ 峰值辐射: ${peakWm2}W/m²，云量均值: ${cloudCount > 0 ? (cloudSum/cloudCount).toFixed(0) : '?'}%`);
+  } catch(e) {
+    console.warn(`[solar-forecast] 获取失败: ${e.message}，使用 DB 缓存`);
+  }
 }
 
 // ── Step 1: 获取 Amber 价格预测（含重试，最多3次）────────────────
@@ -191,7 +235,7 @@ function calcPvCalibration(db) {
   const calibFactor = ratioCount > 0 ? ratioSum / ratioCount : 0.6;
   console.log(`\n[PV校准] 过去${ratioCount}天有效数据，校准系数: ${calibFactor.toFixed(3)}`);
   calibLog.forEach(l => console.log(l));
-  return Math.min(1.0, Math.max(0.6, calibFactor)); // 限制在 0.6–1.0（下限调高，保守估算）
+  return Math.min(1.0, Math.max(0.25, calibFactor)); // 限制在 0.25–1.0（实测历史均值约0.3）
 }
 
 // ── Step 3: 从 solar_forecast 获取今天逐小时 PV 预测 ───────────
@@ -239,9 +283,22 @@ function homeLoadKw(hour) {
 }
 
 // ── Step 5: 生成半小时充放电计划 ─────────────────────────────
-function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5, nightReserveKwh = null) {
+function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5, nightReserveKwh = null, hwWindow = null) {
   const targetKwh  = SOC_TARGET * BATT_KWH;               // 目标 kWh（85%）
   const currentKwh = currentSoc / 100 * BATT_KWH;
+
+  // 热水器运行时段 set（key格式 "HH:MM"）— 充电功率需降低避免超断路器
+  const hwKeys = new Set();
+  if (hwWindow) {
+    const [sh, sm] = hwWindow.startKey.split(':').map(Number);
+    const [eh, em] = hwWindow.endKey.split(':').map(Number);
+    let mins = sh * 60 + sm;
+    const endMins = eh * 60 + em;
+    while (mins < endMins) {
+      hwKeys.add(`${String(Math.floor(mins/60)).padStart(2,'0')}:${String(mins%60).padStart(2,'0')}`);
+      mins += 30;
+    }
+  }
 
   // 动态卖电门槛：买入均价 + 利润margin，但不低于绝对下限
   const sellMinC = Math.max(SELL_FLOOR_C, avgBuyC + SELL_MIN_MARGIN_C);
@@ -288,7 +345,9 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5, nightReser
       const h  = parseInt(s.key.split(':')[0]);
       const pv = pvAt30min(pvByHour, h);
       const hl = homeLoadKw(h);
-      const gridHeadroom = BREAKER_KW - Math.max(0, hl - pv) - CHARGE_BUFFER;
+      // 热水器时段：homeLoad 加 HW_LOAD_KW，但仍可充电（功率降低）
+      const effectiveLoad = hwKeys.has(s.key) ? hl + HW_LOAD_KW : hl;
+      const gridHeadroom = BREAKER_KW - Math.max(0, effectiveLoad - pv) - CHARGE_BUFFER;
       const maxChargeKw  = parseFloat(Math.min(MAX_CHARGE_KW, Math.max(0, gridHeadroom)).toFixed(2));
       const chargeKwhPer = maxChargeKw * 0.5 * 0.95; // 半小时可充入 kWh（含效率）
       return { ...s, h, pv, hl, maxChargeKw, chargeKwhPer };
@@ -354,7 +413,10 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5, nightReser
     const net = hl - pv;
 
     const gridHeadroom = BREAKER_KW - Math.max(0, net) - CHARGE_BUFFER;
-    const maxChargeKw  = parseFloat(Math.min(MAX_CHARGE_KW, Math.max(0, gridHeadroom)).toFixed(2));
+    // 热水器时段：额外扣除热水器负荷，降低充电功率（但不停止）
+    const hwExtra = hwKeys.has(s.key) ? HW_LOAD_KW : 0;
+    const gridHeadroomHw = BREAKER_KW - Math.max(0, net + hwExtra) - CHARGE_BUFFER;
+    const maxChargeKw  = parseFloat(Math.min(MAX_CHARGE_KW, Math.max(0, gridHeadroomHw)).toFixed(2));
 
     const usableKwh = Math.max(0, socKwh - SOC_MIN * BATT_KWH);
     // 过夜保留 = max(35%电量, 实际夜间用电均值×1.1)，防止卖超
@@ -370,10 +432,11 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5, nightReser
       action = 'standby';
       reason = 'DW';
     } else if (chargeKeys.has(s.key) && socKwh < targetKwh && maxChargeKw >= 0.5) {
-      // 选中的充电槽
+      // 选中的充电槽（热水器时段功率自动降低）
       action   = 'charge';
       chargeKw = maxChargeKw;
-      reason   = `buy=${s.buyC}¢ selected(cheapest)`;
+      const hwNote = hwKeys.has(s.key) ? ' +HW↓' : '';
+      reason   = `buy=${s.buyC}¢ selected(cheapest)${hwNote}`;
     } else if (s.feedInC >= sellMinC && maxSellKw >= 0.5) {
       // 高价卖电：feedIn 够高 + 卖后剩余 > 过夜保留量（含夜间用电安全系数）
       action = 'sell';
@@ -754,7 +817,10 @@ async function main() {
   const currentSocPct = latest?.soc ?? 50;
   console.log(`[SOC] 当前: ${currentSocPct}%`);
 
-  // 2. PV 校准系数
+  // 2. Solar forecast（先取，确保 DB 里有今日数据）
+  await fetchSolarForecast(db, today);
+
+  // 3. PV 校准系数
   const calibFactor = calcPvCalibration(db);
 
   // 3. 今日 PV 预测（按小时）
@@ -770,28 +836,26 @@ async function main() {
   const hasDW    = slots.some(s => s.dw);
   console.log(`[Amber] ${slots.length} 个半小时槽, DW: ${hasDW}`);
 
-  // 5. 生成计划（先用默认avgBuyC预估，生成后用实际充电槽均价重算卖电门槛）
-  // 先做一次 dry-run 算充电槽 → 得到真实买入均价 → 正式生成
-  const dryRun = buildPlan(slots, pvByHour, currentSocPct, hasDW, BUY_MIN_C + 1);
-  const dryChargeSlots = dryRun.plan.filter(s => s.action === 'charge');
-  const realAvgBuyC = dryChargeSlots.length > 0
-    ? dryChargeSlots.reduce((s, x) => s + x.buyC, 0) / dryChargeSlots.length
-    : BUY_MIN_C + 1;
-  console.log(`[买入均价] 充电槽均价: ${realAvgBuyC.toFixed(2)}¢ (${dryChargeSlots.length}槽)`);
-
-  // 过去7天夜间实际用电均值，用于限制可卖电量（不卖到晚上不够用）
-  const avgNightKwh = calcAvgNightKwh(db);
-  console.log(`[过夜用电] 近7天均值: ${avgNightKwh ?? '无数据'}kWh，保底: ${avgNightKwh ? (avgNightKwh*1.1).toFixed(1) : (SOC_OVERNIGHT*BATT_KWH).toFixed(1)}kWh`);
-
-  const { plan, buyThreshold, chargeTargetBy, sellMinC } = buildPlan(slots, pvByHour, currentSocPct, hasDW, realAvgBuyC, avgNightKwh);
-
-  // 5b. 热水器计划（主热水器最低价2小时窗口）
+  // 5a. 热水器计划（先算，buildPlan 需要知道热水器时段）
   const hwWindow = calcHotWaterWindow(slots);
   if (hwWindow) {
     console.log(`\n[热水器] 主热水器计划: ${hwWindow.startKey}–${hwWindow.endKey}，均价 ${hwWindow.avgBuyC}¢`);
   } else {
     console.log('[热水器] 无合适窗口');
   }
+
+  // 5b. 生成计划（dry-run 先算买入均价，再正式生成）
+  const dryRun = buildPlan(slots, pvByHour, currentSocPct, hasDW, BUY_MIN_C + 1, null, hwWindow);
+  const dryChargeSlots = dryRun.plan.filter(s => s.action === 'charge');
+  const realAvgBuyC = dryChargeSlots.length > 0
+    ? dryChargeSlots.reduce((s, x) => s + x.buyC, 0) / dryChargeSlots.length
+    : BUY_MIN_C + 1;
+  console.log(`[买入均价] 充电槽均价: ${realAvgBuyC.toFixed(2)}¢ (${dryChargeSlots.length}槽)`);
+
+  const avgNightKwh = calcAvgNightKwh(db);
+  console.log(`[过夜用电] 近7天均值: ${avgNightKwh ?? '无数据'}kWh，保底: ${avgNightKwh ? (avgNightKwh*1.1).toFixed(1) : (SOC_OVERNIGHT*BATT_KWH).toFixed(1)}kWh`);
+
+  const { plan, buyThreshold, chargeTargetBy, sellMinC } = buildPlan(slots, pvByHour, currentSocPct, hasDW, realAvgBuyC, avgNightKwh, hwWindow);
 
   // 6. 打印
   const report = printPlan(plan, currentSocPct, today, hwWindow);
