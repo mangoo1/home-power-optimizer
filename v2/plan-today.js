@@ -752,13 +752,14 @@ function calcHotWaterWindows(slots) {
   const mainWin = findBestWindow(dayCandidates);
   if (!mainWin) return { main: null, gf: null };
 
-  // GF热水器窗口：高电价/DW 开始前1小时开（趁低价预热，避开高峰）
-  // 找今天第一个高电价时段（>= HW_BATT_MIN_C）或 DW 开始时间
+  // GF热水器窗口：电价抬头前1小时开（趁低价预热，在电价升高前结束）
+  // 触发条件：第一个 buyC > HW_GRID_MAX_C（默认10¢）或 DW 的时段，14:00以后
+  // GF 结束 = 该时段开始（不进入高价段），GF 开始 = 结束前1小时
   let highPriceStartMins = null;
   for (const s of slots) {
     const h = parseInt(s.key.split(':')[0]);
     const m = parseInt(s.key.split(':')[1]);
-    if ((s.buyC >= HW_BATT_MIN_C || s.dw) && h >= 14) { // 只看14:00以后的高电价
+    if ((s.buyC > HW_GRID_MAX_C || s.dw) && h >= 14) {
       highPriceStartMins = h*60+m;
       break;
     }
@@ -766,17 +767,14 @@ function calcHotWaterWindows(slots) {
 
   let gfWin = null;
   if (highPriceStartMins !== null) {
-    // GF 开始 = 高电价前1小时，持续1小时（2槽）
     const gfStartMins = highPriceStartMins - 60;
-    const gfEndMins   = highPriceStartMins;
+    const gfEndMins   = highPriceStartMins; // 结束 = 高电价起点，不进入高价
     const gfStartKey  = `${String(Math.floor(gfStartMins/60)).padStart(2,'0')}:${String(gfStartMins%60).padStart(2,'0')}`;
     const gfEndKey    = `${String(Math.floor(gfEndMins/60)).padStart(2,'0')}:${String(gfEndMins%60).padStart(2,'0')}`;
-    // 找这个窗口的平均电价
     const gfSlots = slots.filter(s => s.key >= gfStartKey && s.key < gfEndKey);
     const avgC = gfSlots.length ? gfSlots.reduce((s,x)=>s+x.buyC,0)/gfSlots.length : 0;
-    // 确保不与主热水器重叠
     const [meh,mem] = mainWin.endKey.split(':').map(Number);
-    if (gfStartMins >= meh*60+mem + 30) { // 主热水器结束后至少30分钟
+    if (gfStartMins >= meh*60+mem + 30 && gfStartMins >= 14*60) {
       gfWin = { startKey: gfStartKey, endKey: gfEndKey, avgBuyC: parseFloat(avgC.toFixed(2)), source: hwSource(avgC) };
     }
   }
