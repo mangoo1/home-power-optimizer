@@ -591,6 +591,11 @@ async function applyToInverter(plan, today) {
 
 // ── Step 7: 保存到 DB ─────────────────────────────────────────
 function savePlan(db, today, plan, meta) {
+  // 确保 hw_window_json 列存在（向后兼容旧表结构）
+  try {
+    db.prepare('ALTER TABLE daily_plan ADD COLUMN hw_window_json TEXT').run();
+  } catch {}
+
   db.prepare('UPDATE daily_plan SET is_active=0 WHERE date=? AND is_active=1').run(today);
   const lastVer = db.prepare('SELECT MAX(version) as v FROM daily_plan WHERE date=?').get(today);
   const version = (lastVer?.v ?? 0) + 1;
@@ -609,8 +614,8 @@ function savePlan(db, today, plan, meta) {
        has_demand_window, charge_cutoff_hour,
        pv_forecast_kwh, pv_peak_kw,
        charge_windows_json, intervals_json, notes,
-       buy_threshold_c, sell_min_c, is_active)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)
+       buy_threshold_c, sell_min_c, hw_window_json, is_active)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)
   `).run(
     today, version, new Date().toISOString(), 'v2-rules', 'v2/plan-today.js',
     meta.currentSocPct,
@@ -623,14 +628,51 @@ function savePlan(db, today, plan, meta) {
     JSON.stringify({ buyThreshold: meta.buyThreshold, sellMinC: meta.sellMinC, calibFactor: meta.calibFactor }),
     parseFloat(meta.buyThreshold.toFixed(2)),
     meta.sellMinC,
+    meta.hwWindow ? JSON.stringify(meta.hwWindow) : null,
   );
 
   console.log(`\n✅ 计划 v${version} 已存入 DB (source=v2-rules)`);
   return version;
 }
 
+// ── 热水器计划：找今天最便宜的连续2小时窗口 ───────────────────
+// 主热水器每天必须在最低电价时段运行2小时（晚上要有热水用）
+// 约束：只在 06:00–14:00 之间，非 DW 时段，连续4个半小时槽
+function calcHotWaterWindow(slots) {
+  // 只考虑 06:00–14:00 之间、非 DW 的候选槽
+  const candidates = slots.filter(s => {
+    const h = parseInt(s.key.split(':')[0]);
+    return h >= 6 && h < 14 && !s.dw && s.buyC > 0;
+  });
+
+  if (candidates.length < 4) {
+    // 候选不足4槽，退而求其次取最便宜的连续段
+    if (candidates.length === 0) return null;
+    const start = candidates[0];
+    const end   = candidates[Math.min(3, candidates.length-1)];
+    const avg   = candidates.slice(0, 4).reduce((s, x) => s + x.buyC, 0) / Math.min(4, candidates.length);
+    return { startKey: start.key, endKey: end.key, avgBuyC: parseFloat(avg.toFixed(2)) };
+  }
+
+  // 滑动窗口：找连续4槽（2小时）平均电价最低的组合
+  let bestAvg = Infinity, bestIdx = 0;
+  for (let i = 0; i <= candidates.length - 4; i++) {
+    const avg = (candidates[i].buyC + candidates[i+1].buyC + candidates[i+2].buyC + candidates[i+3].buyC) / 4;
+    if (avg < bestAvg) { bestAvg = avg; bestIdx = i; }
+  }
+
+  const startKey = candidates[bestIdx].key;
+  const endSlot  = candidates[bestIdx + 3];
+  // 结束时间 = 最后一槽 + 30min
+  const [eh, em] = endSlot.key.split(':').map(Number);
+  const endMins  = eh * 60 + em + 30;
+  const endKey   = `${String(Math.floor(endMins/60)).padStart(2,'0')}:${String(endMins%60).padStart(2,'0')}`;
+
+  return { startKey, endKey, avgBuyC: parseFloat(bestAvg.toFixed(2)) };
+}
+
 // ── Step 8: 打印计划 ──────────────────────────────────────────
-function printPlan(plan, currentSocPct, today) {
+function printPlan(plan, currentSocPct, today, hwWindow) {
   const lines = [
     `\n🔋 充放电计划（v2）— ${today}  当前SOC: ${currentSocPct}%`,
     `时间   动作       充电  卖电   买¢    卖¢   SOC   PV`,
@@ -660,6 +702,15 @@ function printPlan(plan, currentSocPct, today) {
   const last = plan[plan.length-1];
   lines.push(`${'─'.repeat(60)}`);
   lines.push(`收盘预计: SOC ${last?.socPct ?? '?'}% (${((last?.socPct??0)/100*BATT_KWH).toFixed(1)}kWh)`);
+
+  // 热水器计划
+  if (hwWindow) {
+    lines.push('');
+    lines.push(`🚿 主热水器: ${hwWindow.startKey}–${hwWindow.endKey} 开2小时（均价 ${hwWindow.avgBuyC}¢）`);
+  } else {
+    lines.push('');
+    lines.push('🚿 主热水器: 今日无合适低价窗口，请手动安排');
+  }
 
   return lines.join('\n');
 }
@@ -725,8 +776,16 @@ async function main() {
 
   const { plan, buyThreshold, chargeTargetBy, sellMinC } = buildPlan(slots, pvByHour, currentSocPct, hasDW, realAvgBuyC, avgNightKwh);
 
+  // 5b. 热水器计划（主热水器最低价2小时窗口）
+  const hwWindow = calcHotWaterWindow(slots);
+  if (hwWindow) {
+    console.log(`\n[热水器] 主热水器计划: ${hwWindow.startKey}–${hwWindow.endKey}，均价 ${hwWindow.avgBuyC}¢`);
+  } else {
+    console.log('[热水器] 无合适窗口');
+  }
+
   // 6. 打印
-  const report = printPlan(plan, currentSocPct, today);
+  const report = printPlan(plan, currentSocPct, today, hwWindow);
   console.log(report);
 
   // 6b. 21:00 过夜电量检阅
@@ -743,7 +802,7 @@ async function main() {
   const prevChargeSlots = prevPlan ? JSON.parse(prevPlan.intervals_json ?? '[]').filter(s=>s.action==='charge').map(s=>s.key).join(',') : '';
 
   const version = savePlan(db, today, plan, {
-    currentSocPct, hasDW, pvForecastKwh, pvPeakKw, calibFactor, buyThreshold, chargeTargetBy, sellMinC
+    currentSocPct, hasDW, pvForecastKwh, pvPeakKw, calibFactor, buyThreshold, chargeTargetBy, sellMinC, hwWindow
   });
   db.close();
 
@@ -756,7 +815,10 @@ async function main() {
   const windowChanged  = newChargeSlots !== prevChargeSlots || newSellSlots !== prevSellSlots;
 
   if (windowChanged) {
-    await sendWhatsApp(report + '\n\n' + overnightLine);
+    const hwLine = hwWindow
+      ? `\n🚿 主热水器提醒: ${hwWindow.startKey} 开，${hwWindow.endKey} 关（均价 ${hwWindow.avgBuyC}¢）`
+      : '';
+    await sendWhatsApp(report + '\n\n' + overnightLine + hwLine);
     console.log('\n[完成] 计划已发送到 WhatsApp（窗口有变化）');
   } else {
     console.log('\n[完成] 计划无变化，静默跳过 WhatsApp');
