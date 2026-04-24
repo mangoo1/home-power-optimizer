@@ -135,7 +135,7 @@ async function readEss() {
   // 今日汇总（来自 runInfo xc3xx 字段）
   const todayChargeKwh    = runInfo?.xc304 ?? null;
   const todayDischargeKwh = runInfo?.xc306 ?? null;
-  const todayPvKwh        = runInfo?.xc308 ?? null;
+  const todayPvKwh        = runInfo?.x1264 ?? null;  // 今日PV发电（x1264=正确字段，xc308已确认错误）
   const todayGridBuyKwh   = runInfo?.xc30A ?? null;
   const todayGridSellKwh  = runInfo?.xc30C ?? null;
   const todayHomeKwh      = runInfo?.xc30E ?? null;
