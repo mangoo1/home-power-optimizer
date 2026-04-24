@@ -380,12 +380,8 @@ const HW_MAIN_ID = 'bf160bbe78f4f1ce6dpkdp'; // 主热水器：plan-today hwWind
 const HW_GF_ID   = 'bf3c28e8181e5e980eoobm';  // GF热水器（~3.5kW）：固定时间窗口控制
 const HW_TUYA_CWD = '/home/deven/.openclaw/workspace';
 
-// GF热水器固定时间窗口（每天）
-// 凌晨用电池供热，下午低价电网补热
-const GF_HW_WINDOWS = [
-  { start: '04:00', end: '05:00', label: '凌晨电池供热' },
-  { start: '14:00', end: '15:00', label: '下午低价补热' },
-];
+// GF热水器固定兜底窗口：凌晨04:00电池供热（plan-today 不覆盖凌晨时段）
+// 下午窗口由 plan-today 的 gf_window_json 动态计划
 
 async function tuyaControl(deviceId, on) {
   const cmd = on ? 'tuya_turn_on_device' : 'tuya_turn_off_device';
@@ -406,7 +402,9 @@ async function controlHotWater(on) {
   return ok;
 }
 
-// 主热水器：由 plan-today hwWindow 驱动
+// 主热水器：由 plan-today hw_window_json 驱动
+// source='grid' → 开热水器时把充电功率设 0.1kW（电网直供，电池几乎不动）
+// source='batt' → Self-use（电池放电供热水器）
 async function handleHotWaterWindow(planRow, db, syd) {
   if (!planRow?.hw_window_json) return;
   let hw;
@@ -417,14 +415,25 @@ async function handleHotWaterWindow(planRow, db, syd) {
   const [sh, sm] = hw.startKey.split(':').map(Number);
   const [eh, em] = hw.endKey.split(':').map(Number);
   const today = syd.date;
+  const source = hw.source ?? 'grid';
 
   if (nowMins >= sh*60+sm - 5 && nowMins < sh*60+sm + 5) {
     const key = `hw_main:${today}:on`;
     if (!db.prepare("SELECT 1 FROM kv_store WHERE key=?").get(key)) {
       const ok = await controlHotWater(true);
       if (ok) {
+        // 根据 source 切换逆变器模式
+        if (source === 'grid') {
+          // 电网直供：Timed 模式 chargeKw=0.1，电池几乎不动
+          await essApi.setChargeKw(0.1, 'hw-grid-supply', 'plan-executor');
+          console.log('[主热水器] 电网直供模式，充电功率→0.1kW');
+        } else {
+          // 电池供电：Self-use 模式
+          await essApi.switchToSelfUse('hw-batt-supply', 'plan-executor');
+          console.log('[主热水器] 电池供电模式，切Self-use');
+        }
         db.prepare("INSERT OR REPLACE INTO kv_store (key,value) VALUES (?,?)").run(key, '1');
-        await sendAlert(`🚿 主热水器已开（${hw.startKey}，均价${hw.avgBuyC}¢）`);
+        await sendAlert(`🚿 主热水器已开（${hw.startKey}，${source==='grid'?'电网':'电池'}供，${hw.avgBuyC}¢）`);
       }
     }
   }
@@ -433,6 +442,8 @@ async function handleHotWaterWindow(planRow, db, syd) {
     if (!db.prepare("SELECT 1 FROM kv_store WHERE key=?").get(key)) {
       const ok = await controlHotWater(false);
       if (ok) {
+        // 关闭后恢复充电功率到正常（executor 下个周期会重新按计划设）
+        await essApi.setChargeKw(MAX_CHARGE_KW, 'hw-restore', 'plan-executor');
         db.prepare("INSERT OR REPLACE INTO kv_store (key,value) VALUES (?,?)").run(key, '1');
         await sendAlert(`🔴 主热水器已关（${hw.endKey}）`);
       }
@@ -440,12 +451,26 @@ async function handleHotWaterWindow(planRow, db, syd) {
   }
 }
 
-// GF热水器：固定时间窗口，每天 04:00-05:00 和 14:00-15:00
+// GF热水器：plan-today gf_window_json（动态计划）+ 固定兜底窗口
+// source 逻辑同主热水器
 async function handleGfHotWater(db, syd) {
   const nowMins = syd.hh * 60 + syd.mi;
   const today = syd.date;
 
-  for (const win of GF_HW_WINDOWS) {
+  // 先尝试读 plan-today 算出的 GF 窗口
+  const planRow = db.prepare("SELECT gf_window_json FROM daily_plan WHERE date=? AND is_active=1 ORDER BY rowid DESC LIMIT 1").get(today);
+  let planWins = [];
+  if (planRow?.gf_window_json) {
+    try {
+      const w = JSON.parse(planRow.gf_window_json);
+      if (w?.startKey) planWins.push({ start: w.startKey, end: w.endKey, source: w.source ?? 'grid', label: `计划窗口(${w.avgBuyC}¢)` });
+    } catch {}
+  }
+  // 兜底：固定凌晨04:00窗口（plan-today 不覆盖凌晨，电池供热）
+  const hasFixedWindow = planWins.some(w => w.start === '04:00');
+  if (!hasFixedWindow) planWins.push({ start: '04:00', end: '05:00', source: 'batt', label: '凌晨电池供热' });
+
+  for (const win of planWins) {
     const [sh, sm] = win.start.split(':').map(Number);
     const [eh, em] = win.end.split(':').map(Number);
 
@@ -453,10 +478,10 @@ async function handleGfHotWater(db, syd) {
       const key = `hw_gf:${today}:${win.start}:on`;
       if (!db.prepare("SELECT 1 FROM kv_store WHERE key=?").get(key)) {
         const ok = await tuyaControl(HW_GF_ID, true);
-        console.log(`[GF热水器] 开 ${win.start}（${win.label}）${ok ? '✅' : '❌'}`);
+        console.log(`[GF热水器] 开 ${win.start}（${win.label}）${ok?'✅':'❌'}`);
         if (ok) {
           db.prepare("INSERT OR REPLACE INTO kv_store (key,value) VALUES (?,?)").run(key, '1');
-          await sendAlert(`🚿 GF热水器已开（${win.start}，${win.label}）`);
+          await sendAlert(`🛁 GF热水器已开（${win.start}，${win.label}）`);
         }
       }
     }
@@ -464,7 +489,7 @@ async function handleGfHotWater(db, syd) {
       const key = `hw_gf:${today}:${win.start}:off`;
       if (!db.prepare("SELECT 1 FROM kv_store WHERE key=?").get(key)) {
         const ok = await tuyaControl(HW_GF_ID, false);
-        console.log(`[GF热水器] 关 ${win.end}（${win.label}）${ok ? '✅' : '❌'}`);
+        console.log(`[GF热水器] 关 ${win.end}（${win.label}）${ok?'✅':'❌'}`);
         if (ok) {
           db.prepare("INSERT OR REPLACE INTO kv_store (key,value) VALUES (?,?)").run(key, '1');
           await sendAlert(`🔴 GF热水器已关（${win.end}）`);
