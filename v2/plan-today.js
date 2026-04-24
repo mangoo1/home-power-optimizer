@@ -316,12 +316,21 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5, nightReser
     accumulated += s.chargeKwhPer;
   }
 
-  // ── 补充：把买价 < BUY_MAX_C 且在充电时间窗口内的"早期低价槽"也纳入 ──
-  // 防止贪心算法因为"够了"就跳过早上可充的廉价时段，导致 SOC 白白消耗
-  // 逻辑：如果一个槽 buyC <= 已选最贵的槽，但时间早（在第一个已选槽之前），也加进来
-  const firstChargeKey = [...chargeKeys].sort()[0];
+  // ── 补充：填满首尾充电槽之间的所有空隙 ──
+  // 贪心算法可能跳过首尾之间的某些槽（如 10:30、11:00），导致中间出现自用"空洞"
+  // 策略：已选最早槽和最晚槽之间，只要 buyC < BUY_MAX_C 且非 DW 的都加进来
+  const sortedChargeKeys = [...chargeKeys].sort();
+  const firstChargeKey = sortedChargeKeys[0];
+  const lastChargeKey  = sortedChargeKeys[sortedChargeKeys.length - 1];
   for (const s of candidateSlots) {
     if (chargeKeys.has(s.key)) continue;
+    // 填补首尾之间的空隙
+    if (firstChargeKey && lastChargeKey &&
+        s.key >= firstChargeKey && s.key <= lastChargeKey &&
+        s.buyC < BUY_MAX_C) {
+      chargeKeys.add(s.key);
+    }
+    // 早于首槽但价格更便宜的也纳入（防 SOC 白白消耗）
     if (firstChargeKey && s.key < firstChargeKey && s.buyC <= BUY_MAX_C) {
       chargeKeys.add(s.key);
     }
