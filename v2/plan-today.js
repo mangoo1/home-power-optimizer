@@ -38,7 +38,7 @@ if (!ESS_TOKEN   || !ESS_MAC_HEX)   throw new Error('Missing ESS_TOKEN or ESS_MA
 const BATT_KWH       = 42;      // 电池总容量 kWh
 const SOC_MIN        = 0.10;    // 最低 SOC 底线（不放电到这以下）
 const SOC_OVERNIGHT  = 0.35;    // 电池绝对底线（逆变器保护，不放电到这以下）
-const SOC_SELL_FLOOR = 0.68;    // 卖电保守底线（21:00保留68% = 28.6kWh，覆盖历史最大夜间消耗23.4kWh + 10%底线）
+const SOC_SELL_FLOOR = 0.60;    // 卖电保守底线（21:00保留60%=25.2kWh，去极值最大消耗19.5+底线4.2=23.7kWh，余量1.5kWh）
 // 充电目标：电网必须充到 85%，保证晚上有足够电量
 // 下午 PV 是额外收益（继续充或卖电），不依赖 PV 来补缺口
 const SOC_TARGET     = 0.85;    // 电网充电目标（必须达到）
