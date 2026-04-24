@@ -84,6 +84,33 @@ function httpsPost(url, body, headers = {}) {
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+// ── 发送 WhatsApp 告警 ────────────────────────────────────────
+async function sendAlert(message) {
+  try {
+    const http = require('http');
+    const body = JSON.stringify({ message });
+    await new Promise(resolve => {
+      const req = http.request({
+        hostname: 'localhost', port: GW_PORT, path: '/send', method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+      }, res => { res.resume(); resolve(); });
+      req.on('error', () => resolve());
+      req.write(body); req.end();
+    });
+    console.log('[告警] 已发送 WhatsApp:', message.slice(0, 80));
+  } catch(e) {
+    console.warn('[告警] 发送失败:', e.message);
+  }
+}
+
+// 告警去重：同一类告警当天只发一次
+const _alertSent = new Set();
+async function sendAlertOnce(key, message) {
+  if (_alertSent.has(key)) return;
+  _alertSent.add(key);
+  await sendAlert(message);
+}
+
 // ── ESS API ───────────────────────────────────────────────────
 const ESS_HEADERS = {
   Authorization: ESS_TOKEN, lang:'en', showloading:'false',
@@ -448,6 +475,11 @@ async function main() {
   const [ess, amber] = await Promise.all([ readEss(), readAmber() ]);
 
   console.log(`[ESS] SOC:${ess.soc}% batt:${ess.battPower}kW home:${ess.homeLoad}kW pv:${ess.pvPower}kW grid:${ess.gridPower}kW mode:${ess.reportedMode}`);
+
+  // ESS 连接失败告警（SOC 为 null 说明 API 没返回数据，可能是 token 过期）
+  if (ess.soc === null) {
+    await sendAlertOnce('ess-offline', '⚠️ ESS 逆变器数据获取失败（SOC=null），可能 token 过期，请检查！');
+  }
   if (amber) {
     console.log(`[Amber] buy:${amber.buyPrice?.toFixed(2)}¢ feedIn:${amber.feedInPrice?.toFixed(2)}¢ DW:${amber.demandWindow} ${amber.descriptor??''}`);
   } else {
@@ -600,7 +632,8 @@ async function main() {
   console.log(`[完成] action=${action}`);
 }
 
-main().catch(e => {
+main().catch(async e => {
   console.error('[ERROR]', e.message, e.stack?.split('\n')[1]);
+  await sendAlert(`⚠️ plan-executor 崩溃: ${e.message}`);
   process.exit(1);
 });
