@@ -39,10 +39,10 @@ const BATT_KWH       = 42;      // 电池总容量 kWh
 const SOC_MIN        = 0.10;    // 最低 SOC 底线（不放电到这以下）
 const SOC_OVERNIGHT  = 0.35;    // 过夜 SOC 最低底线（绝对不卖到这以下）
 const SOC_SELL_FLOOR = 0.55;    // 卖电时的保守底线（确保21:00有足够余量过夜）
-// 充电目标：电网只补到电网充电目标SOC，剩余由PV自然填满
-// 逻辑：早上电网低价时充到 GRID_CHARGE_TARGET，下午PV继续充到最终 SOC_MAX
-const SOC_TARGET     = 0.85;    // 最终目标 SOC（PV+电网合计）
-const GRID_CHARGE_TARGET = 0.70; // 电网充电截止 SOC（剩余15%留给下午PV来填）
+// 充电目标：电网必须充到 85%，保证晚上有足够电量
+// 下午 PV 是额外收益（继续充或卖电），不依赖 PV 来补缺口
+const SOC_TARGET     = 0.85;    // 电网充电目标（必须达到）
+const GRID_CHARGE_TARGET = 0.85; // 与 SOC_TARGET 一致，电网负责充满
 const MAX_CHARGE_KW  = 5.0;     // 逆变器最大充电功率
 const MAX_SELL_KW    = 5.0;     // 逆变器最大放电功率
 const BREAKER_KW     = 7.7;     // 主断路器限制
@@ -318,36 +318,20 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5, nightReser
   } else {
     // 电网充电在 PV 峰值前结束（一般 12:00 前），让下午 PV 自然充满
     // 取 08:00–12:00 里最后的低价槽 +30min
-    const morningCheap = slots.filter(s => {
+    // 无 DW：低价时段充电，上限到 17:00 前（让出晚高峰卖电）
+    const cheapSlots = slots.filter(s => {
       const h = parseInt(s.key.split(':')[0]);
-      return h >= 7 && h < 13 && !s.dw && s.buyC > 0 && s.buyC < BUY_MAX_C;
+      return h >= 7 && h < 17 && !s.dw && s.buyC > 0 && s.buyC < BUY_MAX_C;
     });
-    const lastMorning = morningCheap.length ? morningCheap[morningCheap.length - 1] : null;
-    const lastH = lastMorning ? parseInt(lastMorning.key.split(':')[0]) + 1 : 12;
-    gridChargeEndHour = Math.min(lastH, 13); // 最晚 13:00
-    console.log(`[充电截止] 无DW，电网充电截止 ${gridChargeEndHour}:00（最后低价槽 ${lastMorning?.key ?? 'none'}）`);
+    const lastCheap = cheapSlots.length ? cheapSlots[cheapSlots.length - 1] : null;
+    const lastH = lastCheap ? parseInt(lastCheap.key.split(':')[0]) + 1 : 15;
+    gridChargeEndHour = Math.min(lastH, 17); // 最晚 17:00（晚高峰前停止充电）
+    console.log(`[充电截止] 无DW，电网充电截止 ${gridChargeEndHour}:00（最后低价槽 ${lastCheap?.key ?? 'none'}）`);
   }
 
-  // ── Phase 1: 计算今天 PV 总预测贡献（下午部分）──────────
-  // 下午 PV 能充多少：gridChargeEndHour ~ 17:00 之间的 PV 积分
-  let pvAfternoonKwh = 0;
-  slots.forEach(s => {
-    const h = parseInt(s.key.split(':')[0]);
-    if (h >= gridChargeEndHour && h < 17) {
-      pvAfternoonKwh += pvAt30min(pvByHour, h) * 0.5 * 0.92; // 充入效率
-    }
-  });
-  console.log(`[PV下午贡献] ${gridChargeEndHour}:00-17:00 估算充入: ${pvAfternoonKwh.toFixed(1)}kWh`);
-
-  // 电网充电目标 = 最终目标 - PV下午贡献，但不低于当前 SOC+基本夜间保障
-  const gridTargetKwh = Math.max(
-    currentKwh + 5,                                         // 至少比现在多 5kWh
-    Math.min(
-      GRID_CHARGE_TARGET * BATT_KWH,                        // 硬上限：电网充到 70%
-      (SOC_TARGET * BATT_KWH) - pvAfternoonKwh              // 最终目标 - PV 预计贡献
-    )
-  );
-  console.log(`[电网目标] ${(gridTargetKwh/BATT_KWH*100).toFixed(0)}% (${gridTargetKwh.toFixed(1)}kWh)，最终目标85%由PV补齐`);
+  // 电网充电目标 = 85%，必须由电网保证，PV 是额外收益
+  const gridTargetKwh = GRID_CHARGE_TARGET * BATT_KWH;  // 35.7kWh
+  console.log(`[电网目标] ${Math.round(GRID_CHARGE_TARGET*100)}% (${gridTargetKwh.toFixed(1)}kWh) — 电网必须达到，PV另算`);
 
   // ── Phase 2: 选最便宜的槽充到 gridTargetKwh ────────────────
   const candidateSlots = slots
@@ -395,6 +379,17 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5, nightReser
     if (firstChargeKey && lastChargeKey && s.key >= firstChargeKey && s.key <= lastChargeKey) {
       chargeKeys.add(s.key);
     }
+  }
+
+  // SOC 偏低时，把早晨所有低价槽也纳入（不能等到中午才开始充）
+  // 逻辑：如果现在 SOC < 65%，7:00–12:00 之间 buyC < BUY_MAX_C 的候选槽全充
+  if (currentSoc < 65) {
+    for (const s of candidateSlots) {
+      if (chargeKeys.has(s.key)) continue;
+      if (s.h >= 7 && s.h < 12) chargeKeys.add(s.key);
+    }
+    const newFirst = [...chargeKeys].sort()[0];
+    console.log(`[低SOC扩充] SOC=${currentSoc}% < 65%，早晨充电提前到 ${newFirst ?? '-'}`);
   }
 
   const selectedPrices = [...candidateSlots].filter(s => chargeKeys.has(s.key)).map(s => s.buyC);
