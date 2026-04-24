@@ -421,22 +421,31 @@ async function main() {
     action = 'no-slot';
 
   } else if (slot.action === 'charge') {
-    // 充电时段：确保 Timed 模式+正确窗口，动态调整功率
-    if (ess.reportedMode !== 1) {
-      console.log(`[模式] charge时段但mode=${ess.reportedMode}，切回 Timed`);
-      const chargeWindows = planRow ? JSON.parse(planRow.charge_windows_json || '[]') : [];
-      await restoreTimedMode(chargeWindows, `restore-timed: mode-was-${ess.reportedMode}`);
-      logData(db, ess, amber, slot, 'mode-switch-timed', { modeFrom: ess.reportedMode, modeTo: 1 });
+    // 充电时段：实时验证电价是否仍然合算
+    const buyThreshold = JSON.parse(planRow?.notes ?? '{}').buyThreshold ?? planRow?.buy_threshold_c ?? 10;
+    const realBuyPrice = amber?.buyPrice ?? null;
+    if (realBuyPrice != null && realBuyPrice > buyThreshold + 2) {
+      // 实际电价比计划阈值高 2¢ 以上 → 停充，切 self-use
+      console.log(`[充电] 实际电价 ${realBuyPrice.toFixed(1)}¢ > 阈值 ${buyThreshold}¢+2，停止充电切 self-use`);
+      await switchToSelfUse(`charge-abort: realBuy=${realBuyPrice.toFixed(1)}c > threshold+2`);
+      logData(db, ess, amber, slot, 'charge-abort-price', { buyPrice: realBuyPrice, threshold: buyThreshold });
+      action = 'charge-abort';
+    } else {
+      // 电价合理，正常充电
+      if (ess.reportedMode !== 1) {
+        console.log(`[模式] charge时段但mode=${ess.reportedMode}，切回 Timed`);
+        const chargeWindows = planRow ? JSON.parse(planRow.charge_windows_json || '[]') : [];
+        await restoreTimedMode(chargeWindows, `restore-timed: mode-was-${ess.reportedMode}`);
+        logData(db, ess, amber, slot, 'mode-switch-timed', { modeFrom: ess.reportedMode, modeTo: 1 });
+      }
+      const safeChargeKw = calcSafeChargeKw(homeLoad, pvPower);
+      const targetKw = Math.min(slot.chargeKw || MAX_CHARGE_KW, safeChargeKw);
+      if (targetKw < MAX_CHARGE_KW - 0.2) {
+        console.log(`[功率] homeLoad=${homeLoad.toFixed(2)}kW 高负载，充电降至 ${targetKw}kW（安全上限 ${safeChargeKw}kW）`);
+      }
+      await updateChargeKw(targetKw, `charge-slot: home=${homeLoad.toFixed(2)}kW safe=${safeChargeKw}kW`);
+      action = 'charge';
     }
-    // 充电时段：动态计算安全充电功率
-    // 正常情况满功率(5kW)，有大功率设备(热水器等)时自动降速
-    const safeChargeKw = calcSafeChargeKw(homeLoad, pvPower);
-    const targetKw = Math.min(slot.chargeKw || MAX_CHARGE_KW, safeChargeKw);
-    if (targetKw < MAX_CHARGE_KW - 0.2) {
-      console.log(`[功率] homeLoad=${homeLoad.toFixed(2)}kW 高负载，充电降至 ${targetKw}kW（安全上限 ${safeChargeKw}kW）`);
-    }
-    await updateChargeKw(targetKw, `charge-slot: home=${homeLoad.toFixed(2)}kW safe=${safeChargeKw}kW`);
-    action = 'charge';
 
   } else if (slot.action === 'sell') {
     // 卖电时段：实时检查 SOC 底线 + feedIn 价格
