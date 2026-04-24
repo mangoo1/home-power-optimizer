@@ -165,13 +165,14 @@ async function fetchAmberPrices() {
 function aggregateAmberTo30min(raw, today) {
   const slots = {};
   for (const p of raw) {
-    // 只要今天的（Sydney 日期）
-    const nemDate = p.nemTime?.substring(0, 10); // "2026-04-20"
-    if (nemDate !== today) continue;
+    // 用 startTime（UTC）转 Sydney 时间来确定时段
+    // 注意：nemTime 是 NEM 结算时间（比实际开始晚30分钟），不能用来定位时段
+    const sydStart = new Date(new Date(p.startTime).getTime() + 10 * 3600 * 1000);
+    const sydDate  = sydStart.toISOString().substring(0, 10);
+    if (sydDate !== today) continue;
 
-    // 取半小时 key：nemTime "2026-04-20T09:30:00+10:00" → "09:30"
-    const hh = p.nemTime.substring(11, 13);
-    const mm = parseInt(p.nemTime.substring(14, 16)) < 30 ? '00' : '30';
+    const hh  = sydStart.toISOString().substring(11, 13);
+    const mm  = parseInt(sydStart.toISOString().substring(14, 16)) < 30 ? '00' : '30';
     const key = `${hh}:${mm}`;
 
     if (!slots[key]) slots[key] = { buySum: 0, feedInSum: 0, count: 0, demandWindow: false, nemTime: p.nemTime };
