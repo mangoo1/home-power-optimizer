@@ -34,27 +34,27 @@ const GW_PORT       = process.env.OPENCLAW_GATEWAY_PORT || '18789';
 if (!AMBER_TOKEN || !AMBER_SITE_ID) throw new Error('Missing AMBER_API_TOKEN or AMBER_SITE_ID in .env');
 if (!ESS_TOKEN   || !ESS_MAC_HEX)   throw new Error('Missing ESS_TOKEN or ESS_MAC_HEX in .env');
 
-// ── 系统常量 ──────────────────────────────────────────────────
-const BATT_KWH       = 42;      // 电池总容量 kWh
-const SOC_MIN        = 0.10;    // 最低 SOC 底线（不放电到这以下）
-const SOC_OVERNIGHT  = 0.35;    // 电池绝对底线（逆变器保护，不放电到这以下）
-const SOC_SELL_FLOOR = 0.50;    // 卖电保守底线（21:00保留50%=21kWh，数据积累后再调整）
-// 充电目标：电网必须充到 85%，保证晚上有足够电量
-// 下午 PV 是额外收益（继续充或卖电），不依赖 PV 来补缺口
-const SOC_TARGET     = 0.85;    // 电网充电目标（必须达到）
-const GRID_CHARGE_TARGET = 0.85; // 与 SOC_TARGET 一致，电网负责充满
-const MAX_CHARGE_KW  = 5.0;     // 逆变器最大充电功率
-const MAX_SELL_KW    = 5.0;     // 逆变器最大放电功率
-const BREAKER_KW     = 7.7;     // 主断路器限制
-const PANEL_KWP      = 4.3;     // 系统峰值功率
-const MAX_DAILY_KWH  = 20.0;    // 晴天实际上限（实测约15kWh）
-const CHARGE_BUFFER  = 0.5;     // 充电安全余量 kW
-const HW_LOAD_KW     = 5.0;     // 主热水器运行时附加负荷（单台约5kW）
-const PV_SCALE       = 0.0032;  // 实测换算系数：kW per W/m²（97样本均值，校准后直接用）
-const BUY_MAX_C      = 14.0;    // 买电上限（超过不充）
-const BUY_MIN_C      = parseFloat(process.env.BUY_THRESHOLD_C || '8.0');
-const SELL_MIN_MARGIN_C = parseFloat(process.env.SELL_MIN_MARGIN_C || '3.0');
-const SELL_FLOOR_C   = parseFloat(process.env.SELL_FLOOR_C || '9.9');
+// ── 系统常量（全部从 .env 读取，修改阈值请编辑 .env 文件）──────
+const e = (key, def) => parseFloat(process.env[key] || def);
+const BATT_KWH       = e('BATT_KWH',           42);
+const SOC_MIN        = e('SOC_MIN_PCT',         10)  / 100;
+const SOC_OVERNIGHT  = SOC_MIN;                       // 逆变器绝对底线 = SOC_MIN
+const SOC_SELL_FLOOR = e('SOC_SELL_FLOOR_PCT',  50)  / 100;
+const SOC_TARGET     = e('CHARGE_TARGET_PCT',   85)  / 100;
+const GRID_CHARGE_TARGET = SOC_TARGET;
+const MAX_CHARGE_KW  = e('MAX_CHARGE_KW',       5.0);
+const MAX_SELL_KW    = e('MAX_SELL_KW',         5.0);
+const BREAKER_KW     = e('BREAKER_KW',          7.7);
+const MAX_DAILY_KWH  = 20.0;
+const CHARGE_BUFFER  = e('CHARGE_BUFFER_KW',    0.5);
+const HW_LOAD_KW     = e('HW_LOAD_KW',          5.0);
+const PV_SCALE       = e('PV_SCALE',            0.0032);
+const BUY_MAX_C      = e('BUY_MAX_C',           14.0);
+const BUY_MIN_C      = e('BUY_THRESHOLD_C',      8.0);
+const SELL_MIN_MARGIN_C = e('SELL_MIN_MARGIN_C', 3.0);
+const SELL_FLOOR_C   = e('SELL_FLOOR_C',        10.0);
+const HW_GRID_MAX_C  = e('HW_GRID_MAX_C',       10.0);
+const HW_BATT_MIN_C  = e('HW_BATT_MIN_C',       12.0);
 const DB_PATH        = path.join(__dirname, '..', 'data', 'energy.db');
 
 // ── 工具函数 ──────────────────────────────────────────────────
@@ -696,8 +696,6 @@ function savePlan(db, today, plan, meta) {
 // 主热水器每天必须在最低电价时段运行2小时（晚上要有热水用）
 // 约束：只在 06:00–14:00 之间，非 DW 时段，连续4个半小时槽
 // 电价门槛：低于此值用电网直供，高于此值用电池
-const HW_GRID_MAX_C = 10.0;  // ≤10¢ 用电网（Timed 0.1kW）
-const HW_BATT_MIN_C = 12.0;  // ≥12¢ 用电池（Self-use）
 
 // 根据电价决定热水器供电来源
 // source='grid'  → Timed 模式 chargeKw=0.1（电网直供，电池几乎不动）
@@ -750,19 +748,65 @@ function calcHotWaterWindows(slots) {
     return h >= 6 && h < 17 && !s.dw && s.buyC > 0;  // 最晚到17:00前（留出晚高峰）
   });
 
-  // 主热水器窗口
+  // 主热水器窗口：最低价2小时
   const mainWin = findBestWindow(dayCandidates);
   if (!mainWin) return { main: null, gf: null };
 
-  // GF热水器窗口：排除与主热水器重叠的槽（主热水器结束后至少1小时）
-  const [meh, mem] = mainWin.endKey.split(':').map(Number);
-  const mainEndMins = meh*60+mem;
-  const gfCandidates = dayCandidates.filter(s => {
-    const [h,m] = s.key.split(':').map(Number);
-    return h*60+m >= mainEndMins + 60; // 至少主热水器结束后1小时
-  });
+  // GF热水器窗口：高电价/DW 开始前1小时开（趁低价预热，避开高峰）
+  // 找今天第一个高电价时段（>= HW_BATT_MIN_C）或 DW 开始时间
+  let highPriceStartMins = null;
+  for (const s of slots) {
+    const h = parseInt(s.key.split(':')[0]);
+    const m = parseInt(s.key.split(':')[1]);
+    if ((s.buyC >= HW_BATT_MIN_C || s.dw) && h >= 14) { // 只看14:00以后的高电价
+      highPriceStartMins = h*60+m;
+      break;
+    }
+  }
 
-  const gfWin = findBestWindow(gfCandidates);
+  let gfWin = null;
+  if (highPriceStartMins !== null) {
+    // GF 开始 = 高电价前1小时，持续1小时（2槽）
+    const gfStartMins = highPriceStartMins - 60;
+    const gfEndMins   = highPriceStartMins;
+    const gfStartKey  = `${String(Math.floor(gfStartMins/60)).padStart(2,'0')}:${String(gfStartMins%60).padStart(2,'0')}`;
+    const gfEndKey    = `${String(Math.floor(gfEndMins/60)).padStart(2,'0')}:${String(gfEndMins%60).padStart(2,'0')}`;
+    // 找这个窗口的平均电价
+    const gfSlots = slots.filter(s => s.key >= gfStartKey && s.key < gfEndKey);
+    const avgC = gfSlots.length ? gfSlots.reduce((s,x)=>s+x.buyC,0)/gfSlots.length : 0;
+    // 确保不与主热水器重叠
+    const [meh,mem] = mainWin.endKey.split(':').map(Number);
+    if (gfStartMins >= meh*60+mem + 30) { // 主热水器结束后至少30分钟
+      gfWin = { startKey: gfStartKey, endKey: gfEndKey, avgBuyC: parseFloat(avgC.toFixed(2)), source: hwSource(avgC) };
+    }
+  }
+
+  // 如果没找到高电价触发，退而求其次找主热水器后最便宜的1小时
+  if (!gfWin) {
+    const [meh,mem] = mainWin.endKey.split(':').map(Number);
+    const mainEndMins = meh*60+mem;
+    const gfCandidates = dayCandidates.filter(s => {
+      const [h,m] = s.key.split(':').map(Number);
+      return h*60+m >= mainEndMins + 60;
+    });
+    if (gfCandidates.length >= 2) {
+      // 取最便宜的连续2槽（1小时）
+      let bestAvg = Infinity, bestIdx = 0;
+      for (let i = 0; i <= gfCandidates.length - 2; i++) {
+        const avg = (gfCandidates[i].buyC + gfCandidates[i+1].buyC) / 2;
+        if (avg < bestAvg) { bestAvg = avg; bestIdx = i; }
+      }
+      const s0 = gfCandidates[bestIdx], s1 = gfCandidates[bestIdx+1];
+      const [eh,em] = s1.key.split(':').map(Number);
+      const endMins = eh*60+em+30;
+      gfWin = {
+        startKey: s0.key,
+        endKey: `${String(Math.floor(endMins/60)).padStart(2,'0')}:${String(endMins%60).padStart(2,'0')}`,
+        avgBuyC: parseFloat(bestAvg.toFixed(2)),
+        source: hwSource(bestAvg),
+      };
+    }
+  }
 
   return { main: mainWin, gf: gfWin };
 }
