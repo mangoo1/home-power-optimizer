@@ -1,6 +1,6 @@
 /**
- * hw-monitor.js — 监控热水器开关状态，记录到 hw_log 表
- * cron: 每5分钟跑一次，记录 GF / Main Hot Water 的 switch 状态变化
+ * hw-monitor.js — 监控热水器功率，每5分钟记录到 hw_log 表
+ * 通过 phase_a base64 解码实时功率（W）、电压（V）、电流（A）
  */
 'use strict';
 
@@ -17,7 +17,6 @@ const DEVICES = [
 
 const db = new Database(DB_PATH);
 
-// 确保表存在
 db.exec(`
   CREATE TABLE IF NOT EXISTS hw_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -26,9 +25,24 @@ db.exec(`
     device_name TEXT,
     online INTEGER,
     switch_on INTEGER,
-    duration_min REAL  -- 本次开启持续时间（关闭时计算）
+    voltage_v REAL,
+    current_a REAL,
+    power_w REAL,
+    total_kwh REAL
   )
 `);
+
+// 解码 Tuya phase_a: voltage(2B)/10V, current(3B)/1000A, power(3B)/10W
+function decodePhase(b64) {
+  try {
+    const b = Buffer.from(b64, 'base64');
+    return {
+      voltage: b.readUInt16BE(0) / 10,
+      current: (b[2] * 65536 + b[3] * 256 + b[4]) / 1000,
+      power:   (b[5] * 65536 + b[6] * 256 + b[7]) / 10,
+    };
+  } catch { return { voltage: 0, current: 0, power: 0 }; }
+}
 
 function getStatus(deviceId) {
   try {
@@ -37,48 +51,37 @@ function getStatus(deviceId) {
       { cwd: '/home/deven/.openclaw/workspace', timeout: 15000 }
     ).toString();
     const r = JSON.parse(out);
+    if (!r.success) return null;
+    const phase = decodePhase(r.data?.phase_a || '');
     return {
-      online: r.success,
-      switch_on: r.data?.switch === true ? 1 : 0,
+      online:     1,
+      switch_on:  r.data?.switch ? 1 : 0,
+      voltage_v:  phase.voltage,
+      current_a:  phase.current,
+      power_w:    phase.power,
+      total_kwh:  (r.data?.total_forward_energy || 0) / 100,
     };
-  } catch {
-    return { online: 0, switch_on: 0 };
-  }
+  } catch { return null; }
 }
 
 const now = new Date().toISOString();
 
 for (const dev of DEVICES) {
-  const status = getStatus(dev.id);
-
-  // 查上一条记录
-  const prev = db.prepare(
-    'SELECT * FROM hw_log WHERE device_id=? ORDER BY id DESC LIMIT 1'
-  ).get(dev.id);
-
-  // 状态有变化（或第一次记录）才写入
-  const changed = !prev || prev.switch_on !== status.switch_on || prev.online !== status.online;
-
-  // 计算持续时间：如果从 on→off，算这次开了多久
-  let duration_min = null;
-  if (prev && prev.switch_on === 1 && status.switch_on === 0) {
-    const prevTs = new Date(prev.ts);
-    const nowTs = new Date(now);
-    duration_min = parseFloat(((nowTs - prevTs) / 60000).toFixed(1));
+  const s = getStatus(dev.id);
+  if (!s) {
+    db.prepare(`INSERT INTO hw_log (ts,device_id,device_name,online,switch_on,power_w) VALUES (?,?,?,0,0,0)`)
+      .run(now, dev.id, dev.name);
+    console.log(`[${dev.name}] OFFLINE`);
+    continue;
   }
 
-  if (changed) {
-    db.prepare(`
-      INSERT INTO hw_log (ts, device_id, device_name, online, switch_on, duration_min)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(now, dev.id, dev.name, status.online ? 1 : 0, status.switch_on, duration_min);
+  db.prepare(`
+    INSERT INTO hw_log (ts,device_id,device_name,online,switch_on,voltage_v,current_a,power_w,total_kwh)
+    VALUES (?,?,?,?,?,?,?,?,?)
+  `).run(now, dev.id, dev.name, s.online, s.switch_on, s.voltage_v, s.current_a, s.power_w, s.total_kwh);
 
-    const stateStr = !status.online ? 'OFFLINE' : status.switch_on ? '🔴 ON' : '⚫ OFF';
-    const durStr = duration_min != null ? ` (运行了 ${duration_min} 分钟)` : '';
-    console.log(`[${dev.name}] ${stateStr}${durStr}`);
-  } else {
-    console.log(`[${dev.name}] 无变化 (${status.switch_on ? 'ON' : 'OFF'})`);
-  }
+  const heating = s.power_w > 100 ? `🔥 加热中 ${s.power_w}W` : `💤 待机 ${s.power_w}W`;
+  console.log(`[${dev.name}] ${heating} | ${s.voltage_v}V ${s.current_a}A | 累计${s.total_kwh}kWh`);
 }
 
 db.close();
