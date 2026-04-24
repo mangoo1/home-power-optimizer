@@ -37,20 +37,24 @@ if (!ESS_TOKEN   || !ESS_MAC_HEX)   throw new Error('Missing ESS_TOKEN or ESS_MA
 // ── 系统常量 ──────────────────────────────────────────────────
 const BATT_KWH       = 42;      // 电池总容量 kWh
 const SOC_MIN        = 0.10;    // 最低 SOC 底线（不放电到这以下）
-const SOC_OVERNIGHT  = 0.35;    // 21:00 过夜保留目标（不卖电到这以下）
-const SOC_TARGET     = 0.85;    // 充电目标 SOC
-// SOC_TARGET_BY 不再硬编码，由运行时动态计算：有DW取DW前1小时，无DW取低电价结束时间
+const SOC_OVERNIGHT  = 0.35;    // 过夜 SOC 最低底线（绝对不卖到这以下）
+const SOC_SELL_FLOOR = 0.55;    // 卖电时的保守底线（确保21:00有足够余量过夜）
+// 充电目标：电网只补到电网充电目标SOC，剩余由PV自然填满
+// 逻辑：早上电网低价时充到 GRID_CHARGE_TARGET，下午PV继续充到最终 SOC_MAX
+const SOC_TARGET     = 0.85;    // 最终目标 SOC（PV+电网合计）
+const GRID_CHARGE_TARGET = 0.70; // 电网充电截止 SOC（剩余15%留给下午PV来填）
 const MAX_CHARGE_KW  = 5.0;     // 逆变器最大充电功率
 const MAX_SELL_KW    = 5.0;     // 逆变器最大放电功率
 const BREAKER_KW     = 7.7;     // 主断路器限制
 const PANEL_KWP      = 4.3;     // 系统峰值功率
-const MAX_DAILY_KWH  = 22.0;    // 晴天理论上限（4.3kWp × ~5h 有效日照）
+const MAX_DAILY_KWH  = 20.0;    // 晴天实际上限（实测约15kWh）
 const CHARGE_BUFFER  = 0.5;     // 充电安全余量 kW
 const HW_LOAD_KW     = 5.0;     // 主热水器运行时附加负荷（单台约5kW）
-const BUY_MAX_C      = 14.0;    // 买电上限（超过不充，放宽到14¢覆盖更多时段）
-const BUY_MIN_C      = parseFloat(process.env.BUY_THRESHOLD_C || '8.0'); // 买电阈值下限（.env 可覆盖）
-const SELL_MIN_MARGIN_C = parseFloat(process.env.SELL_MIN_MARGIN_C || '3.0'); // 卖电最低利润（¢/kWh，相对买入均价）
-const SELL_FLOOR_C   = parseFloat(process.env.SELL_FLOOR_C || '9.9');   // 卖电绝对下限（再便宜不卖）
+const PV_SCALE       = 0.0032;  // 实测换算系数：kW per W/m²（97样本均值，校准后直接用）
+const BUY_MAX_C      = 14.0;    // 买电上限（超过不充）
+const BUY_MIN_C      = parseFloat(process.env.BUY_THRESHOLD_C || '8.0');
+const SELL_MIN_MARGIN_C = parseFloat(process.env.SELL_MIN_MARGIN_C || '3.0');
+const SELL_FLOOR_C   = parseFloat(process.env.SELL_FLOOR_C || '9.9');
 const DB_PATH        = path.join(__dirname, '..', 'data', 'energy.db');
 
 // ── 工具函数 ──────────────────────────────────────────────────
@@ -239,13 +243,14 @@ function calcPvCalibration(db) {
 }
 
 // ── Step 3: 从 solar_forecast 获取今天逐小时 PV 预测 ───────────
-function getPvForecast(db, today, calibFactor) {
+// 使用实测换算系数 PV_SCALE（0.0032 kW per W/m²），不再需要 calibFactor 双重折减
+function getPvForecast(db, today) {
   const row = db.prepare(`
     SELECT forecast_json FROM solar_forecast WHERE date=? ORDER BY fetched_at DESC LIMIT 1
   `).get(today);
 
   if (!row) {
-    console.log('[PV预测] 无今日预测数据，使用默认值');
+    console.log('[PV预测] 无今日预测数据，PV按0处理');
     return {};
   }
 
@@ -256,12 +261,10 @@ function getPvForecast(db, today, calibFactor) {
     const t = fc.time[i];
     if (!t.startsWith(today)) continue;
     const h = parseInt(t.substring(11, 13));
-    const swRad = fc.sw[i] ?? 0;      // W/m²
-    const cloud = fc.cloud[i] ?? 0;   // %
-
-    // PV 估算：系统峰值 4.3kWp，辐射转换 + 云量折减
-    const cloudFactor = 1 - (cloud / 100) * 0.7;  // 100%云 = 30%辐射
-    const pvKw = (swRad / 1000) * 4.3 * cloudFactor * calibFactor;
+    const swRad = fc.sw[i] ?? 0;
+    const cloud = fc.cloud[i] ?? 0;
+    const cloudFactor = 1 - (cloud / 100) * 0.7;
+    const pvKw = swRad * PV_SCALE * cloudFactor;
     pvByHour[h] = parseFloat(Math.max(0, pvKw).toFixed(2));
   }
 
@@ -287,7 +290,7 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5, nightReser
   const targetKwh  = SOC_TARGET * BATT_KWH;               // 目标 kWh（85%）
   const currentKwh = currentSoc / 100 * BATT_KWH;
 
-  // 热水器运行时段 set（key格式 "HH:MM"）— 充电功率需降低避免超断路器
+  // 热水器运行时段 set（key格式 "HH:MM"）
   const hwKeys = new Set();
   if (hwWindow) {
     const [sh, sm] = hwWindow.startKey.split(':').map(Number);
@@ -300,74 +303,82 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5, nightReser
     }
   }
 
-  // 动态卖电门槛：买入均价 + 利润margin，但不低于绝对下限
+  // ── 卖电门槛 ──
   const sellMinC = Math.max(SELL_FLOOR_C, avgBuyC + SELL_MIN_MARGIN_C);
-  console.log(`[卖电] 买入均价: ${avgBuyC.toFixed(2)}¢, 卖电门槛: ${sellMinC.toFixed(2)}¢ (margin=${SELL_MIN_MARGIN_C}¢, floor=${SELL_FLOOR_C}¢)`);
+  console.log(`[卖电门槛] 买入均价: ${avgBuyC.toFixed(2)}¢ + ${SELL_MIN_MARGIN_C}¢ = ${sellMinC.toFixed(2)}¢ (floor=${SELL_FLOOR_C}¢)`);
 
-  // ── 动态计算充电截止时间 ──────────────────────────────────
-  // 有 DW：在 DW 开始前 1 小时停止充电（避免 DW 时段还在充）
-  // 无 DW：取今天最后一个低电价时段结束时间（买价 < BUY_MAX_C 的最后一槽）
-  let chargeTargetBy; // Sydney 小时（exclusive）
+  // ── 充电截止时间 ──
+  // 有 DW：DW 开始前 1 小时；无 DW：PV 峰值前结束（给下午 PV 充电留空间）
+  let gridChargeEndHour;
   if (hasDW) {
     const dwSlot = slots.find(s => s.dw);
     const dwHour = dwSlot ? parseInt(dwSlot.key.split(':')[0]) : 17;
-    chargeTargetBy = Math.max(9, dwHour - 1); // DW前1小时，最早9点
-    console.log(`[充电截止] DW模式，截止 ${chargeTargetBy}:00（DW开始 ${dwHour}:00）`);
+    gridChargeEndHour = Math.max(9, dwHour - 1);
+    console.log(`[充电截止] DW模式，截止 ${gridChargeEndHour}:00`);
   } else {
-    // 找今天价格低于 BUY_MAX_C 的最后一个时段
-    const cheapSlots = slots.filter(s => s.buyC > 0 && s.buyC < BUY_MAX_C && !s.dw);
-    const lastCheap = cheapSlots.length ? cheapSlots[cheapSlots.length - 1] : null;
-    const lastH = lastCheap ? parseInt(lastCheap.key.split(':')[0]) + 1 : 15;
-    chargeTargetBy = Math.min(lastH, 17); // 最晚17点
-    console.log(`[充电截止] 无DW，按低电价截止 ${chargeTargetBy}:00（最后低价槽 ${lastCheap?.key ?? 'none'}）`);
+    // 电网充电在 PV 峰值前结束（一般 12:00 前），让下午 PV 自然充满
+    // 取 08:00–12:00 里最后的低价槽 +30min
+    const morningCheap = slots.filter(s => {
+      const h = parseInt(s.key.split(':')[0]);
+      return h >= 7 && h < 13 && !s.dw && s.buyC > 0 && s.buyC < BUY_MAX_C;
+    });
+    const lastMorning = morningCheap.length ? morningCheap[morningCheap.length - 1] : null;
+    const lastH = lastMorning ? parseInt(lastMorning.key.split(':')[0]) + 1 : 12;
+    gridChargeEndHour = Math.min(lastH, 13); // 最晚 13:00
+    console.log(`[充电截止] 无DW，电网充电截止 ${gridChargeEndHour}:00（最后低价槽 ${lastMorning?.key ?? 'none'}）`);
   }
 
-  // ── Phase 1: 倒推需要充多少，选最便宜的槽 ──────────────────
-  // 只考虑 chargeTargetBy 前、非 DW 的候选槽，算出每槽可充 kWh
-  const nowHour = parseInt(slots[0]?.key?.split(':')[0] ?? '0');  // 当前时间近似（取第一个槽）
-
-  // 估算从现在到第一个候选充电槽之间的电池消耗（防止 SOC 跌到底线）
-  const waitSlots = slots.filter(s => {
+  // ── Phase 1: 计算今天 PV 总预测贡献（下午部分）──────────
+  // 下午 PV 能充多少：gridChargeEndHour ~ 17:00 之间的 PV 积分
+  let pvAfternoonKwh = 0;
+  slots.forEach(s => {
     const h = parseInt(s.key.split(':')[0]);
-    return h < chargeTargetBy && !s.dw && s.buyC > 0 && s.buyC >= BUY_MAX_C;
+    if (h >= gridChargeEndHour && h < 17) {
+      pvAfternoonKwh += pvAt30min(pvByHour, h) * 0.5 * 0.92; // 充入效率
+    }
   });
-  // 等待期消耗：每个非充电半小时槽，电池需要供 homeLoad - pv
-  const waitConsumptionKwh = waitSlots.reduce((sum, s) => {
-    const h  = parseInt(s.key.split(':')[0]);
-    const pv = pvAt30min(pvByHour, h);
-    const hl = homeLoadKw(h);
-    const net = Math.max(0, hl - pv); // 需要电池供的净负荷
-    return sum + net * 0.5 * (1 / 0.85); // 放电效率折算
-  }, 0);
+  console.log(`[PV下午贡献] ${gridChargeEndHour}:00-17:00 估算充入: ${pvAfternoonKwh.toFixed(1)}kWh`);
 
+  // 电网充电目标 = 最终目标 - PV下午贡献，但不低于当前 SOC+基本夜间保障
+  const gridTargetKwh = Math.max(
+    currentKwh + 5,                                         // 至少比现在多 5kWh
+    Math.min(
+      GRID_CHARGE_TARGET * BATT_KWH,                        // 硬上限：电网充到 70%
+      (SOC_TARGET * BATT_KWH) - pvAfternoonKwh              // 最终目标 - PV 预计贡献
+    )
+  );
+  console.log(`[电网目标] ${(gridTargetKwh/BATT_KWH*100).toFixed(0)}% (${gridTargetKwh.toFixed(1)}kWh)，最终目标85%由PV补齐`);
+
+  // ── Phase 2: 选最便宜的槽充到 gridTargetKwh ────────────────
   const candidateSlots = slots
     .map(s => {
       const h  = parseInt(s.key.split(':')[0]);
       const pv = pvAt30min(pvByHour, h);
       const hl = homeLoadKw(h);
-      // 热水器时段：homeLoad 加 HW_LOAD_KW，但仍可充电（功率降低）
       const effectiveLoad = hwKeys.has(s.key) ? hl + HW_LOAD_KW : hl;
       const gridHeadroom = BREAKER_KW - Math.max(0, effectiveLoad - pv) - CHARGE_BUFFER;
       const maxChargeKw  = parseFloat(Math.min(MAX_CHARGE_KW, Math.max(0, gridHeadroom)).toFixed(2));
-      const chargeKwhPer = maxChargeKw * 0.5 * 0.95; // 半小时可充入 kWh（含效率）
+      const chargeKwhPer = maxChargeKw * 0.5 * 0.95;
       return { ...s, h, pv, hl, maxChargeKw, chargeKwhPer };
     })
-    .filter(s => s.h < chargeTargetBy && !s.dw && s.maxChargeKw >= 0.5 && s.buyC > 0);
+    .filter(s => s.h < gridChargeEndHour && !s.dw && s.maxChargeKw >= 0.5 && s.buyC > 0 && s.buyC < BUY_MAX_C);
 
-  // 按电价从低到高排，贪心选槽直到充够
+  // 早晨消耗估算（等待第一个充电槽期间的自放）
+  const nowHour = parseInt(slots[0]?.key?.split(':')[0] ?? '0');
+  const waitConsumptionKwh = slots.filter(s => {
+    const h = parseInt(s.key.split(':')[0]);
+    return h < gridChargeEndHour && !s.dw && s.buyC >= BUY_MAX_C;
+  }).reduce((sum, s) => {
+    const h = parseInt(s.key.split(':')[0]);
+    const net = Math.max(0, homeLoadKw(h) - pvAt30min(pvByHour, h));
+    return sum + net * 0.5 * (1 / 0.85);
+  }, 0);
+
+  const neededKwh = Math.max(0, gridTargetKwh - currentKwh + waitConsumptionKwh);
+  console.log(`[需充] ${neededKwh.toFixed(1)}kWh（目标${gridTargetKwh.toFixed(1)}kWh - 当前${currentKwh.toFixed(1)}kWh + 等待消耗${waitConsumptionKwh.toFixed(1)}kWh）`);
+
   const sortedByPrice = [...candidateSlots].sort((a, b) => a.buyC - b.buyC);
   const chargeKeys = new Set();
-
-  // neededKwh = 目标 - 当前 + 等待期消耗（防止跌底）
-  let neededKwh = Math.max(0, targetKwh - currentKwh + waitConsumptionKwh);
-
-  // 还要扣掉 PV 预计贡献（候选槽期间 PV 总发电 × 自用比例）
-  const pvContrib = candidateSlots.reduce((s, x) => s + x.pv * 0.5 * 0.9, 0);
-  neededKwh = Math.max(0, neededKwh - pvContrib);
-
-  console.log(`[计划] 等待期消耗估算: ${waitConsumptionKwh.toFixed(1)}kWh, PV贡献: ${pvContrib.toFixed(1)}kWh`);
-
-  const buyThreshold_auto = sortedByPrice.length ? sortedByPrice[0].buyC : BUY_MIN_C;
   let accumulated = 0;
   for (const s of sortedByPrice) {
     if (accumulated >= neededKwh) break;
@@ -375,34 +386,23 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5, nightReser
     accumulated += s.chargeKwhPer;
   }
 
-  // ── 补充：填满首尾充电槽之间的所有空隙 ──
-  // 贪心算法可能跳过首尾之间的某些槽（如 10:30、11:00），导致中间出现自用"空洞"
-  // 策略：已选最早槽和最晚槽之间，只要 buyC < BUY_MAX_C 且非 DW 的都加进来
+  // 填满首尾充电槽之间的空隙（避免中间出现自用空洞）
   const sortedChargeKeys = [...chargeKeys].sort();
   const firstChargeKey = sortedChargeKeys[0];
   const lastChargeKey  = sortedChargeKeys[sortedChargeKeys.length - 1];
   for (const s of candidateSlots) {
     if (chargeKeys.has(s.key)) continue;
-    // 填补首尾之间的空隙
-    if (firstChargeKey && lastChargeKey &&
-        s.key >= firstChargeKey && s.key <= lastChargeKey &&
-        s.buyC < BUY_MAX_C) {
-      chargeKeys.add(s.key);
-    }
-    // 早于首槽但价格更便宜的也纳入（防 SOC 白白消耗）
-    if (firstChargeKey && s.key < firstChargeKey && s.buyC <= BUY_MAX_C) {
+    if (firstChargeKey && lastChargeKey && s.key >= firstChargeKey && s.key <= lastChargeKey) {
       chargeKeys.add(s.key);
     }
   }
 
-  // 实际买电阈值 = 选中槽里最贵的那个（加保底 BUY_MIN_C）
-  const selectedPrices = sortedByPrice.filter(s => chargeKeys.has(s.key)).map(s => s.buyC);
+  const selectedPrices = [...candidateSlots].filter(s => chargeKeys.has(s.key)).map(s => s.buyC);
   const buyThreshold = Math.max(BUY_MIN_C, selectedPrices.length ? Math.max(...selectedPrices) : BUY_MIN_C);
 
-  console.log(`\n[计划] 目标: SOC ${currentSoc}% → ${Math.round(SOC_TARGET*100)}% (需充 ${neededKwh.toFixed(1)}kWh, PV贡献 ~${pvContrib.toFixed(1)}kWh)`);
-  console.log(`[计划] 选中 ${chargeKeys.size} 个充电槽 | 买电阈值: ${buyThreshold.toFixed(1)}¢ | 卖电门槛: ${sellMinC.toFixed(1)}¢ | DW: ${hasDW}`);
+  console.log(`\n[电网充电] 选中 ${chargeKeys.size} 槽 (${firstChargeKey ?? '-'}–${lastChargeKey ?? '-'}) | 最贵: ${buyThreshold.toFixed(1)}¢ | 卖电门槛: ${sellMinC.toFixed(1)}¢`);
 
-  // ── Phase 2: 顺序扫描生成计划 ──────────────────────────────
+  // ── Phase 3: 顺序扫描生成完整计划（含卖电）──────────────────
   let socKwh = currentKwh;
   const plan = [];
 
@@ -412,17 +412,16 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5, nightReser
     const hl  = homeLoadKw(h);
     const net = hl - pv;
 
-    const gridHeadroom = BREAKER_KW - Math.max(0, net) - CHARGE_BUFFER;
-    // 热水器时段：额外扣除热水器负荷，降低充电功率（但不停止）
+    // 充电功率：热水器时段降低（避免超断路器）
     const hwExtra = hwKeys.has(s.key) ? HW_LOAD_KW : 0;
-    const gridHeadroomHw = BREAKER_KW - Math.max(0, net + hwExtra) - CHARGE_BUFFER;
-    const maxChargeKw  = parseFloat(Math.min(MAX_CHARGE_KW, Math.max(0, gridHeadroomHw)).toFixed(2));
+    const maxChargeKw = parseFloat(Math.min(MAX_CHARGE_KW,
+      Math.max(0, BREAKER_KW - Math.max(0, net + hwExtra) - CHARGE_BUFFER)
+    ).toFixed(2));
 
-    const usableKwh = Math.max(0, socKwh - SOC_MIN * BATT_KWH);
-    // 过夜保留 = max(35%电量, 实际夜间用电均值×1.1)，防止卖超
+    // 卖电：动态可卖量 = 当前SOC - 过夜保留底线
     const overnightFloorKwh = nightReserveKwh
-      ? Math.max(SOC_OVERNIGHT * BATT_KWH, nightReserveKwh * 1.1)
-      : SOC_OVERNIGHT * BATT_KWH;
+      ? Math.max(SOC_SELL_FLOOR * BATT_KWH, nightReserveKwh * 1.2)
+      : SOC_SELL_FLOOR * BATT_KWH;
     const sellableKwh = Math.max(0, socKwh - overnightFloorKwh);
     const maxSellKw = parseFloat(Math.min(MAX_SELL_KW, sellableKwh / 0.5).toFixed(2));
 
@@ -431,14 +430,14 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5, nightReser
     if (s.dw) {
       action = 'standby';
       reason = 'DW';
-    } else if (chargeKeys.has(s.key) && socKwh < targetKwh && maxChargeKw >= 0.5) {
-      // 选中的充电槽（热水器时段功率自动降低）
+    } else if (chargeKeys.has(s.key) && socKwh < gridTargetKwh && maxChargeKw >= 0.5) {
+      // 电网充电槽（充到电网目标，剩余由PV填）
       action   = 'charge';
       chargeKw = maxChargeKw;
       const hwNote = hwKeys.has(s.key) ? ' +HW↓' : '';
-      reason   = `buy=${s.buyC}¢ selected(cheapest)${hwNote}`;
-    } else if (s.feedInC >= sellMinC && maxSellKw >= 0.5) {
-      // 高价卖电：feedIn 够高 + 卖后剩余 > 过夜保留量（含夜间用电安全系数）
+      reason   = `buy=${s.buyC}¢ grid-charge${hwNote}`;
+    } else if (s.feedInC >= sellMinC && maxSellKw >= 0.5 && h >= 16) {
+      // 晚间高价卖电（16:00以后，feedIn够高，有足够SOC）
       action = 'sell';
       sellKw = maxSellKw;
       reason = `feedIn=${s.feedInC}¢ ≥ ${sellMinC.toFixed(1)}¢`;
@@ -456,23 +455,14 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5, nightReser
     socKwh = Math.min(BATT_KWH, Math.max(SOC_MIN * BATT_KWH, socKwh + deltaKwh));
 
     plan.push({
-      key:      s.key,
-      nemTime:  s.nemTime,
-      hour:     h,
-      buyC:     s.buyC,
-      feedInC:  s.feedInC,
-      pvKw:     pv,
-      homeLoad: hl,
-      dw:       s.dw,
-      action,
-      chargeKw: parseFloat(chargeKw.toFixed(2)),
-      sellKw:   parseFloat(sellKw.toFixed(2)),
-      socPct:   Math.round(socKwh / BATT_KWH * 100),
-      reason,
+      key: s.key, nemTime: s.nemTime, hour: h,
+      buyC: s.buyC, feedInC: s.feedInC, pvKw: pv, homeLoad: hl, dw: s.dw,
+      action, chargeKw: parseFloat(chargeKw.toFixed(2)), sellKw: parseFloat(sellKw.toFixed(2)),
+      socPct: Math.round(socKwh / BATT_KWH * 100), reason,
     });
   }
 
-  return { plan, buyThreshold, chargeTargetBy, sellMinC };
+  return { plan, buyThreshold, chargeTargetBy: gridChargeEndHour, sellMinC };
 }
 
 // ── 21:00 过夜电量检阅 ────────────────────────────────────────
@@ -820,14 +810,11 @@ async function main() {
   // 2. Solar forecast（先取，确保 DB 里有今日数据）
   await fetchSolarForecast(db, today);
 
-  // 3. PV 校准系数
-  const calibFactor = calcPvCalibration(db);
-
-  // 3. 今日 PV 预测（按小时）
-  const pvByHour = getPvForecast(db, today, calibFactor);
+  // 3. 今日 PV 预测（直接用实测换算系数 PV_SCALE=0.0032，不再需要校准）
+  const pvByHour = getPvForecast(db, today);
   const pvForecastKwh = Math.min(MAX_DAILY_KWH, Object.values(pvByHour).reduce((s, v) => s + v, 0));
   const pvPeakKw = Math.max(...Object.values(pvByHour), 0);
-  console.log(`[PV预测] 今日预计: ${pvForecastKwh.toFixed(1)}kWh, 峰值: ${pvPeakKw.toFixed(2)}kW`);
+  console.log(`[PV预测] 今日预计: ${pvForecastKwh.toFixed(1)}kWh, 峰值: ${pvPeakKw.toFixed(2)}kW (scale=${PV_SCALE})`);
 
   // 4. Amber 价格预测
   console.log('\n[Amber] 拉取价格预测...');
@@ -844,13 +831,13 @@ async function main() {
     console.log('[热水器] 无合适窗口');
   }
 
-  // 5b. 生成计划（dry-run 先算买入均价，再正式生成）
+  // 5b. 生成计划（dry-run 先算买入均价，再正式生成含卖电）
   const dryRun = buildPlan(slots, pvByHour, currentSocPct, hasDW, BUY_MIN_C + 1, null, hwWindow);
   const dryChargeSlots = dryRun.plan.filter(s => s.action === 'charge');
   const realAvgBuyC = dryChargeSlots.length > 0
     ? dryChargeSlots.reduce((s, x) => s + x.buyC, 0) / dryChargeSlots.length
     : BUY_MIN_C + 1;
-  console.log(`[买入均价] 充电槽均价: ${realAvgBuyC.toFixed(2)}¢ (${dryChargeSlots.length}槽)`);
+  console.log(`[买入均价] ${realAvgBuyC.toFixed(2)}¢ (${dryChargeSlots.length}槽) → 卖电门槛 = max(${SELL_FLOOR_C}¢, ${realAvgBuyC.toFixed(2)}+${SELL_MIN_MARGIN_C}¢)`);
 
   const avgNightKwh = calcAvgNightKwh(db);
   console.log(`[过夜用电] 近7天均值: ${avgNightKwh ?? '无数据'}kWh，保底: ${avgNightKwh ? (avgNightKwh*1.1).toFixed(1) : (SOC_OVERNIGHT*BATT_KWH).toFixed(1)}kWh`);
@@ -875,7 +862,7 @@ async function main() {
   const prevChargeSlots = prevPlan ? JSON.parse(prevPlan.intervals_json ?? '[]').filter(s=>s.action==='charge').map(s=>s.key).join(',') : '';
 
   const version = savePlan(db, today, plan, {
-    currentSocPct, hasDW, pvForecastKwh, pvPeakKw, calibFactor, buyThreshold, chargeTargetBy, sellMinC, hwWindow
+    currentSocPct, hasDW, pvForecastKwh, pvPeakKw, calibFactor: PV_SCALE, buyThreshold, chargeTargetBy, sellMinC, hwWindow
   });
   db.close();
 
