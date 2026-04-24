@@ -103,11 +103,16 @@ async function sendAlert(message) {
   }
 }
 
-// 告警去重：同一类告警当天只发一次
-const _alertSent = new Set();
-async function sendAlertOnce(key, message) {
-  if (_alertSent.has(key)) return;
-  _alertSent.add(key);
+// 告警限频：同一类告警当天最多发 MAX_ALERTS_PER_DAY 次，用 kv_store 持久化
+const MAX_ALERTS_PER_DAY = 2;
+
+async function sendAlertOnce(db, key, message) {
+  const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Australia/Sydney' });
+  const storeKey = `alert:${key}:${today}`;
+  const row = db.prepare("SELECT value FROM kv_store WHERE key=?").get(storeKey);
+  const count = row ? parseInt(row.value) : 0;
+  if (count >= MAX_ALERTS_PER_DAY) return;
+  db.prepare("INSERT OR REPLACE INTO kv_store (key,value) VALUES (?,?)").run(storeKey, String(count + 1));
   await sendAlert(message);
 }
 
@@ -478,12 +483,13 @@ async function main() {
 
   // ESS 连接失败告警（SOC 为 null 说明 API 没返回数据，可能是 token 过期）
   if (ess.soc === null) {
-    await sendAlertOnce('ess-offline', '⚠️ ESS 逆变器数据获取失败（SOC=null），可能 token 过期，请检查！');
+    await sendAlertOnce(db, 'ess-offline', '⚠️ ESS 逆变器数据获取失败（SOC=null），可能 token 过期，请检查！');
   }
   if (amber) {
     console.log(`[Amber] buy:${amber.buyPrice?.toFixed(2)}¢ feedIn:${amber.feedInPrice?.toFixed(2)}¢ DW:${amber.demandWindow} ${amber.descriptor??''}`);
   } else {
     console.log('[Amber] API blip — 继续按计划执行（时间窗口已设好）');
+    await sendAlertOnce(db, 'amber-offline', '⚠️ Amber API 连续获取失败，充放电按固定窗口运行，请检查网络或 API token！');
   }
 
   // 3. DW 检查：plan-today 已在计划里处理 DW，只需检查计划外的突发 DW
