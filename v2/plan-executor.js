@@ -629,6 +629,19 @@ async function main() {
   }
 
   db.close();
+
+  // Turso 云同步（fire-and-forget，失败不影响主流程）
+  try {
+    const { execSync } = require('child_process');
+    execSync('node scripts/turso-sync.js', {
+      cwd: require('path').join(__dirname, '..'),
+      timeout: 30000,
+      stdio: 'ignore',
+    });
+  } catch(e) {
+    console.warn('[turso-sync] 同步失败:', e.message);
+  }
+
   console.log(`[完成] action=${action}`);
 }
 
