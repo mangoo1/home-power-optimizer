@@ -11,7 +11,8 @@
 
 // Load .env from project root (two levels up from mcp/ess-inverter-mcp/)
 require("dotenv").config({ path: require("path").resolve(__dirname, "../../.env") });
- *
+
+/*
  * Inverter modes (index 0x300C):
  *   0 = Self-use       (default — use solar/battery, buy only when needed)
  *   1 = Timed          (scheduled charge/discharge windows)
@@ -19,8 +20,8 @@ require("dotenv").config({ path: require("path").resolve(__dirname, "../../.env"
  *   5 = PV Priority    (solar first, excess to grid)
  *   6 = Selling        (discharge battery + solar to grid aggressively)
  */
- *   6 = Selling        (discharge battery + solar to grid aggressively)
- *
+
+/*
  * Read endpoints:
  *   getBatteryInfo       — SOC, voltage, current, power, charge/discharge totals
  *   getLoadInfo          — home load power (kW)
@@ -33,6 +34,7 @@ require("dotenv").config({ path: require("path").resolve(__dirname, "../../.env"
 const { Server } = require("@modelcontextprotocol/sdk/server/index.js");
 const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio.js");
 const { CallToolRequestSchema, ListToolsRequestSchema } = require("@modelcontextprotocol/sdk/types.js");
+const essApi = require("../../v2/ess-api");
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const BASE_URL    = (process.env.ESS_BASE_URL || "https://eu.ess-link.com").replace(/\/$/, "");
@@ -42,6 +44,9 @@ const STATION_SN  = process.env.ESS_STATION_SN  || "";
 
 if (!TOKEN)   { console.error("[ess-inverter-mcp] ESS_TOKEN is required");   process.exit(1); }
 if (!MAC_HEX) { console.error("[ess-inverter-mcp] ESS_MAC_HEX is required"); process.exit(1); }
+
+// 初始化 ess-api（单一写操作入口，带格式校验+日志）
+essApi.init({ mac: MAC_HEX, token: TOKEN });
 
 // Web API uses Bearer prefix + cookie-style token; App API uses raw JWT
 const WEB_HEADERS = {
@@ -473,15 +478,27 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       case "ess_set_param": {
-        const res = await httpsPost("/api/app/deviceInfo/setDeviceParam", {
-          data: args.value, macHex: mac, index: args.index,
-        });
-        if (res.code !== 200) throw new Error(`ESS set param failed: ${JSON.stringify(res)}`);
-        result = { ok: true, index: args.index, value: args.value, response: res };
+        // 委托 ess-api，带格式校验+日志（防浮点十六进制污染）
+        const rawVal = args.value;
+        const numVal = typeof rawVal === 'string' ? parseFloat(rawVal) : rawVal;
+        if (typeof numVal !== 'number' || !isFinite(numVal)) throw new Error('value must be a number, got: ' + JSON.stringify(rawVal));
+        const ok = await essApi.setParam(args.index, numVal, 'mcp:ess_set_param', 'mcp');
+        if (!ok) throw new Error('ESS set param failed: index=' + args.index + ' value=' + numVal);
+        result = { ok: true, index: args.index, value: numVal };
         break;
       }
 
-      default:
+      case "ess_set_charge": {
+        const { chargeStartHHMM, chargeEndHHMM, chargeKw, sellStartHHMM, sellEndHHMM, sellKw } = args;
+        await essApi.restoreTimedMode(
+          { startHHMM: chargeStartHHMM, endHHMM: chargeEndHHMM, chargeKw, sellStartHHMM, sellEndHHMM, sellKw },
+          'mcp:ess_set_charge', 'mcp'
+        );
+        result = { ok: true, params: args };
+        break;
+      }
+
+            default:
         throw new Error(`Unknown tool: ${name}`);
     }
 

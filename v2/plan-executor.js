@@ -26,6 +26,7 @@ const https    = require('https');
 const http     = require('http');
 const path     = require('path');
 const Database = require('better-sqlite3');
+const essApi   = require('./ess-api');
 
 // ── 环境变量（全部从 .env，绝不硬编码）────────────────────────
 const AMBER_TOKEN   = process.env.AMBER_API_TOKEN;
@@ -201,97 +202,42 @@ async function readAmber() {
   } catch { return null; }
 }
 
-// ── 逆变器参数写入 ────────────────────────────────────────────
-// 全局 db 引用，供 setParam 记录日志（main() 里赋值）
-let _db = null;
-let _setParamReason = 'unknown'; // 调用前设置，记录写入原因
+// ── 逆变器写操作：全部委托给 ess-api.js（单一接口）────────────
+// 本地包装，保持日志输出格式一致
 
-async function setParam(index, data) {
-  const r = await httpsPost('https://eu.ess-link.com/api/app/deviceInfo/setDeviceParam',
-    { macHex:ESS_MAC_HEX, index, data }, ESS_HEADERS).catch(() => ({}));
-  const ok = r.code === 200;
-  // 记录到数据库
-  try {
-    if (_db) {
-      _db.prepare(`
-        INSERT OR IGNORE INTO ess_param_log (ts, param_index, param_value, ok, reason, caller)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `).run(new Date().toISOString(), index, String(data), ok ? 1 : 0, _setParamReason, 'plan-executor');
-    }
-  } catch(e) { /* 日志失败不影响主流程 */ }
+async function updateChargeKw(kw, reason = 'charge') {
+  const ok = await essApi.setChargeKw(kw, reason, 'plan-executor');
+  console.log(`[功率] 充电功率 → ${kw}kW ${ok?'✅':'❌'} (${reason})`);
   return ok;
 }
 
-// 确保 ess_param_log 表存在
-function ensureParamLogTable(db) {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS ess_param_log (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      ts TEXT NOT NULL,
-      param_index TEXT NOT NULL,
-      param_value TEXT,
-      ok INTEGER,
-      reason TEXT,
-      caller TEXT
-    )
-  `);
-}
-
-// 只调整充电功率（不动时间窗口）
-async function updateChargeKw(kw, reason = _setParamReason) {
-  const clamped = parseFloat(Math.min(MAX_CHARGE_KW, Math.max(0, kw)).toFixed(2));
-  _setParamReason = reason;
-  const ok = await setParam('0xC0BA', clamped);
-  console.log(`[功率] 充电功率 → ${clamped}kW ${ok?'✅':'❌'} (${reason})`);
+async function updateSellKw(kw, reason = 'sell') {
+  const ok = await essApi.setSellKw(kw, reason, 'plan-executor');
+  console.log(`[功率] 放电功率 → ${kw}kW ${ok?'✅':'❌'} (${reason})`);
   return ok;
 }
 
-// 只调整放电功率（不动时间窗口）
-async function updateSellKw(kw, reason = _setParamReason) {
-  const clamped = parseFloat(Math.min(MAX_SELL_KW, Math.max(0, kw)).toFixed(2));
-  _setParamReason = reason;
-  const ok = await setParam('0xC0BC', clamped);
-  console.log(`[功率] 放电功率 → ${clamped}kW ${ok?'✅':'❌'} (${reason})`);
-  return ok;
-}
-
-// 切回 Self-use 模式（0x300C=0）
-async function switchToSelfUse(reason = _setParamReason) {
-  _setParamReason = reason;
-  const ok = await setParam('0x300C', 0);
+async function switchToSelfUse(reason = 'self-use') {
+  const ok = await essApi.switchToSelfUse(reason, 'plan-executor');
   console.log(`[模式] 切回 Self-use ${ok?'✅':'❌'} (${reason})`);
   return ok;
 }
 
-// 恢复 Timed 模式并写入正确的充电时间窗口
-async function restoreTimedMode(chargeWindows, reason = _setParamReason) {
+async function restoreTimedMode(chargeWindows, reason = 'restore-timed') {
   const w = chargeWindows?.[0];
   const startHHMM = w ? w.startHour * 100 : 900;
   const endHHMM   = w ? (w.endHour - 1) * 100 + 30 : 1430;
-  _setParamReason = reason;
-  await setParam('0x300C', 1);
-  await setParam('0xC014', startHHMM);
-  await setParam('0xC016', endHHMM);
-  await setParam('0xC0BA', MAX_CHARGE_KW);
+  await essApi.restoreTimedMode({ startHHMM, endHHMM, chargeKw: MAX_CHARGE_KW }, reason, 'plan-executor');
   console.log(`[模式] 切回 Timed ✅ 充电窗口: ${String(startHHMM).padStart(4,'0')}–${String(endHHMM).padStart(4,'0')} chargeKw=${MAX_CHARGE_KW} (${reason})`);
 }
 
-// 紧急停止：清空充放电功率（DW 或超断路器）
 async function emergencyStop(reason) {
   console.log(`[紧急] 停止充放电: ${reason}`);
-  _setParamReason = `emergencyStop: ${reason}`;
-  await setParam('0xC0BA', 0);
-  await sleep(300);
-  await setParam('0xC0BC', 0);
+  await essApi.emergencyStop(`emergencyStop: ${reason}`, 'plan-executor');
 }
 
 // ── 计算动态充电功率（不超断路器）────────────────────────────
-function calcSafeChargeKw(homeLoad, pvPower) {
-  // 总电网进口 = homeLoad - pvPower + chargeKw ≤ BREAKER_KW - buffer
-  const netHouseFromGrid = (homeLoad ?? 0) - (pvPower ?? 0);
-  const headroom = BREAKER_KW - BREAKER_BUFFER - Math.max(0, netHouseFromGrid);
-  return parseFloat(Math.min(MAX_CHARGE_KW, Math.max(0, headroom)).toFixed(2));
-}
+const calcSafeChargeKw = essApi.calcSafeChargeKw;
 
 // ── 记录数据到 energy_log ─────────────────────────────────────
 function logData(db, ess, amber, slot, action, extra = {}) {
@@ -410,8 +356,7 @@ async function main() {
   console.log(`\n[${syd.date} ${syd.hh}:${String(syd.mi).padStart(2,'0')}] === plan-executor v2 ===`);
 
   const db = new Database(DB_PATH);
-  _db = db;
-  ensureParamLogTable(db);
+  essApi.init({ db, mac: ESS_MAC_HEX, token: ESS_TOKEN });
 
   // 1. 读今日计划
   const planRow = db.prepare(
@@ -497,10 +442,10 @@ async function main() {
     // 卖电时段：实时检查 SOC 底线 + feedIn 价格
     if (ess.soc !== null && ess.soc <= SOC_OVERNIGHT) {
       // SOC 触底过夜保留线：切 Self-use + 清卖电功率 + 清卖电窗口，防止逆变器自动恢复
-      await switchToSelfUse();
-      await setParam('0xC0BC', 0);   // 卖电功率清零
-      await setParam('0xC018', 0);   // 卖电开始时间清零
-      await setParam('0xC01A', 0);   // 卖电结束时间清零
+      await switchToSelfUse('self-use-slot');
+      await essApi.setParam('0xC0BC', 0, 'clear-sell', 'plan-executor');   // 卖电功率清零
+      await essApi.setParam('0xC018', 0, 'clear-sell', 'plan-executor');   // 卖电开始时间清零
+      await essApi.setParam('0xC01A', 0, 'clear-sell', 'plan-executor');   // 卖电结束时间清零
       extraSellKw = 0;
       console.log(`[卖电] SOC=${ess.soc}% ≤ ${SOC_OVERNIGHT}%，停止卖电，清卖电窗口`);
       action = 'sell-soc-floor';
@@ -524,10 +469,10 @@ async function main() {
     } else {
       // Amber blip：无法获取价格，但仍需检查 SOC 底线
       if (ess.soc !== null && ess.soc <= SOC_OVERNIGHT) {
-        await switchToSelfUse();
-        await setParam('0xC0BC', 0);
-        await setParam('0xC018', 0);
-        await setParam('0xC01A', 0);
+        await switchToSelfUse('self-use-slot');
+        await essApi.setParam('0xC0BC', 0, 'clear-sell', 'plan-executor');
+        await essApi.setParam('0xC018', 0, 'clear-sell', 'plan-executor');
+        await essApi.setParam('0xC01A', 0, 'clear-sell', 'plan-executor');
         extraSellKw = 0;
         console.log(`[卖电] Amber blip 但 SOC=${ess.soc}% ≤ ${SOC_OVERNIGHT}%，强制停止卖电`);
         action = 'sell-soc-floor';
@@ -548,7 +493,7 @@ async function main() {
     // 若逆变器还在 Timed 模式，切回 Self-use
     {
       if (ess.reportedMode === 1) {
-        await switchToSelfUse();
+        await switchToSelfUse('self-use-slot');
         logData(db, ess, amber, slot, 'mode-switch-selfuse', { modeFrom: 1, modeTo: 0 });
       }
       action = slot.action;
