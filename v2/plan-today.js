@@ -891,7 +891,7 @@ function calcHotWaterWindows(slots, pvByHour) {
     };
     console.log(`[GF热水器] ${gfWin.startKey}–${gfWin.endKey} avgPV=${bestGfPv.toFixed(1)}kW avgPrice=${gfAvgC.toFixed(2)}¢`);
   } else {
-    console.log('[GF热水器] 候选槽不足，今日跳过（凌晨04:00–06:00固定窗口仍会执行）');
+    console.log('[GF热水器] 候选槽不足，今日跳过（凌晨04:00固定窗口仍会执行）');
   }
 
   return { main: mainWin, gf: gfWin };
