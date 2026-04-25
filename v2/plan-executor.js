@@ -424,15 +424,13 @@ async function handleHotWaterWindow(planRow, db, syd) {
     if (!db.prepare("SELECT 1 FROM kv_store WHERE key=?").get(key)) {
       const ok = await controlHotWater(true);
       if (ok) {
-        // 根据 source 切换逆变器模式
-        if (source === 'grid') {
-          // 电网直供：Timed 模式 chargeKw=0.1，电池几乎不动
-          await essApi.setChargeKw(0.1, 'hw-grid-supply', 'plan-executor');
-          console.log('[主热水器] 电网直供模式，充电功率→0.1kW');
-        } else {
-          // 电池供电：Self-use 模式
+        // source='batt' 时切 Self-use（电池放电供热水器）
+        // source='grid' 时不需要额外操作——断路器保护逻辑会自动限制充电功率
+        if (source === 'batt') {
           await essApi.switchToSelfUse('hw-batt-supply', 'plan-executor');
-          console.log('[主热水器] 电池供电模式，切Self-use');
+          console.log('[主热水器] 电池供电，切Self-use');
+        } else {
+          console.log('[主热水器] 电网直供，断路器保护自动调整充电功率');
         }
         db.prepare("INSERT OR REPLACE INTO kv_store (key,value) VALUES (?,?)").run(key, '1');
         await sendAlert(`🚿 主热水器已开（${hw.startKey}，${source==='grid'?'电网':'电池'}供，${hw.avgBuyC}¢）`);
@@ -444,8 +442,7 @@ async function handleHotWaterWindow(planRow, db, syd) {
     if (!db.prepare("SELECT 1 FROM kv_store WHERE key=?").get(key)) {
       const ok = await controlHotWater(false);
       if (ok) {
-        // 关闭后恢复充电功率到正常（executor 下个周期会重新按计划设）
-        await essApi.setChargeKw(MAX_CHARGE_KW, 'hw-restore', 'plan-executor');
+        // 关闭后主循环下个周期自动重算充电功率
         db.prepare("INSERT OR REPLACE INTO kv_store (key,value) VALUES (?,?)").run(key, '1');
         await sendAlert(`🔴 主热水器已关（${hw.endKey}）`);
       }
