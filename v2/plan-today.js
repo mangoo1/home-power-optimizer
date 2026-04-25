@@ -38,9 +38,10 @@ if (!ESS_TOKEN   || !ESS_MAC_HEX)   throw new Error('Missing ESS_TOKEN or ESS_MA
 const e = (key, def) => parseFloat(process.env[key] || def);
 const BATT_KWH       = e('BATT_KWH',           42);
 const SOC_MIN        = e('SOC_MIN_PCT',         10)  / 100;
-const SOC_OVERNIGHT  = SOC_MIN;                       // 逆变器绝对底线 = SOC_MIN
+const SOC_OVERNIGHT  = SOC_MIN;
 const SOC_SELL_FLOOR = e('SOC_SELL_FLOOR_PCT',  50)  / 100;
-const SOC_TARGET     = e('CHARGE_TARGET_PCT',   85)  / 100;
+const SOC_TARGET     = e('CHARGE_TARGET_PCT',   85)  / 100;  // 电网充到85%，留8%给PV
+const SOC_PV_LIMIT   = e('SOC_PV_LIMIT_PCT',    93)  / 100;  // 93%以上逆变器限流，PV无法充入
 const GRID_CHARGE_TARGET = SOC_TARGET;
 const MAX_CHARGE_KW  = e('MAX_CHARGE_KW',       5.0);
 const MAX_SELL_KW    = e('MAX_SELL_KW',         5.0);
@@ -49,6 +50,7 @@ const MAX_DAILY_KWH  = 20.0;
 const CHARGE_BUFFER  = e('CHARGE_BUFFER_KW',    0.5);
 const HW_LOAD_KW     = e('HW_LOAD_KW',          5.0);
 const PV_SCALE       = e('PV_SCALE',            0.0032);
+const PV_PEAK_KW     = e('PV_PEAK_KW',          4.2);  // 实测峰值 4.2kW
 const BUY_MAX_C      = e('BUY_MAX_C',           14.0);
 const BUY_MIN_C      = e('BUY_THRESHOLD_C',      8.0);
 const SELL_MIN_MARGIN_C = e('SELL_MIN_MARGIN_C', 3.0);
@@ -402,57 +404,94 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5, nightReser
   let socKwh = currentKwh;
   const plan = [];
 
+  // 热水器时段：主热水器开着时的总消耗
+  // hwKeys 包含主热水器时段，用于判断热水器是否在消纳PV
+  const hwLoadMap = {}; // key → 热水器附加负荷
+  if (hwWindow) {
+    slots.forEach(s => {
+      if (s.key >= hwWindow.startKey && s.key < hwWindow.endKey) hwLoadMap[s.key] = HW_LOAD_KW;
+    });
+  }
+
   for (const s of slots) {
     const h   = parseInt(s.key.split(':')[0]);
     const pv  = pvAt30min(pvByHour, h);
     const hl  = homeLoadKw(h);
-    const net = hl - pv;
+    const hwExtra = hwLoadMap[s.key] ?? (hwKeys.has(s.key) ? HW_LOAD_KW : 0);
+    const totalLoad = hl + hwExtra; // 家用 + 热水器
+    const net = totalLoad - pv;     // 净需求（正=需要供电，负=PV有余）
 
-    // 充电功率：热水器时段降低（避免超断路器）
-    const hwExtra = hwKeys.has(s.key) ? HW_LOAD_KW : 0;
+    // ── 充电功率计算 ──────────────────────────────────────────
+    // 断路器限制下最大可充功率
     const maxChargeKw = parseFloat(Math.min(MAX_CHARGE_KW,
-      Math.max(0, BREAKER_KW - Math.max(0, net + hwExtra) - CHARGE_BUFFER)
+      Math.max(0, BREAKER_KW - Math.max(0, net) - CHARGE_BUFFER)
     ).toFixed(2));
 
-    // 卖电：动态可卖量 = 当前SOC - 过夜保留底线
+    // PV 消纳充电功率：PV 有余时，需要充电来消纳多余的PV
+    // 消纳需要：pvKw > totalLoad，差额 = pvKw - totalLoad
+    // 需要充电功率 = pvKw - totalLoad（让PV不溢出）
+    const pvSurplus = Math.max(0, pv - totalLoad);
+    const pvAbsorb  = parseFloat(Math.min(MAX_CHARGE_KW, pvSurplus).toFixed(2));
+
+    // ── 卖电计算 ──────────────────────────────────────────────
     const overnightFloorKwh = nightReserveKwh
       ? Math.max(SOC_SELL_FLOOR * BATT_KWH, nightReserveKwh * 1.2)
       : SOC_SELL_FLOOR * BATT_KWH;
     const sellableKwh = Math.max(0, socKwh - overnightFloorKwh);
-    const maxSellKw = parseFloat(Math.min(MAX_SELL_KW, sellableKwh / 0.5).toFixed(2));
+    const maxSellKw   = parseFloat(Math.min(MAX_SELL_KW, sellableKwh / 0.5).toFixed(2));
+
+    // PV 时段判断：有实际 PV 出力
+    const hasPv = pv > 0.2;
+    // 电池是否还有空间接收PV（< 93% 才能充入）
+    const battCanAbsorb = socKwh < SOC_PV_LIMIT * BATT_KWH;
 
     let action = 'self-use', chargeKw = 0, sellKw = 0, reason = '';
 
     if (s.dw) {
+      // DW时段：绝对不充不卖，待机
       action = 'standby';
       reason = 'DW';
+
     } else if (chargeKeys.has(s.key) && socKwh < gridTargetKwh && maxChargeKw >= 0.5) {
-      // 电网充电槽（充到电网目标，剩余由PV填）
+      // 电网充电槽：充到85%目标
       action   = 'charge';
       chargeKw = maxChargeKw;
       const hwNote = hwKeys.has(s.key) ? ' +HW↓' : '';
       reason   = `buy=${s.buyC}¢ grid-charge${hwNote}`;
-    } else if (s.feedInC >= sellMinC && maxSellKw >= 0.5 && h >= 16) {
-      // 晚间高价卖电（16:00以后，feedIn够高，有足够SOC）
+
+    } else if (hasPv && battCanAbsorb && pvAbsorb >= 0.3) {
+      // PV 消纳充电：有PV溢出且电池未满，充电消纳PV
+      // 即使不在电网充电槽，也要充电避免PV浪费
+      action   = 'charge';
+      chargeKw = pvAbsorb;
+      reason   = `pv-absorb: pv=${pv.toFixed(1)}kW load=${totalLoad.toFixed(1)}kW surplus=${pvSurplus.toFixed(1)}kW`;
+
+    } else if (!hasPv && s.feedInC >= sellMinC && maxSellKw >= 0.5 && h >= 16) {
+      // 晚间卖电：PV已落山（无PV出力），电价够高，有足够SOC
       action = 'sell';
       sellKw = maxSellKw;
       reason = `feedIn=${s.feedInC}¢ ≥ ${sellMinC.toFixed(1)}¢`;
+
     } else {
       action = 'self-use';
-      reason = `buy=${s.buyC}¢ feedIn=${s.feedInC}¢`;
+      reason = `buy=${s.buyC}¢ feedIn=${s.feedInC}¢ pv=${pv.toFixed(1)}kW`;
     }
 
+    // SOC 变化计算
+    const effectiveCharge = chargeKw; // 已含热水器负荷影响（maxChargeKw已算进去）
     const deltaKwh = action === 'charge'
-      ? chargeKw * 0.5 * 0.95
+      ? effectiveCharge * 0.5 * 0.95
       : action === 'sell'
         ? -sellKw * 0.5
-        : (net < 0 ? (-net) * 0.5 * 0.9 : -net * 0.5 * 0.85);
+        : net > 0
+          ? -net * 0.5 * 0.85   // 放电供负载（效率85%）
+          : (-net) * 0.5 * 0.9; // PV充入电池（效率90%）
 
     socKwh = Math.min(BATT_KWH, Math.max(SOC_MIN * BATT_KWH, socKwh + deltaKwh));
 
     plan.push({
       key: s.key, nemTime: s.nemTime, hour: h,
-      buyC: s.buyC, feedInC: s.feedInC, pvKw: pv, homeLoad: hl, dw: s.dw,
+      buyC: s.buyC, feedInC: s.feedInC, pvKw: pv, homeLoad: totalLoad, dw: s.dw,
       action, chargeKw: parseFloat(chargeKw.toFixed(2)), sellKw: parseFloat(sellKw.toFixed(2)),
       socPct: Math.round(socKwh / BATT_KWH * 100), reason,
     });
