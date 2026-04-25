@@ -973,10 +973,14 @@ async function main() {
   const pvByHour = getPvForecast(db, today);
   const pvForecastKwh = Math.min(MAX_DAILY_KWH, Object.values(pvByHour).reduce((s, v) => s + v, 0));
   const pvPeakKw = Math.max(...Object.values(pvByHour), 0);
-  // 晴天（PV >= 5kWh）留8%给PV，阴天直接充到93%
+  // 充电目标：看剩余PV（从现在到日落），不够就直接充到93%
   const PV_SUFFICIENT_KWH = parseFloat(process.env.PV_SUFFICIENT_KWH || '5');
-  const gridChargeTarget = pvForecastKwh >= PV_SUFFICIENT_KWH ? SOC_TARGET : SOC_PV_LIMIT;
-  console.log(`[PV预测] 今日预计: ${pvForecastKwh.toFixed(1)}kWh, 峰值: ${pvPeakKw.toFixed(2)}kW → 充电目标 ${Math.round(gridChargeTarget*100)}%`);
+  const nowHour = parseInt(syd.hh);
+  const pvRemaining = Object.entries(pvByHour)
+    .filter(([h]) => parseInt(h) >= nowHour)
+    .reduce((s, [, v]) => s + v, 0);
+  const gridChargeTarget = pvRemaining >= PV_SUFFICIENT_KWH ? SOC_TARGET : SOC_PV_LIMIT;
+  console.log(`[PV预测] 今日预计: ${pvForecastKwh.toFixed(1)}kWh, 剩余: ${pvRemaining.toFixed(1)}kWh → 充电目标 ${Math.round(gridChargeTarget*100)}%`);
 
   // 4. Amber 价格预测
   console.log('\n[Amber] 拉取价格预测...');
