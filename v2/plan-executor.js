@@ -562,7 +562,7 @@ async function main() {
   let extraChargeKw = null, extraSellKw = null;
 
   if (gridImport > BREAKER_KW - BREAKER_BUFFER) {
-    const safeKw = calcSafeChargeKw(homeLoad, pvPower);
+    const safeKw = calcSafeChargeKw(homeLoad, pvPower, ess.gridPower);
     console.log(`[安全] 电网进口 ${gridImport.toFixed(2)}kW 超断路器上限，降充电至 ${safeKw}kW`);
     await updateChargeKw(safeKw, `breaker-throttle: gridImport=${gridImport.toFixed(2)}kW home=${homeLoad.toFixed(2)}kW`);
     extraChargeKw = safeKw;
@@ -596,7 +596,7 @@ async function main() {
         await restoreTimedMode(chargeWindows, `restore-timed: mode-was-${ess.reportedMode}`);
         logData(db, ess, amber, slot, 'mode-switch-timed', { modeFrom: ess.reportedMode, modeTo: 1 });
       }
-      const safeChargeKw = calcSafeChargeKw(homeLoad, pvPower);
+      const safeChargeKw = calcSafeChargeKw(homeLoad, pvPower, ess.gridPower);
       // 始终用断路器计算的最大安全功率充电，不受 plan 里预设 chargeKw 的限制
       // plan 的 chargeKw 是静态估算，executor 实时知道 homeLoad，应该用实时值
       const targetKw = safeChargeKw;

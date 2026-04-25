@@ -155,9 +155,17 @@ async function emergencyStop(reason = 'emergency', caller = 'unknown') {
 }
 
 /** 动态计算安全充电功率（不超断路器） */
-function calcSafeChargeKw(homeLoad, pvPower) {
-  const net = (homeLoad ?? 0) - (pvPower ?? 0);
-  const headroom = BREAKER_KW - BREAKER_BUFFER - Math.max(0, net);
+function calcSafeChargeKw(homeLoad, pvPower, gridPower) {
+  // 优先用实际电网进口功率计算余量（更准确）
+  // gridPower = 电表实时进口，正=买电，直接反映断路器负荷
+  // 如果没有 gridPower，退而用 homeLoad - pvPower 估算
+  let headroom;
+  if (gridPower != null && gridPower > 0) {
+    headroom = BREAKER_KW - BREAKER_BUFFER - gridPower;
+  } else {
+    const net = (homeLoad ?? 0) - (pvPower ?? 0);
+    headroom = BREAKER_KW - BREAKER_BUFFER - Math.max(0, net);
+  }
   return parseFloat(Math.min(MAX_CHARGE_KW, Math.max(0, headroom)).toFixed(2));
 }
 
