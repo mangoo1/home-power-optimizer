@@ -650,7 +650,9 @@ async function main() {
   } else if (slot.action === 'charge') {
     const buyThreshold = JSON.parse(planRow?.notes ?? '{}').buyThreshold ?? planRow?.buy_threshold_c ?? 10;
     const realBuyPrice = amber?.buyPrice ?? null;
-    const chargeTargetPct = parseFloat(process.env.CHARGE_TARGET_PCT || '85');
+    // 从 plan notes 读今日充电目标（plan-today 按PV预测动态设定：晴天85%，阴天93%）
+    const planNotes = JSON.parse(planRow?.notes ?? '{}');
+    const chargeTargetPct = planNotes.gridChargeTarget ?? parseFloat(process.env.CHARGE_TARGET_PCT || '85');
 
     if (ess.soc !== null && ess.soc >= chargeTargetPct) {
       // SOC 已达 85%：不再从电网充，降到刚好消纳 PV 的功率

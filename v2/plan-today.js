@@ -333,9 +333,13 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5, nightReser
     console.log(`[充电截止] 无DW，电网充电截止 ${gridChargeEndHour}:00（最后低价槽 ${lastCheap?.key ?? 'none'}）`);
   }
 
-  // 电网充电目标 = 85%，必须由电网保证，PV 是额外收益
-  const gridTargetKwh = GRID_CHARGE_TARGET * BATT_KWH;  // 35.7kWh
-  console.log(`[电网目标] ${Math.round(GRID_CHARGE_TARGET*100)}% (${gridTargetKwh.toFixed(1)}kWh) — 电网必须达到，PV另算`);
+  // 电网充电目标：
+  // - 今天 PV 预测充足（>= 5kWh）→ 充到 85%，留8%空间给 PV
+  // - 今天 PV 预测不足（< 5kWh，阴天/多云）→ 直接充到 93%，不预留
+  const PV_SUFFICIENT_KWH = parseFloat(process.env.PV_SUFFICIENT_KWH || '5');
+  const gridChargeTarget = pvForecastKwh >= PV_SUFFICIENT_KWH ? SOC_TARGET : SOC_PV_LIMIT;
+  const gridTargetKwh = gridChargeTarget * BATT_KWH;
+  console.log(`[电网目标] ${Math.round(gridChargeTarget*100)}% (${gridTargetKwh.toFixed(1)}kWh) — PV预测${pvForecastKwh.toFixed(1)}kWh ${pvForecastKwh >= PV_SUFFICIENT_KWH ? '充足，预留8%给PV' : '不足，直接充到93%'}`);
 
   // ── Phase 2: 选最便宜的槽充到 gridTargetKwh ────────────────
   const candidateSlots = slots
@@ -731,7 +735,7 @@ function savePlan(db, today, plan, meta) {
     parseFloat(meta.pvPeakKw.toFixed(2)),
     JSON.stringify(chargeWindows),
     JSON.stringify(plan),
-    JSON.stringify({ buyThreshold: meta.buyThreshold, sellMinC: meta.sellMinC, calibFactor: meta.calibFactor }),
+    JSON.stringify({ buyThreshold: meta.buyThreshold, sellMinC: meta.sellMinC, calibFactor: meta.calibFactor, gridChargeTarget: Math.round(meta.gridChargeTarget * 100) }),
     parseFloat(meta.buyThreshold.toFixed(2)),
     meta.sellMinC,
     meta.mainWin ? JSON.stringify(meta.mainWin) : null,
@@ -1016,6 +1020,7 @@ async function main() {
 
   const version = savePlan(db, today, plan, {
     currentSocPct, hasDW, pvForecastKwh, pvPeakKw, calibFactor: PV_SCALE,
+    gridChargeTarget,
     buyThreshold, chargeTargetBy, sellMinC, mainWin, gfWin,
   });
   db.close();
