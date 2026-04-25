@@ -396,6 +396,35 @@ async function tuyaControl(deviceId, on) {
   } catch { return false; }
 }
 
+// 热水器操作记录（写入 hw_log，供 dashboard 使用）
+function logHwAction(db, deviceId, deviceName, on, opts = {}) {
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS hw_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts TEXT NOT NULL, device_id TEXT, device_name TEXT,
+      online INTEGER, switch_on INTEGER, duration_min REAL,
+      voltage_v REAL, current_a REAL, power_w REAL, total_kwh REAL,
+      action TEXT, triggered_by TEXT, source TEXT, plan_window TEXT
+    )`);
+    // 确保新列存在
+    ['action','triggered_by','source','plan_window'].forEach(col => {
+      try { db.prepare(`ALTER TABLE hw_log ADD COLUMN ${col} TEXT`).run(); } catch {}
+    });
+    db.prepare(`
+      INSERT INTO hw_log (ts, device_id, device_name, switch_on, action, triggered_by, source, plan_window)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      new Date().toISOString(),
+      deviceId, deviceName,
+      on ? 1 : 0,
+      on ? 'on' : 'off',
+      opts.triggeredBy ?? 'executor',
+      opts.source ?? null,
+      opts.planWindow ?? null,
+    );
+  } catch(e) { console.warn('[hw_log] 写入失败:', e.message); }
+}
+
 async function controlHotWater(on) {
   const ok = await tuyaControl(HW_MAIN_ID, on);
   console.log(`[主热水器] ${on ? '开' : '关'} ${ok ? '✅' : '❌'}`);
@@ -426,6 +455,7 @@ async function handleHotWaterWindow(planRow, db, syd) {
       console.warn(`[主热水器] ⚠️ 已开 ${nowMins - openMins}min，超过最大 ${MAX_HW_MINS}min，强制关闭`);
       const ok = await controlHotWater(false);
       if (ok) {
+        logHwAction(db, HW_MAIN_ID, '主热水器', false, { triggeredBy: 'executor-timeout' });
         db.prepare("INSERT OR REPLACE INTO kv_store (key,value) VALUES (?,?)").run(offKey, '1');
         await sendAlert(`⚠️ 主热水器已超时自动关闭（开了${Math.round((nowMins-openMins)/60*10)/10}h）`);
       }
@@ -459,6 +489,7 @@ async function handleHotWaterWindow(planRow, db, syd) {
         } else {
           console.log('[主热水器] 电网直供，断路器保护自动调整充电功率');
         }
+        logHwAction(db, HW_MAIN_ID, '主热水器', true, { triggeredBy: 'executor', source: source, planWindow: `${hw.startKey}-${hw.endKey}` });
         db.prepare("INSERT OR REPLACE INTO kv_store (key,value) VALUES (?,?)").run(key, '1');
         // 记录开启时间（分钟），用于兜底超时保护
         db.prepare("INSERT OR REPLACE INTO kv_store (key,value) VALUES (?,?)").run(`hw_main:${today}:open_time`, String(nowMins));
@@ -508,6 +539,7 @@ async function handleGfHotWater(db, syd) {
         const ok = await tuyaControl(HW_GF_ID, true);
         console.log(`[GF热水器] 开 ${win.start}（${win.label}）${ok?'✅':'❌'}`);
         if (ok) {
+          logHwAction(db, HW_GF_ID, 'GF热水器', true, { triggeredBy: 'executor', planWindow: `${win.start}-${win.end}` });
           db.prepare("INSERT OR REPLACE INTO kv_store (key,value) VALUES (?,?)").run(key, '1');
           await sendAlert(`🛁 GF热水器已开（${win.start}，${win.label}）`);
         }
@@ -519,6 +551,7 @@ async function handleGfHotWater(db, syd) {
         const ok = await tuyaControl(HW_GF_ID, false);
         console.log(`[GF热水器] 关 ${win.end}（${win.label}）${ok?'✅':'❌'}`);
         if (ok) {
+          logHwAction(db, HW_GF_ID, 'GF热水器', false, { triggeredBy: 'executor', planWindow: `${win.start}-${win.end}` });
           db.prepare("INSERT OR REPLACE INTO kv_store (key,value) VALUES (?,?)").run(key, '1');
           await sendAlert(`🔴 GF热水器已关（${win.end}）`);
         }
