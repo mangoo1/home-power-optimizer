@@ -406,6 +406,33 @@ async function controlHotWater(on) {
 // source='grid' → 开热水器时把充电功率设 0.1kW（电网直供，电池几乎不动）
 // source='batt' → Self-use（电池放电供热水器）
 async function handleHotWaterWindow(planRow, db, syd) {
+  const today = syd.date;
+  const nowMins = syd.hh * 60 + syd.mi;
+
+  // ── 兜底保护：热水器已开但窗口丢失时，超过最大运行时间自动关闭 ──
+  const onKey  = `hw_main:${today}:on`;
+  const offKey = `hw_main:${today}:off`;
+  const isOn  = !!db.prepare("SELECT 1 FROM kv_store WHERE key=?").get(onKey);
+  const isOff = !!db.prepare("SELECT 1 FROM kv_store WHERE key=?").get(offKey);
+  const MAX_HW_MINS = 150; // 最大运行2.5小时，超过强制关
+
+  if (isOn && !isOff && (!planRow?.hw_window_json)) {
+    // 热水器开着但计划没有窗口 → 检查是否超时
+    // 用 onKey 写入时间估算（简化：用当天06:00作为最早开始时间）
+    // 如果当前时间 > 最早可能开始时间 + MAX_HW_MINS，强制关
+    const hwOpenRow = db.prepare("SELECT value FROM kv_store WHERE key=?").get(`hw_main:${today}:open_time`);
+    const openMins = hwOpenRow ? parseInt(hwOpenRow.value) : null;
+    if (openMins !== null && nowMins - openMins >= MAX_HW_MINS) {
+      console.warn(`[主热水器] ⚠️ 已开 ${nowMins - openMins}min，超过最大 ${MAX_HW_MINS}min，强制关闭`);
+      const ok = await controlHotWater(false);
+      if (ok) {
+        db.prepare("INSERT OR REPLACE INTO kv_store (key,value) VALUES (?,?)").run(offKey, '1');
+        await sendAlert(`⚠️ 主热水器已超时自动关闭（开了${Math.round((nowMins-openMins)/60*10)/10}h）`);
+      }
+    }
+    return; // 没有窗口就不继续处理开关逻辑
+  }
+
   if (!planRow?.hw_window_json) return;
   let hw;
   try { hw = JSON.parse(planRow.hw_window_json); } catch { return; }
@@ -433,6 +460,8 @@ async function handleHotWaterWindow(planRow, db, syd) {
           console.log('[主热水器] 电网直供，断路器保护自动调整充电功率');
         }
         db.prepare("INSERT OR REPLACE INTO kv_store (key,value) VALUES (?,?)").run(key, '1');
+        // 记录开启时间（分钟），用于兜底超时保护
+        db.prepare("INSERT OR REPLACE INTO kv_store (key,value) VALUES (?,?)").run(`hw_main:${today}:open_time`, String(nowMins));
         await sendAlert(`🚿 主热水器已开（${hw.startKey}，${source==='grid'?'电网':'电池'}供，${hw.avgBuyC}¢）`);
       }
     }
