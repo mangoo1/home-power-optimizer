@@ -438,7 +438,7 @@ async function handleHotWaterWindow(planRow, db, syd) {
   try { hw = JSON.parse(planRow.hw_window_json); } catch { return; }
   if (!hw?.startKey || !hw?.endKey) return;
 
-  const nowMins = syd.hh * 60 + syd.mi;
+  // nowMins already declared above
   const [sh, sm] = hw.startKey.split(':').map(Number);
   const [eh, em] = hw.endKey.split(':').map(Number);
   const today = syd.date;
