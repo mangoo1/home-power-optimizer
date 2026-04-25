@@ -105,6 +105,20 @@ async function main() {
   const todayDischarged = prevState.battDischarged != null ? (battDischarged - prevState.battDischarged).toFixed(2) : 'N/A';
   const todayLoad   = prevState.loadTotal  != null ? (loadTotal  - prevState.loadTotal ).toFixed(2) : 'N/A';
 
+  // 今日 PV 发电量：从 energy_log 取当天最大累计值
+  let todayPv = '0';
+  try {
+    const Database = require('better-sqlite3');
+    const dbPath = path.join(__dirname, '../data/energy.db');
+    const db = new Database(dbPath);
+    const sydDate = new Date(new Date().getTime() + 10*3600000).toISOString().slice(0,10);
+    const pvRow = db.prepare(
+      "SELECT MAX(today_pv_kwh) as pv FROM energy_log WHERE DATE(ts, '+10 hours') = ?"
+    ).get(sydDate);
+    todayPv = pvRow?.pv?.toFixed(1) ?? '0';
+    db.close();
+  } catch {}
+
   // Amber 今日用电金额估算（用均价 ~25c 买电，卖电用 feedIn 均价）
   // 实际用 Amber API 今日历史价格来算更准，但简化用当前均价
   // 买电：取今日 general 均价，假设 ~25c（高峰均价）
@@ -156,6 +170,63 @@ async function main() {
   const newState = { gridBought, gridSold, battCharged, battDischarged, loadTotal, date: new Date().toISOString().split('T')[0] };
   fs.writeFileSync(stateFile, JSON.stringify(newState, null, 2));
 
+  // ── 复盘分析 ──────────────────────────────────────────────
+  const todayBoughtNum  = parseFloat(todayBought)  || 0;
+  const todaySoldNum    = parseFloat(todaySold)    || 0;
+  const todayPvNum      = parseFloat(todayPv)      || 0;
+  const todayLoadNum    = parseFloat(todayLoad)    || 0;
+  const todayChargedNum = parseFloat(todayCharged) || 0;
+
+  // 今日净电费 = 买电成本 - 卖电收入
+  const costNum    = amberTodayCost     != null ? parseFloat(amberTodayCost)        : null;
+  const revenueNum = amberTodaySellRevenue != null ? parseFloat(amberTodaySellRevenue) : null;
+  const netCost    = (costNum != null && revenueNum != null) ? (costNum - Math.abs(revenueNum)).toFixed(2) : null;
+
+  // 复盘评分
+  const reviews = [];
+
+  // 1. PV 消纳：今天 PV 有没有浪费（卖电价<买电价 = 低价溢出）
+  if (todayPvNum > 0) {
+    const pvSelfUseRate = Math.min(100, Math.round((todayPvNum - Math.max(0, todaySoldNum - todayChargedNum)) / todayPvNum * 100));
+    if (pvSelfUseRate >= 95) reviews.push('☀️ PV消纳优秀，几乎零溢出');
+    else if (pvSelfUseRate >= 80) reviews.push(`☀️ PV消纳${pvSelfUseRate}%，有改进空间`);
+    else reviews.push(`⚠️ PV消纳仅${pvSelfUseRate}%，有较多溢出低价卖出`);
+  }
+
+  // 2. 电池充满了吗
+  if (soc >= 85) reviews.push('🔋 电池充满 ✅');
+  else if (soc >= 70) reviews.push(`🔋 电池${soc}%，略低于目标85%`);
+  else reviews.push(`⚠️ 电池仅${soc}%，明天早晨充电压力大`);
+
+  // 3. 卖电收益
+  if (todaySoldNum >= 10) reviews.push(`💰 卖电${todaySoldNum}kWh，收益$${revenueNum ?? '?'}`);
+  else if (todaySoldNum >= 3) reviews.push(`💰 卖电${todaySoldNum}kWh，偏少`);
+  else reviews.push(`❌ 卖电不足（${todaySoldNum}kWh），电池可能没充满或PV不足`);
+
+  // 4. 今日净电费
+  if (netCost != null) {
+    if (parseFloat(netCost) <= 2) reviews.push(`✅ 净电费 $${netCost}（接近自给）`);
+    else if (parseFloat(netCost) <= 5) reviews.push(`📋 净电费 $${netCost}`);
+    else reviews.push(`⚠️ 净电费 $${netCost}，偏高`);
+  }
+
+  // 5. 读今日计划对比
+  let planNote = '';
+  try {
+    const Database = require('better-sqlite3');
+    const dbPath = path.join(__dirname, '../data/energy.db');
+    const db = new Database(dbPath);
+    const sydDate = new Date(new Date().getTime() + 10*3600000).toISOString().slice(0,10);
+    const plan = db.prepare('SELECT pv_forecast_kwh, soc_at_gen FROM daily_plan WHERE date=? AND is_active=1 ORDER BY version DESC LIMIT 1').get(sydDate);
+    if (plan) {
+      const pvForecast = plan.pv_forecast_kwh?.toFixed(1);
+      const pvActual = todayPvNum.toFixed(1);
+      const pvErr = pvForecast ? Math.round((todayPvNum - plan.pv_forecast_kwh) / plan.pv_forecast_kwh * 100) : null;
+      planNote = `\n📐 PV预测 ${pvForecast}kWh vs 实际 ${pvActual}kWh${pvErr != null ? `（误差${pvErr > 0 ? '+':''}${pvErr}%）` : ''}`;
+    }
+    db.close();
+  } catch {}
+
   // 组装报告
   const gridStatus = gridPower < 0 ? `卖电 ${Math.abs(gridPower)} kW` : gridPower > 0.05 ? `买电 ${gridPower} kW` : '自给自足';
   const battStatus = battPower < 0 ? `放电 ${Math.abs(battPower)} kW` : battPower > 0 ? `充电 ${battPower} kW` : '待机';
@@ -163,24 +234,21 @@ async function main() {
   const lines = [
     `☀️ *今日太阳能日报* (${new Date().toLocaleDateString('zh-CN', {timeZone:'Australia/Sydney'})})`,
     ``,
-    `🔋 *电池*`,
-    `• 当前 SoC：${soc}%`,
-    `• 今日充电：${todayCharged} kWh`,
-    `• 今日放电：${todayDischarged} kWh`,
-    `• 当前状态：${battStatus}`,
+    `🔋 *电池*  SoC ${soc}%（${battStatus}）`,
+    `• 今日充电 ${todayCharged}kWh  放电 ${todayDischarged}kWh`,
     ``,
     `⚡ *电网*`,
-    `• 今日买电：${todayBought} kWh${amberTodayCost != null ? ` ≈ $${amberTodayCost} AUD` : ''}`,
-    `• 今日卖电：${todaySold} kWh${amberTodaySellRevenue != null ? ` ≈ $${amberTodaySellRevenue} AUD` : ''}`,
-    `• 当前状态：${gridStatus}`,
+    `• 买电 ${todayBought}kWh${costNum != null ? ` $${costNum}` : ''}  |  卖电 ${todaySold}kWh${revenueNum != null ? ` $${Math.abs(revenueNum)}` : ''}`,
+    netCost != null ? `• 净电费 $${netCost}` : '',
     ``,
-    `🏠 *家庭用电*`,
-    `• 今日用电：${todayLoad} kWh`,
-    `• 当前功率：${loadPower} kW`,
+    `☀️ *太阳能*  ${todayPv}kWh${planNote}`,
+    `🏠 *用电*  ${todayLoad}kWh`,
     ``,
-    `📊 *累计总量*`,
-    `• 总买电：${gridBought} kWh | 总卖电：${gridSold} kWh`,
-  ];
+    `📋 *今日复盘*`,
+    ...reviews.map(r => `• ${r}`),
+    ``,
+    `📊 累计：买 ${gridBought}kWh | 卖 ${gridSold}kWh`,
+  ].filter(l => l !== '');
 
   console.log(lines.join('\n'));
 }
