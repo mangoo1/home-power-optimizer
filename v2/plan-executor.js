@@ -20,6 +20,7 @@
  */
 'use strict';
 
+process.env.TZ = 'Australia/Sydney'; // 统一用Sydney本地时间
 require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
 
 const https    = require('https');
@@ -397,9 +398,9 @@ async function tuyaControl(deviceId, on) {
 }
 
 
-// Sydney 时间字符串（用于 hw_log 等面向人的记录）
-function sydneyISOString() {
-  return new Date().toLocaleString('sv-SE', { timeZone: 'Australia/Sydney' }).replace(' ', 'T') + '+10:00';
+// 本地时间字符串（TZ=Australia/Sydney 已在进程启动时设置）
+function nowLocal() {
+  return new Date().toLocaleString('sv-SE', { timeZone: 'Australia/Sydney' }).replace(' ', 'T');
 }
 
 // 热水器操作记录（写入 hw_log，供 dashboard 使用）
@@ -420,7 +421,7 @@ function logHwAction(db, deviceId, deviceName, on, opts = {}) {
       INSERT INTO hw_log (ts, device_id, device_name, switch_on, action, triggered_by, source, plan_window)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
-      sydneyISOString(),
+      nowLocal(),
       deviceId, deviceName,
       on ? 1 : 0,
       on ? 'on' : 'off',

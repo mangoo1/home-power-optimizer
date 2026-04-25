@@ -17,6 +17,7 @@
  */
 'use strict';
 
+process.env.TZ = 'Australia/Sydney'; // 统一用Sydney本地时间
 require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
 
 const https    = require('https');
