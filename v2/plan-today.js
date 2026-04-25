@@ -809,16 +809,14 @@ function calcHotWaterWindows(slots, pvByHour) {
 
   if (dayCandidates.length < 4) return { main: null, gf: null };
 
-  // ── 主热水器：4槽（2小时），按 PV出力高 + 电价低 打分，找最优窗口 ──
-  // 打分：pvScore（越高越好）- priceScore（越低越好）
-  let bestScore = -Infinity, bestIdx = 0;
+  // 主热水器：找 PV 出力最强的连续4槽（2小时）
+  // 原则：把热水器开在 PV 峰值，让 PV 直接供热水器，天然消纳
+  // 约束：在高电价前结束，不进 DW
+  let bestPv = -Infinity, bestIdx = 0;
   for (let i = 0; i <= dayCandidates.length - 4; i++) {
     const window4 = dayCandidates.slice(i, i + 4);
-    const avgPv    = window4.reduce((s, x) => s + pvAt30min(pvByHour, parseInt(x.key)), 0) / 4;
-    const avgPrice = window4.reduce((s, x) => s + x.buyC, 0) / 4;
-    // 归一化：PV 权重大（每kW PV节省约15¢/h，而电价差最多5¢），所以 PV 权重 3x
-    const score = avgPv * 3 - avgPrice;
-    if (score > bestScore) { bestScore = score; bestIdx = i; }
+    const avgPv = window4.reduce((s, x) => s + pvAt30min(pvByHour, parseInt(x.key)), 0) / 4;
+    if (avgPv > bestPv) { bestPv = avgPv; bestIdx = i; }
   }
 
   const mainSlots = dayCandidates.slice(bestIdx, bestIdx + 4);
@@ -843,14 +841,12 @@ function calcHotWaterWindows(slots, pvByHour) {
 
   let gfWin = null;
   if (gfCandidates.length >= 2) {
-    // GF 也按 PV打分 选最优1小时（2槽）
-    let bestGfScore = -Infinity, bestGfIdx = 0;
+    // GF 也找 PV 最强的连续2槽
+    let bestGfPv = -Infinity, bestGfIdx = 0;
     for (let i = 0; i <= gfCandidates.length - 2; i++) {
       const w = gfCandidates.slice(i, i+2);
-      const avgPv    = w.reduce((s,x) => s + pvAt30min(pvByHour, parseInt(x.key)), 0) / 2;
-      const avgPrice = w.reduce((s,x) => s + x.buyC, 0) / 2;
-      const score = avgPv * 3 - avgPrice;
-      if (score > bestGfScore) { bestGfScore = score; bestGfIdx = i; }
+      const avgPv = w.reduce((s,x) => s + pvAt30min(pvByHour, parseInt(x.key)), 0) / 2;
+      if (avgPv > bestGfPv) { bestGfPv = avgPv; bestGfIdx = i; }
     }
     const gfSlots = gfCandidates.slice(bestGfIdx, bestGfIdx + 2);
     const [geh, gem] = gfSlots[1].key.split(':').map(Number);
