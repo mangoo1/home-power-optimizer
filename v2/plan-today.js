@@ -290,7 +290,7 @@ function homeLoadKw(hour) {
 }
 
 // ── Step 5: 生成半小时充放电计划 ─────────────────────────────
-function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5, nightReserveKwh = null, hwWindow = null) {
+function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5, nightReserveKwh = null, hwWindow = null, gridChargeTarget = SOC_TARGET) {
   const targetKwh  = SOC_TARGET * BATT_KWH;               // 目标 kWh（85%）
   const currentKwh = currentSoc / 100 * BATT_KWH;
 
@@ -336,10 +336,8 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5, nightReser
   // 电网充电目标：
   // - 今天 PV 预测充足（>= 5kWh）→ 充到 85%，留8%空间给 PV
   // - 今天 PV 预测不足（< 5kWh，阴天/多云）→ 直接充到 93%，不预留
-  const PV_SUFFICIENT_KWH = parseFloat(process.env.PV_SUFFICIENT_KWH || '5');
-  const gridChargeTarget = pvForecastKwh >= PV_SUFFICIENT_KWH ? SOC_TARGET : SOC_PV_LIMIT;
   const gridTargetKwh = gridChargeTarget * BATT_KWH;
-  console.log(`[电网目标] ${Math.round(gridChargeTarget*100)}% (${gridTargetKwh.toFixed(1)}kWh) — PV预测${pvForecastKwh.toFixed(1)}kWh ${pvForecastKwh >= PV_SUFFICIENT_KWH ? '充足，预留8%给PV' : '不足，直接充到93%'}`);
+  console.log(`[电网目标] ${Math.round(gridChargeTarget*100)}% (${gridTargetKwh.toFixed(1)}kWh)`);
 
   // ── Phase 2: 选最便宜的槽充到 gridTargetKwh ────────────────
   const candidateSlots = slots
@@ -975,7 +973,10 @@ async function main() {
   const pvByHour = getPvForecast(db, today);
   const pvForecastKwh = Math.min(MAX_DAILY_KWH, Object.values(pvByHour).reduce((s, v) => s + v, 0));
   const pvPeakKw = Math.max(...Object.values(pvByHour), 0);
-  console.log(`[PV预测] 今日预计: ${pvForecastKwh.toFixed(1)}kWh, 峰值: ${pvPeakKw.toFixed(2)}kW (scale=${PV_SCALE})`);
+  // 晴天（PV >= 5kWh）留8%给PV，阴天直接充到93%
+  const PV_SUFFICIENT_KWH = parseFloat(process.env.PV_SUFFICIENT_KWH || '5');
+  const gridChargeTarget = pvForecastKwh >= PV_SUFFICIENT_KWH ? SOC_TARGET : SOC_PV_LIMIT;
+  console.log(`[PV预测] 今日预计: ${pvForecastKwh.toFixed(1)}kWh, 峰值: ${pvPeakKw.toFixed(2)}kW → 充电目标 ${Math.round(gridChargeTarget*100)}%`);
 
   // 4. Amber 价格预测
   console.log('\n[Amber] 拉取价格预测...');
@@ -990,7 +991,7 @@ async function main() {
   if (gfWin)   console.log(`[GF热水器] ${gfWin.startKey}–${gfWin.endKey} 均价${gfWin.avgBuyC}¢ → ${gfWin.source==='grid'?'电网直供':'电池供电'}`);
 
   // 5b. 生成计划（dry-run 先算买入均价，再正式生成含卖电）
-  const dryRun = buildPlan(slots, pvByHour, currentSocPct, hasDW, BUY_MIN_C + 1, null, mainWin);
+  const dryRun = buildPlan(slots, pvByHour, currentSocPct, hasDW, BUY_MIN_C + 1, null, mainWin, gridChargeTarget);
   const dryChargeSlots = dryRun.plan.filter(s => s.action === 'charge');
   const realAvgBuyC = dryChargeSlots.length > 0
     ? dryChargeSlots.reduce((s, x) => s + x.buyC, 0) / dryChargeSlots.length
@@ -1000,7 +1001,7 @@ async function main() {
   const avgNightKwh = calcAvgNightKwh(db);
   console.log(`[过夜用电] 近7天均值: ${avgNightKwh ?? '无数据'}kWh`);
 
-  const { plan, buyThreshold, chargeTargetBy, sellMinC } = buildPlan(slots, pvByHour, currentSocPct, hasDW, realAvgBuyC, avgNightKwh, mainWin);
+  const { plan, buyThreshold, chargeTargetBy, sellMinC } = buildPlan(slots, pvByHour, currentSocPct, hasDW, realAvgBuyC, avgNightKwh, mainWin, gridChargeTarget);
 
   // 6. 打印
   const report = printPlan(plan, currentSocPct, today, mainWin, gfWin);
