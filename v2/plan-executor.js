@@ -653,10 +653,19 @@ async function main() {
     const chargeTargetPct = parseFloat(process.env.CHARGE_TARGET_PCT || '85');
 
     if (ess.soc !== null && ess.soc >= chargeTargetPct) {
-      // SOC 已达目标，停止电网充电，切 self-use（让 PV 自然充入）
-      console.log(`[充电] SOC ${ess.soc}% ≥ 目标 ${chargeTargetPct}%，停止电网充电`);
-      await switchToSelfUse(`charge-done: soc=${ess.soc}%`);
-      action = 'charge-done';
+      // SOC 已达 85%：不再从电网充，降到刚好消纳 PV 的功率
+      // chargeKw = max(0, pvPower - homeLoad)，让 PV 全部被电池吸收，不卖出
+      const pvAbsorb = parseFloat(Math.max(0, (pvPower ?? 0) - (homeLoad ?? 0.6)).toFixed(2));
+      if (pvAbsorb >= 0.2) {
+        await updateChargeKw(pvAbsorb, `pv-absorb-only: soc=${ess.soc}% pv=${pvPower}kW home=${homeLoad}kW`);
+        console.log(`[充电] SOC ${ess.soc}% ≥ ${chargeTargetPct}%，降至PV消纳功率 ${pvAbsorb}kW（不再从电网充）`);
+        action = 'charge-pv-only';
+      } else {
+        // PV 不足以消纳（阴天或夜间），切 self-use
+        await switchToSelfUse(`charge-done-no-pv: soc=${ess.soc}%`);
+        console.log(`[充电] SOC ${ess.soc}% ≥ ${chargeTargetPct}%，无PV，切self-use`);
+        action = 'charge-done';
+      }
     } else if (realBuyPrice != null && realBuyPrice > buyThreshold + 2) {
       // 实际电价比计划阈值高 2¢ 以上 → 停充，切 self-use
       console.log(`[充电] 实际电价 ${realBuyPrice.toFixed(1)}¢ > 阈值 ${buyThreshold}¢+2，停止充电切 self-use`);
