@@ -824,12 +824,25 @@ function calcHotWaterWindows(slots, pvByHour) {
     return { main: null, gf: null };
   }
 
-  // 主热水器：PV 最强的连续4槽（2小时）
-  let bestPv = -Infinity, bestIdx = 0;
+  // 主热水器：最早的、PV足够强的连续4槽（2小时）
+  // 越早开越好——热水器结束后剩余PV时段更多，电池有更长时间充满
+  // "PV足够强" = 窗口平均PV >= 今天候选槽PV峰值的60%
+  const pvValues = mainCandidates.map(s => pvAt30min(pvByHour, parseInt(s.key)));
+  const peakPv = Math.max(...pvValues, 0.1);
+  const pvThreshold = peakPv * 0.6;
+
+  let bestIdx = -1;
   for (let i = 0; i <= mainCandidates.length - 4; i++) {
     const w4 = mainCandidates.slice(i, i + 4);
     const avgPv = w4.reduce((s, x) => s + pvAt30min(pvByHour, parseInt(x.key)), 0) / 4;
-    if (avgPv > bestPv) { bestPv = avgPv; bestIdx = i; }
+    if (avgPv >= pvThreshold) { bestIdx = i; break; } // 找到最早满足条件的，立即停止
+  }
+  if (bestIdx === -1) { // 没有满足阈值的，退而用PV最强的
+    let bestPv = -Infinity;
+    for (let i = 0; i <= mainCandidates.length - 4; i++) {
+      const avgPv = mainCandidates.slice(i,i+4).reduce((s,x)=>s+pvAt30min(pvByHour,parseInt(x.key)),0)/4;
+      if (avgPv > bestPv) { bestPv = avgPv; bestIdx = i; }
+    }
   }
 
   const mainSlots  = mainCandidates.slice(bestIdx, bestIdx + 4);
@@ -843,7 +856,8 @@ function calcHotWaterWindows(slots, pvByHour) {
     avgBuyC:  parseFloat(mainAvgC.toFixed(2)),
     source:   hwSource(mainAvgC),
   };
-  console.log(`[主热水器] ${mainWin.startKey}–${mainWin.endKey} avgPV=${bestPv.toFixed(1)}kW avgPrice=${mainAvgC.toFixed(2)}¢`);
+  const mainAvgPv = mainSlots.reduce((s,x)=>s+pvAt30min(pvByHour,parseInt(x.key)),0)/4;
+  console.log(`[主热水器] ${mainWin.startKey}–${mainWin.endKey} avgPV=${mainAvgPv.toFixed(1)}kW avgPrice=${mainAvgC.toFixed(2)}¢`);
 
   // GF 热水器：主热水器结束后，到 allHwDeadlineMins 前，PV 最强的连续2槽（1小时）
   const gfCandidates = slots.filter(s => {
