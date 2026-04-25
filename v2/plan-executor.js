@@ -563,7 +563,7 @@ async function handleGfHotWater(db, syd) {
   }
   // 兜底：固定凌晨04:00窗口（plan-today 不覆盖凌晨，电池供热）
   const hasFixedWindow = planWins.some(w => w.start === '04:00');
-  if (!hasFixedWindow) planWins.push({ start: '04:00', end: '05:00', source: 'batt', label: '凌晨电池供热' });
+  if (!hasFixedWindow) planWins.push({ start: '04:00', end: '06:00', source: 'batt', label: '凌晨电池供热' });
 
   for (const win of planWins) {
     const [sh, sm] = win.start.split(':').map(Number);
