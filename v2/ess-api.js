@@ -14,8 +14,8 @@ const https = require('https');
 
 const MAX_CHARGE_KW = 5;
 const MAX_SELL_KW   = 5;
-const BREAKER_KW    = 7.7;
-const BREAKER_BUFFER = 0.3;
+const BREAKER_KW    = parseFloat(process.env.BREAKER_KW      || '7.7');
+const BREAKER_BUFFER = parseFloat(process.env.CHARGE_BUFFER_KW || '0.5');
 
 // 由调用方在 main() 里初始化
 let _db     = null;
