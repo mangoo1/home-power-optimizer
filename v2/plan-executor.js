@@ -648,10 +648,16 @@ async function main() {
     action = 'no-slot';
 
   } else if (slot.action === 'charge') {
-    // 充电时段：实时验证电价是否仍然合算
     const buyThreshold = JSON.parse(planRow?.notes ?? '{}').buyThreshold ?? planRow?.buy_threshold_c ?? 10;
     const realBuyPrice = amber?.buyPrice ?? null;
-    if (realBuyPrice != null && realBuyPrice > buyThreshold + 2) {
+    const chargeTargetPct = parseFloat(process.env.CHARGE_TARGET_PCT || '85');
+
+    if (ess.soc !== null && ess.soc >= chargeTargetPct) {
+      // SOC 已达目标，停止电网充电，切 self-use（让 PV 自然充入）
+      console.log(`[充电] SOC ${ess.soc}% ≥ 目标 ${chargeTargetPct}%，停止电网充电`);
+      await switchToSelfUse(`charge-done: soc=${ess.soc}%`);
+      action = 'charge-done';
+    } else if (realBuyPrice != null && realBuyPrice > buyThreshold + 2) {
       // 实际电价比计划阈值高 2¢ 以上 → 停充，切 self-use
       console.log(`[充电] 实际电价 ${realBuyPrice.toFixed(1)}¢ > 阈值 ${buyThreshold}¢+2，停止充电切 self-use`);
       await switchToSelfUse(`charge-abort: realBuy=${realBuyPrice.toFixed(1)}c > threshold+2`);
