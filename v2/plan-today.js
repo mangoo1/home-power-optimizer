@@ -778,72 +778,90 @@ function findBestWindow(candidates) {
   };
 }
 
-function calcHotWaterWindows(slots) {
-  // 主热水器（Main）：06:00–16:00，非 DW，找最低价2小时
-  // GF 热水器：在主热水器结束后1小时以上再排，避免重叠，也找最低价2小时
-  // 两台都不超过 16:00（留出晚高峰）
+function calcHotWaterWindows(slots, pvByHour) {
+  // ── 新策略：热水器优先排在 PV 峰值时段，天然消纳太阳能 ──
+  //
+  // 原则：chargeKw + homeLoad + hwLoad >= pvKw
+  // PV 峰值约 10:00–15:00，把热水器排在这里，PV 直接供热水器
+  // 不需要复杂的充电消纳逻辑
+  //
+  // 主热水器：2小时，找 PV 出力最强且电价低（<BUY_MAX_C）的连续4槽
+  // GF 热水器：1小时，紧接主热水器之后的 PV 时段，直到高电价前结束
+  //
+  // 两台都不超过高电价起点，不进 DW
 
-  const dayCandidates = slots.filter(s => {
-    const h = parseInt(s.key.split(':')[0]);
-    return h >= 6 && h < 17 && !s.dw && s.buyC > 0;  // 最晚到17:00前（留出晚高峰）
-  });
-
-  // 主热水器窗口：最低价2小时
-  const mainWin = findBestWindow(dayCandidates);
-  if (!mainWin) return { main: null, gf: null };
-
-  // GF热水器窗口：电价抬头前1小时开（趁低价预热，在电价升高前结束）
-  // 触发条件：第一个 buyC > HW_GRID_MAX_C（默认10¢）或 DW 的时段，14:00以后
-  // GF 结束 = 该时段开始（不进入高价段），GF 开始 = 结束前1小时
-  let highPriceStartMins = null;
+  // 找今天高电价起点（buyC > HW_GRID_MAX_C 且在 14:00 以后）
+  let highPriceStartMins = 17 * 60; // 默认 17:00
   for (const s of slots) {
     const h = parseInt(s.key.split(':')[0]);
     const m = parseInt(s.key.split(':')[1]);
     if ((s.buyC > HW_GRID_MAX_C || s.dw) && h >= 14) {
-      highPriceStartMins = h*60+m;
+      highPriceStartMins = h * 60 + m;
       break;
     }
   }
 
-  let gfWin = null;
-  if (highPriceStartMins !== null) {
-    const gfStartMins = highPriceStartMins - 60;
-    const gfEndMins   = highPriceStartMins; // 结束 = 高电价起点，不进入高价
-    const gfStartKey  = `${String(Math.floor(gfStartMins/60)).padStart(2,'0')}:${String(gfStartMins%60).padStart(2,'0')}`;
-    const gfEndKey    = `${String(Math.floor(gfEndMins/60)).padStart(2,'0')}:${String(gfEndMins%60).padStart(2,'0')}`;
-    const gfSlots = slots.filter(s => s.key >= gfStartKey && s.key < gfEndKey);
-    const avgC = gfSlots.length ? gfSlots.reduce((s,x)=>s+x.buyC,0)/gfSlots.length : 0;
-    const [meh,mem] = mainWin.endKey.split(':').map(Number);
-    if (gfStartMins >= meh*60+mem + 30 && gfStartMins >= 14*60) {
-      gfWin = { startKey: gfStartKey, endKey: gfEndKey, avgBuyC: parseFloat(avgC.toFixed(2)), source: hwSource(avgC) };
-    }
+  // 候选槽：08:00 到高电价前，非 DW，电价 < BUY_MAX_C
+  const dayCandidates = slots.filter(s => {
+    const [h, m] = s.key.split(':').map(Number);
+    return h >= 8 && h*60+m < highPriceStartMins && !s.dw && s.buyC < BUY_MAX_C;
+  });
+
+  if (dayCandidates.length < 4) return { main: null, gf: null };
+
+  // ── 主热水器：4槽（2小时），按 PV出力高 + 电价低 打分，找最优窗口 ──
+  // 打分：pvScore（越高越好）- priceScore（越低越好）
+  let bestScore = -Infinity, bestIdx = 0;
+  for (let i = 0; i <= dayCandidates.length - 4; i++) {
+    const window4 = dayCandidates.slice(i, i + 4);
+    const avgPv    = window4.reduce((s, x) => s + pvAt30min(pvByHour, parseInt(x.key)), 0) / 4;
+    const avgPrice = window4.reduce((s, x) => s + x.buyC, 0) / 4;
+    // 归一化：PV 权重大（每kW PV节省约15¢/h，而电价差最多5¢），所以 PV 权重 3x
+    const score = avgPv * 3 - avgPrice;
+    if (score > bestScore) { bestScore = score; bestIdx = i; }
   }
 
-  // 如果没找到高电价触发，退而求其次找主热水器后最便宜的1小时
-  if (!gfWin) {
-    const [meh,mem] = mainWin.endKey.split(':').map(Number);
-    const mainEndMins = meh*60+mem;
-    const gfCandidates = dayCandidates.filter(s => {
-      const [h,m] = s.key.split(':').map(Number);
-      return h*60+m >= mainEndMins + 60;
-    });
-    if (gfCandidates.length >= 2) {
-      // 取最便宜的连续2槽（1小时）
-      let bestAvg = Infinity, bestIdx = 0;
-      for (let i = 0; i <= gfCandidates.length - 2; i++) {
-        const avg = (gfCandidates[i].buyC + gfCandidates[i+1].buyC) / 2;
-        if (avg < bestAvg) { bestAvg = avg; bestIdx = i; }
-      }
-      const s0 = gfCandidates[bestIdx], s1 = gfCandidates[bestIdx+1];
-      const [eh,em] = s1.key.split(':').map(Number);
-      const endMins = eh*60+em+30;
-      gfWin = {
-        startKey: s0.key,
-        endKey: `${String(Math.floor(endMins/60)).padStart(2,'0')}:${String(endMins%60).padStart(2,'0')}`,
-        avgBuyC: parseFloat(bestAvg.toFixed(2)),
-        source: hwSource(bestAvg),
-      };
+  const mainSlots = dayCandidates.slice(bestIdx, bestIdx + 4);
+  const [meh, mem] = mainSlots[3].key.split(':').map(Number);
+  const mainEndMins = meh * 60 + mem + 30;
+  const mainEndKey  = `${String(Math.floor(mainEndMins/60)).padStart(2,'0')}:${String(mainEndMins%60).padStart(2,'0')}`;
+  const mainAvgC = mainSlots.reduce((s,x) => s+x.buyC, 0) / 4;
+  const mainWin = {
+    startKey: mainSlots[0].key,
+    endKey:   mainEndKey,
+    avgBuyC:  parseFloat(mainAvgC.toFixed(2)),
+    source:   hwSource(mainAvgC),
+  };
+
+  console.log(`[主热水器] PV打分选窗口: ${mainWin.startKey}–${mainWin.endKey} avgPV=${( mainSlots.reduce((s,x)=>s+pvAt30min(pvByHour,parseInt(x.key)),0)/4).toFixed(1)}kW avgPrice=${mainAvgC.toFixed(2)}¢`);
+
+  // ── GF 热水器：1小时，紧接主热水器之后，直到高电价前 ──
+  const gfCandidates = dayCandidates.filter(s => {
+    const [h, m] = s.key.split(':').map(Number);
+    return h*60+m >= mainEndMins && h*60+m < highPriceStartMins - 60; // 留1小时余量
+  });
+
+  let gfWin = null;
+  if (gfCandidates.length >= 2) {
+    // GF 也按 PV打分 选最优1小时（2槽）
+    let bestGfScore = -Infinity, bestGfIdx = 0;
+    for (let i = 0; i <= gfCandidates.length - 2; i++) {
+      const w = gfCandidates.slice(i, i+2);
+      const avgPv    = w.reduce((s,x) => s + pvAt30min(pvByHour, parseInt(x.key)), 0) / 2;
+      const avgPrice = w.reduce((s,x) => s + x.buyC, 0) / 2;
+      const score = avgPv * 3 - avgPrice;
+      if (score > bestGfScore) { bestGfScore = score; bestGfIdx = i; }
     }
+    const gfSlots = gfCandidates.slice(bestGfIdx, bestGfIdx + 2);
+    const [geh, gem] = gfSlots[1].key.split(':').map(Number);
+    const gfEndMins = geh*60+gem+30;
+    const gfAvgC = gfSlots.reduce((s,x) => s+x.buyC, 0) / 2;
+    gfWin = {
+      startKey: gfSlots[0].key,
+      endKey:   `${String(Math.floor(gfEndMins/60)).padStart(2,'0')}:${String(gfEndMins%60).padStart(2,'0')}`,
+      avgBuyC:  parseFloat(gfAvgC.toFixed(2)),
+      source:   hwSource(gfAvgC),
+    };
   }
 
   return { main: mainWin, gf: gfWin };
@@ -937,7 +955,7 @@ async function main() {
   console.log(`[Amber] ${slots.length} 个半小时槽, DW: ${hasDW}`);
 
   // 5a. 热水器计划（先算，buildPlan 需要知道热水器时段）
-    const { main: mainWin, gf: gfWin } = calcHotWaterWindows(slots);
+    const { main: mainWin, gf: gfWin } = calcHotWaterWindows(slots, pvByHour);
   if (mainWin) console.log(`\n[主热水器] ${mainWin.startKey}–${mainWin.endKey} 均价${mainWin.avgBuyC}¢ → ${mainWin.source==='grid'?'电网直供':'电池供电'}`);
   if (gfWin)   console.log(`[GF热水器] ${gfWin.startKey}–${gfWin.endKey} 均价${gfWin.avgBuyC}¢ → ${gfWin.source==='grid'?'电网直供':'电池供电'}`);
 
