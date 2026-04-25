@@ -140,7 +140,13 @@ async function essWebGet(path) {
 function findVal(items, index) {
   if (!items) return null;
   const item = Array.isArray(items) ? items.find(i => i.index === index) : null;
-  return item?.value ?? null;
+  if (!item) return null;
+  // 优先用 value，但有时 value=0 而 valueStr 有正确数值（ESS API 解码 bug）
+  // 如果 value 为 0 但 valueStr 非零，用 valueStr
+  if (item.value === 0 && item.valueStr && parseFloat(item.valueStr) !== 0) {
+    return parseFloat(item.valueStr);
+  }
+  return item.value ?? null;
 }
 
 async function readEss() {
@@ -160,7 +166,7 @@ async function readEss() {
   const battCurrent  = findVal(batt, '0x120E') ?? null;   // A
   const homeLoad     = findVal(load, '0x1274') ?? null;   // kW
   const gridPower    = findVal(meter,'0xA112') ?? null;   // kW positive=import
-  const pvPower      = findVal(pv,   '0x1208') ?? null;   // kW
+  const pvPower      = findVal(pv,   '0x1270') ?? null;   // kW Total PV power
   const meterBuy     = findVal(meter,'0x1240') ?? null;   // kWh cumulative bought
   const meterSell    = findVal(meter,'0x1242') ?? null;   // kWh cumulative sold
   const reportedMode = runInfo?.x300C ?? null;
