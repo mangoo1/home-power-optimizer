@@ -997,10 +997,26 @@ async function main() {
   // 5b. 生成计划（dry-run 先算买入均价，再正式生成含卖电）
   const dryRun = buildPlan(slots, pvByHour, currentSocPct, hasDW, BUY_MIN_C + 1, null, mainWin, gridChargeTarget);
   const dryChargeSlots = dryRun.plan.filter(s => s.action === 'charge');
-  const realAvgBuyC = dryChargeSlots.length > 0
+  const dryAvgBuyC = dryChargeSlots.length > 0
     ? dryChargeSlots.reduce((s, x) => s + x.buyC, 0) / dryChargeSlots.length
     : BUY_MIN_C + 1;
-  console.log(`[买入均价] ${realAvgBuyC.toFixed(2)}¢ → 卖电门槛 max(${SELL_FLOOR_C}¢, ${realAvgBuyC.toFixed(2)}+${SELL_MIN_MARGIN_C}¢)`);
+
+  // 用今天实际已充电的买电均价（更准确），如果没有历史数据则用 dry-run 估算
+  let realAvgBuyC = dryAvgBuyC;
+  try {
+    const actualRow = db.prepare(`
+      SELECT AVG(buy_price) as avg FROM energy_log
+      WHERE DATE(ts, 'localtime') = DATE('now', 'localtime')
+        AND buy_price > 0 AND buy_price < ${BUY_MAX_C}
+    `).get();
+    if (actualRow?.avg != null && actualRow.avg > 0) {
+      realAvgBuyC = parseFloat(actualRow.avg.toFixed(2));
+      console.log(`[买入均价] 今日实际 ${realAvgBuyC}¢（历史数据），dry-run估算 ${dryAvgBuyC.toFixed(2)}¢`);
+    } else {
+      console.log(`[买入均价] 无历史数据，用dry-run估算 ${realAvgBuyC.toFixed(2)}¢`);
+    }
+  } catch { console.log(`[买入均价] ${realAvgBuyC.toFixed(2)}¢`); }
+  console.log(`[卖电门槛] max(${SELL_FLOOR_C}¢, ${realAvgBuyC}+${SELL_MIN_MARGIN_C}¢) = ${Math.max(SELL_FLOOR_C, realAvgBuyC + SELL_MIN_MARGIN_C).toFixed(1)}¢`);
 
   const avgNightKwh = calcAvgNightKwh(db);
   console.log(`[过夜用电] 近7天均值: ${avgNightKwh ?? '无数据'}kWh`);
