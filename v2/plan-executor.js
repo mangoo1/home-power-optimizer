@@ -597,9 +597,11 @@ async function main() {
         logData(db, ess, amber, slot, 'mode-switch-timed', { modeFrom: ess.reportedMode, modeTo: 1 });
       }
       const safeChargeKw = calcSafeChargeKw(homeLoad, pvPower);
-      const targetKw = Math.min(slot.chargeKw || MAX_CHARGE_KW, safeChargeKw);
+      // 始终用断路器计算的最大安全功率充电，不受 plan 里预设 chargeKw 的限制
+      // plan 的 chargeKw 是静态估算，executor 实时知道 homeLoad，应该用实时值
+      const targetKw = safeChargeKw;
       if (targetKw < MAX_CHARGE_KW - 0.2) {
-        console.log(`[功率] homeLoad=${homeLoad.toFixed(2)}kW 高负载，充电降至 ${targetKw}kW（安全上限 ${safeChargeKw}kW）`);
+        console.log(`[功率] homeLoad=${homeLoad.toFixed(2)}kW，充电 ${targetKw}kW（断路器上限）`);
       }
       await updateChargeKw(targetKw, `charge-slot: home=${homeLoad.toFixed(2)}kW safe=${safeChargeKw}kW`);
       action = 'charge';
