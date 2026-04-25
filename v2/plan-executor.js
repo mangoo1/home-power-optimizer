@@ -386,15 +386,44 @@ const HW_TUYA_CWD = '/home/deven/.openclaw/workspace';
 
 async function tuyaControl(deviceId, on) {
   const cmd = on ? 'tuya_turn_on_device' : 'tuya_turn_off_device';
-  try {
-    const { execSync } = require('child_process');
-    const result = execSync(
-      `npx mcporter call tuya ${cmd} ${deviceId} switch`,
-      { cwd: HW_TUYA_CWD, timeout: 15000, encoding: 'utf8' }
-    );
-    const r = JSON.parse(result);
-    return r.success === true;
-  } catch { return false; }
+  const { execSync } = require('child_process');
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const result = execSync(
+        `npx mcporter call tuya ${cmd} ${deviceId} switch`,
+        { cwd: HW_TUYA_CWD, timeout: 15000, encoding: 'utf8' }
+      );
+      const r = JSON.parse(result);
+      if (!r.success) { console.warn(`[tuyaControl] attempt ${attempt} API returned success=false`); continue; }
+    } catch (e) {
+      console.warn(`[tuyaControl] attempt ${attempt} command failed: ${e.message}`);
+      if (attempt < 3) await new Promise(r => setTimeout(r, 3000));
+      continue;
+    }
+
+    // 验证设备实际状态（等3秒让设备响应）
+    await new Promise(r => setTimeout(r, 3000));
+    try {
+      const statusRaw = execSync(
+        `npx mcporter call tuya tuya_get_device_status ${deviceId}`,
+        { cwd: HW_TUYA_CWD, timeout: 15000, encoding: 'utf8' }
+      );
+      const s = JSON.parse(statusRaw);
+      const actualSwitch = s?.data?.switch;
+      if (actualSwitch === on) {
+        console.log(`[tuyaControl] ${deviceId} confirmed ${on ? 'ON' : 'OFF'} (attempt ${attempt})`);
+        return true;
+      }
+      console.warn(`[tuyaControl] attempt ${attempt} state mismatch: expected ${on}, got ${actualSwitch} — retrying...`);
+    } catch (e) {
+      console.warn(`[tuyaControl] attempt ${attempt} status check failed: ${e.message}`);
+    }
+    if (attempt < 3) await new Promise(r => setTimeout(r, 5000));
+  }
+
+  console.error(`[tuyaControl] FAILED to confirm ${deviceId} → ${on ? 'ON' : 'OFF'} after 3 attempts`);
+  return false;
 }
 
 
