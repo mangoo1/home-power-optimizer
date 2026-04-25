@@ -459,12 +459,21 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5, nightReser
       const hwNote = hwKeys.has(s.key) ? ' +HW↓' : '';
       reason   = `buy=${s.buyC}¢ grid-charge${hwNote}`;
 
-    } else if (hasPv && battCanAbsorb && pvAbsorb >= 0.3) {
-      // PV 消纳充电：有PV溢出且电池未满，充电消纳PV
-      // 即使不在电网充电槽，也要充电避免PV浪费
+    } else if (hasPv && battCanAbsorb && maxChargeKw >= 0.3) {
+      // PV 时段（有阳光）且电池未满（<93%）：尽量充电
+      //
+      // 两种情况都充：
+      // 1. 热水器开着：热水器消纳PV，充电额外消纳剩余断路器余量
+      //    → 热水器关后电池已充满，继续承接下午PV
+      // 2. 热水器关着：PV直接充电，消纳所有PV溢出
+      //
+      // 充电功率 = 断路器余量（已考虑热水器负荷），上限5kW
       action   = 'charge';
-      chargeKw = pvAbsorb;
-      reason   = `pv-absorb: pv=${pv.toFixed(1)}kW load=${totalLoad.toFixed(1)}kW surplus=${pvSurplus.toFixed(1)}kW`;
+      chargeKw = maxChargeKw;
+      const note = hwExtra > 0
+        ? `pv+hw: pv=${pv.toFixed(1)}kW hw=${hwExtra}kW grid-headroom=${maxChargeKw.toFixed(1)}kW`
+        : `pv-absorb: pv=${pv.toFixed(1)}kW load=${totalLoad.toFixed(1)}kW charge=${maxChargeKw.toFixed(1)}kW`;
+      reason = note;
 
     } else if (!hasPv && s.feedInC >= sellMinC && maxSellKw >= 0.5 && h >= 16) {
       // 晚间卖电：PV已落山（无PV出力），电价够高，有足够SOC
