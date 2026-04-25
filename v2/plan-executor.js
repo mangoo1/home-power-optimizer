@@ -441,7 +441,7 @@ async function handleHotWaterWindow(planRow, db, syd) {
   // nowMins already declared above
   const [sh, sm] = hw.startKey.split(':').map(Number);
   const [eh, em] = hw.endKey.split(':').map(Number);
-  const today = syd.date;
+  // today already declared above
   const source = hw.source ?? 'grid';
 
   // 开：窗口已开始（nowMins 在 startTime 到 startTime+30min 之间）且今天还没开过
