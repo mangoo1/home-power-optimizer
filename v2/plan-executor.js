@@ -417,7 +417,9 @@ async function handleHotWaterWindow(planRow, db, syd) {
   const today = syd.date;
   const source = hw.source ?? 'grid';
 
-  if (nowMins >= sh*60+sm - 5 && nowMins < sh*60+sm + 5) {
+  // 开：窗口已开始（nowMins 在 startTime 到 startTime+30min 之间）且今天还没开过
+  // 用30分钟而不是±5分钟，因为 plan-today 可能在窗口开始后才重新生成计划
+  if (nowMins >= sh*60+sm && nowMins < sh*60+sm + 30) {
     const key = `hw_main:${today}:on`;
     if (!db.prepare("SELECT 1 FROM kv_store WHERE key=?").get(key)) {
       const ok = await controlHotWater(true);
@@ -437,7 +439,7 @@ async function handleHotWaterWindow(planRow, db, syd) {
       }
     }
   }
-  if (nowMins >= eh*60+em - 5 && nowMins < eh*60+em + 5) {
+  if (nowMins >= eh*60+em && nowMins < eh*60+em + 30) {
     const key = `hw_main:${today}:off`;
     if (!db.prepare("SELECT 1 FROM kv_store WHERE key=?").get(key)) {
       const ok = await controlHotWater(false);
@@ -474,7 +476,7 @@ async function handleGfHotWater(db, syd) {
     const [sh, sm] = win.start.split(':').map(Number);
     const [eh, em] = win.end.split(':').map(Number);
 
-    if (nowMins >= sh*60+sm - 5 && nowMins < sh*60+sm + 5) {
+    if (nowMins >= sh*60+sm && nowMins < sh*60+sm + 30) {
       const key = `hw_gf:${today}:${win.start}:on`;
       if (!db.prepare("SELECT 1 FROM kv_store WHERE key=?").get(key)) {
         const ok = await tuyaControl(HW_GF_ID, true);
@@ -485,7 +487,7 @@ async function handleGfHotWater(db, syd) {
         }
       }
     }
-    if (nowMins >= eh*60+em - 5 && nowMins < eh*60+em + 5) {
+    if (nowMins >= eh*60+em && nowMins < eh*60+em + 30) {
       const key = `hw_gf:${today}:${win.start}:off`;
       if (!db.prepare("SELECT 1 FROM kv_store WHERE key=?").get(key)) {
         const ok = await tuyaControl(HW_GF_ID, false);
