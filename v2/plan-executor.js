@@ -46,7 +46,7 @@ const BREAKER_BUFFER  = 0.3;   // kW 安全余量，不撞到断路器上限
 const MAX_CHARGE_KW   = 5.0;
 const MAX_SELL_KW     = 5.0;
 const SOC_FLOOR       = 10;    // % 绝对底线，不往下放
-const SOC_OVERNIGHT   = 35;    // % 过夜保留底线，卖电不低于此值
+const SOC_OVERNIGHT   = 50;    // % 过夜保留底线，卖电不低于此值（热水器+夜间家用约需50%）
 const DB_PATH         = path.join(__dirname, '..', 'data', 'energy.db');
 
 // ── 工具 ──────────────────────────────────────────────────────
@@ -759,8 +759,9 @@ async function main() {
         action = 'sell';
       } else {
         await updateSellKw(0, `sell-skip: feedIn-too-low`);
+        await switchToSelfUse('sell-skip-self-use');  // 切回Self-use，避免Timed模式+放电0的异常状态
         extraSellKw = 0;
-        console.log(`[卖电] feedIn=${amber.feedInPrice.toFixed(1)}¢ < ${planSellMinC}¢，停止卖电`);
+        console.log(`[卖电] feedIn=${amber.feedInPrice.toFixed(1)}¢ < ${planSellMinC}¢，停止卖电，切Self-use`);
         action = 'sell-skip';
       }
     } else {
