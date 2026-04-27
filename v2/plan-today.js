@@ -52,7 +52,7 @@ const CHARGE_BUFFER  = e('CHARGE_BUFFER_KW',    0.5);
 const HW_LOAD_KW     = e('HW_LOAD_KW',          5.0);
 const PV_SCALE       = e('PV_SCALE',            0.0032);
 const PV_PEAK_KW     = e('PV_PEAK_KW',          4.2);  // 实测峰值 4.2kW
-const BUY_MAX_C      = e('BUY_MAX_C',           14.0);
+const BUY_MAX_C      = e('BUY_MAX_C',           12.0);
 const BUY_MIN_C      = e('BUY_THRESHOLD_C',      8.0);
 const SELL_MIN_MARGIN_C = e('SELL_MIN_MARGIN_C', 3.0);
 const SELL_FLOOR_C   = e('SELL_FLOOR_C',        10.0);
@@ -377,13 +377,17 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5, nightReser
   }
 
   // 填满首尾充电槽之间的空隙（避免中间出现自用空洞）
+  // 但只填价格 <= 已选最贵槽价格 的空隙，防止把下午涨价时段也拉进来
   const sortedChargeKeys = [...chargeKeys].sort();
   const firstChargeKey = sortedChargeKeys[0];
   const lastChargeKey  = sortedChargeKeys[sortedChargeKeys.length - 1];
+  const selectedPricesForGap = [...candidateSlots].filter(s => chargeKeys.has(s.key)).map(s => s.buyC);
+  const gapPriceCeil = selectedPricesForGap.length ? Math.max(...selectedPricesForGap) : BUY_MAX_C;
   for (const s of candidateSlots) {
     if (chargeKeys.has(s.key)) continue;
     if (firstChargeKey && lastChargeKey && s.key >= firstChargeKey && s.key <= lastChargeKey) {
-      chargeKeys.add(s.key);
+      // 只填价格不高于已选最贵槽的空隙
+      if (s.buyC <= gapPriceCeil) chargeKeys.add(s.key);
     }
   }
 
