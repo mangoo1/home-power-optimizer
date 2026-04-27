@@ -144,9 +144,9 @@ const ULTRACHEAP_PRICE_C = 7.0;   // ¢ — "ultra cheap" threshold
 //   11:00–23:59 Sydney → 35% (afternoon/evening, must reserve for demand window + overnight)
 // Cutoff changed from 14:00 to 11:00: after 11am there's not enough recharge time before 15:00 DW
 const SOC_MIN_SELL_MORNING  = 12;
-const SOC_MIN_SELL_AFTERNOON = 32;
+const SOC_MIN_SELL_AFTERNOON = 35;
 const SOC_MIN_SELL_CUTOFF_HOUR = 11; // switch to afternoon reserve at 11:00 Sydney time
-const SELL_STOP_HOUR = 21;        // Hard stop selling after this hour (Sydney time) — reserve battery for overnight
+const SELL_STOP_HOUR = 22;        // Hard stop selling after this hour (Sydney time) — reserve battery for overnight
 const SOC_WARN = 20;              // Alert threshold: SOC too low during demand window
 const SELL_FEEDIN_MIN = 0;        // Hard floor for selling (0 = rely solely on avg-buy+margin logic)
 const CHARGE_SPOT_MAX = 0;        // Max spot price for free charging (spot <= 0 = free)
@@ -559,7 +559,7 @@ async function setTimedChargeDischarge({ mode, powerKw, tag, nextDemandMinutes }
 
   const { startHHMM, endHHMM: chargeEndHHMM, clockStr, yesterday, tomorrow } = timedModeTimeContext(nextDemandMinutes, todayPlan);
 
-  // Sell mode: end at SELL_STOP_HOUR (21:00) — fixed, not rolling +10min
+  // Sell mode: end at SELL_STOP_HOUR (22:00) — fixed, not rolling +10min
   // This ensures a missed cron run won't cut selling short mid-session
   const sellEndHHMM = String(SELL_STOP_HOUR).padStart(2,'0') + '00';
   const endHHMM = mode === 'sell' ? sellEndHHMM : chargeEndHHMM;
