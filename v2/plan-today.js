@@ -739,7 +739,15 @@ function savePlan(db, today, plan, meta) {
     parseFloat(meta.pvPeakKw.toFixed(2)),
     JSON.stringify(chargeWindows),
     JSON.stringify(plan),
-    JSON.stringify({ buyThreshold: meta.buyThreshold, sellMinC: meta.sellMinC, calibFactor: meta.calibFactor, gridChargeTarget: Math.round(meta.gridChargeTarget * 100) }),
+    (() => {
+      // 动态计算过夜 SOC 底线：夜间家用 + GF凌晨热水器 + 10%保底（主热水器由电网直供不计）
+      const nightKwh  = meta.avgNightKwh ?? 7;   // 近7天夜间家用均值
+      const gfHwKwh   = 3.5;                      // GF热水器凌晨04:00固定1小时
+      const bufferKwh = BATT_KWH * 0.10;          // 10%保底
+      const totalKwh  = nightKwh + gfHwKwh + bufferKwh;
+      const overnightSocPct = Math.min(60, Math.ceil(totalKwh / BATT_KWH * 100));
+      return JSON.stringify({ buyThreshold: meta.buyThreshold, sellMinC: meta.sellMinC, calibFactor: meta.calibFactor, gridChargeTarget: Math.round(meta.gridChargeTarget * 100), overnightSocPct });
+    })(),
     parseFloat(meta.buyThreshold.toFixed(2)),
     meta.sellMinC,
     meta.mainWin ? JSON.stringify(meta.mainWin) : null,
@@ -1049,7 +1057,7 @@ async function main() {
   const version = savePlan(db, today, plan, {
     currentSocPct, hasDW, pvForecastKwh, pvPeakKw, calibFactor: PV_SCALE,
     gridChargeTarget,
-    buyThreshold, chargeTargetBy, sellMinC, mainWin, gfWin,
+    buyThreshold, chargeTargetBy, sellMinC, mainWin, gfWin, avgNightKwh,
   });
   db.close();
 

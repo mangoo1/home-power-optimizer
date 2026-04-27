@@ -139,12 +139,12 @@ const SOC_MAX_CHARGE_ULTRACHEAP = 100; // % — charge to 100% when price <= thi
 const ULTRACHEAP_PRICE_C = 7.0;   // ¢ — "ultra cheap" threshold
                                   // 85% chosen: above this BMS throttles charge rate,
                                   // PV surplus only earns ~2.8c feedIn — not worth grid charging
-// SOC_MIN_SELL is time-dependent (see getSocMinSell() below):
+// SOC_MIN_SELL is time-dependent:
 //   00:00–10:59 Sydney → 12% (morning, enough time for grid/PV to recharge before demand window)
-//   11:00–23:59 Sydney → 35% (afternoon/evening, must reserve for demand window + overnight)
-// Cutoff changed from 14:00 to 11:00: after 11am there's not enough recharge time before 15:00 DW
+//   11:00–23:59 Sydney → dynamic from plan notes.overnightSocPct, fallback 50%
+// plan-today writes overnightSocPct = nightKwh + hwKwh + 10% buffer (excl. grid-fed hw)
 const SOC_MIN_SELL_MORNING  = 12;
-const SOC_MIN_SELL_AFTERNOON = 35;
+const SOC_MIN_SELL_AFTERNOON_FALLBACK = 50; // fallback if no plan data
 const SOC_MIN_SELL_CUTOFF_HOUR = 11; // switch to afternoon reserve at 11:00 Sydney time
 const SELL_STOP_HOUR = 22;        // Hard stop selling after this hour (Sydney time) — reserve battery for overnight
 const SOC_WARN = 20;              // Alert threshold: SOC too low during demand window
@@ -1566,9 +1566,18 @@ function decide(ess, pvPower, amber, state, dailySummary) {
   const afterSellStopHour = sydneyHourNow >= SELL_STOP_HOUR;
 
   // Time-dependent SOC floor: morning allows lower reserve (can recharge before demand window)
+  // Dynamic overnight SOC floor: read from today's plan, fallback to 50%
+  const overnightSocPct = (() => {
+    try {
+      const notes = todayPlan?.notes
+        ? (typeof todayPlan.notes === 'string' ? JSON.parse(todayPlan.notes) : todayPlan.notes)
+        : null;
+      return notes?.overnightSocPct ?? SOC_MIN_SELL_AFTERNOON_FALLBACK;
+    } catch { return SOC_MIN_SELL_AFTERNOON_FALLBACK; }
+  })();
   const socMinSell = sydneyHourNow < SOC_MIN_SELL_CUTOFF_HOUR
-    ? SOC_MIN_SELL_MORNING    // 00:00–13:59 → 12%
-    : SOC_MIN_SELL_AFTERNOON; // 14:00–23:59 → 35%
+    ? SOC_MIN_SELL_MORNING       // 00:00–10:59 → 12%
+    : overnightSocPct;           // 11:00–23:59 → plan动态值（默认50%）
 
   // ── Priority 5a: Already selling — hold unless exit condition met ─────────
   // If we're currently selling, don't re-evaluate entry conditions each cron run.
