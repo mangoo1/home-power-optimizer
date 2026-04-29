@@ -49,16 +49,22 @@ const BUY_MULT         = 1.30;
 const BUY_HARD_MAX_C   = 12.0;   // never buy above this regardless
 
 // ── Hot water heater config ───────────────────────────────────────────────────
-// Two heaters, ~5kW total, need 2 hours. Planner picks the best 2h window
-// (cheapest price + strongest PV) between HOT_WATER_EARLIEST and HOT_WATER_LATEST.
-// During that window homeLoad is inflated by HOT_WATER_KW, and charge power is
-// reduced accordingly so total grid draw never exceeds BREAKER_KW.
-const HOT_WATER_KW      = 5.0;   // combined load of both heaters
-const HOT_WATER_HOURS   = 2;     // duration needed
-const HOT_WATER_EARLIEST = 9;    // not before 09:00 (PV needs to be up)
-const HOT_WATER_LATEST   = 16;   // must finish by 16:00 (before evening peak)
+// Two separate heaters, each ~5kW, each needs 2 hours in daytime.
+// They MUST NOT run simultaneously (breaker limit).
+// Planner picks the best non-overlapping 2h windows for each heater,
+// avoiding high-price slots and demand windows.
+const HW_MAIN_KW         = 5.0;   // Main heater load
+const HW_GF_KW           = 5.0;   // GF heater load (actually ~3.5kW but budget 5)
+const HW_HOURS_EACH      = 2;     // preferred duration per heater
+const HW_HOURS_MIN       = 1.5;   // minimum acceptable if no 2h window available
+const HW_EARLIEST        = 9;     // not before 09:00 (PV needs to be up)
+const HW_LATEST          = 17;    // must finish by 17:00 (before evening peak)
 const BREAKER_KW         = 7.7;
-const BREAKER_BUFFER_KW  = 1.0;  // safety headroom
+const BREAKER_BUFFER_KW  = 1.0;   // safety headroom
+
+// Device IDs for hardware_tasks
+const HW_MAIN_DEVICE_ID  = 'bf160bbe78f4f1ce6dpkdp';
+const HW_GF_DEVICE_ID    = 'bf3c28e8181e5e980eoobm';
 
 // Home load profile (kW) by Sydney hour — excludes hot water heater
 function homeLoadKw(hour) {
@@ -71,25 +77,39 @@ function homeLoadKw(hour) {
   return 0.35;                               // overnight standby
 }
 
-// Pick best 2h hot water window: score = PV - buyC (more PV + cheaper = better)
-function pickHotWaterWindow(slots, pvByHour) {
-  const candidates = [];
-  const slotCount = HOT_WATER_HOURS * 2; // 30-min slots needed
-  for (let i = 0; i <= slots.length - slotCount; i++) {
-    const window = slots.slice(i, i + slotCount);
-    const startH = window[0].hour;
-    const endH   = window[slotCount - 1].hour + 1;
-    if (startH < HOT_WATER_EARLIEST || endH > HOT_WATER_LATEST) continue;
-    if (window.some(s => s.demandWindow)) continue;
-    const avgBuy = window.reduce((s, v) => s + v.buyC, 0) / window.length;
-    const avgPv  = window.reduce((s, v) => s + (pvByHour[v.hour] || 0), 0) / window.length;
-    // Score: lower buy price = better, higher PV = better (offsets heater load)
-    const score = avgPv - avgBuy * 0.5;
-    candidates.push({ startH, endH, avgBuy, avgPv, score, slots: window });
+// Pick best window for a single heater: tries HW_HOURS_EACH first, falls back to HW_HOURS_MIN
+// excludeRanges: array of {startH, endH} to avoid overlap with other heater
+function pickHwWindow(slots, pvByHour, heaterKw, excludeRanges = []) {
+  // Try preferred duration first, then fall back to minimum
+  const durations = [HW_HOURS_EACH, HW_HOURS_MIN];
+  for (const hours of durations) {
+    const slotCount = Math.round(hours * 2); // 30-min slots needed
+    const candidates = [];
+    for (let i = 0; i <= slots.length - slotCount; i++) {
+      const window = slots.slice(i, i + slotCount);
+      const startH = window[0].hour + (window[0].key ? parseInt(window[0].key.split('T')[1]?.substring(3,5) || '0') / 60 : 0);
+      const startHour = window[0].hour;
+      const startMin  = parseInt(window[0].key?.split('T')[1]?.substring(3,5) || '0');
+      const endMin    = startHour * 60 + startMin + slotCount * 30;
+      const endH      = endMin / 60;
+      if (startHour < HW_EARLIEST || endH > HW_LATEST) continue;
+      if (window.some(s => s.demandWindow)) continue;
+      // Check overlap with excluded ranges (using fractional hours)
+      const winStart = startHour + startMin / 60;
+      const winEnd   = winStart + hours;
+      const overlaps = excludeRanges.some(r => winStart < r.endH && winEnd > r.startH);
+      if (overlaps) continue;
+      const avgBuy = window.reduce((s, v) => s + v.buyC, 0) / window.length;
+      const avgPv  = window.reduce((s, v) => s + (pvByHour[v.hour] || 0), 0) / window.length;
+      const score = avgPv - avgBuy * 0.5;
+      candidates.push({ startH: startHour, startMin, endH: Math.ceil(endH), hours, avgBuy, avgPv, score, slots: window });
+    }
+    if (candidates.length > 0) {
+      candidates.sort((a, b) => b.score - a.score);
+      return candidates[0];
+    }
   }
-  if (candidates.length === 0) return null;
-  candidates.sort((a, b) => b.score - a.score);
-  return candidates[0];
+  return null;
 }
 
 // ── Timezone helpers ──────────────────────────────────────────────────────────
@@ -252,17 +272,59 @@ async function main() {
   console.log(`   Buy threshold: ≤ ${buyThresholdC.toFixed(1)}c/kWh`);
   console.log(`   Sell threshold: ≥ ${SELL_MIN_C}c/kWh`);
 
-  // ── Hot water window selection ──────────────────────────────────────────────
-  const hwWindow = pickHotWaterWindow(slots.filter(s => s.key.startsWith(today)), pvByHour);
-  if (hwWindow) {
-    console.log(`\n🚿 Hot water window: ${String(hwWindow.startH).padStart(2,'0')}:00–${String(hwWindow.endH).padStart(2,'0')}:00`);
-    console.log(`   Avg buy: ${hwWindow.avgBuy.toFixed(1)}c  Avg PV: ${hwWindow.avgPv.toFixed(2)}kW`);
-    console.log(`   During this window: homeLoad +${HOT_WATER_KW}kW, charge power auto-reduced`);
+  // ── Hot water window selection (two separate heaters) ─────────────────────
+  const todaySlots = slots.filter(s => s.key.startsWith(today));
+  const hwMainWindow = pickHwWindow(todaySlots, pvByHour, HW_MAIN_KW, []);
+  // Exclude range uses precise end time (startH + startMin/60 + hours)
+  const mainExclude = hwMainWindow
+    ? [{ startH: hwMainWindow.startH + (hwMainWindow.startMin||0)/60, endH: hwMainWindow.startH + (hwMainWindow.startMin||0)/60 + hwMainWindow.hours }]
+    : [];
+  const hwGfWindow   = pickHwWindow(todaySlots, pvByHour, HW_GF_KW, mainExclude);
+
+  // Build hardware_tasks array (the single source of truth for executor)
+  const hardwareTasks = [];
+  function fmtTime(h, m) { return `${String(h).padStart(2,'0')}:${String(m||0).padStart(2,'0')}`; }
+
+  if (hwMainWindow) {
+    const startTime = fmtTime(hwMainWindow.startH, hwMainWindow.startMin || 0);
+    const endMins = hwMainWindow.startH * 60 + (hwMainWindow.startMin || 0) + hwMainWindow.hours * 60;
+    const endTime = fmtTime(Math.floor(endMins/60), endMins % 60);
+    hardwareTasks.push(
+      { time: startTime, action: 'on',  device: 'main_hw', deviceId: HW_MAIN_DEVICE_ID, deviceName: '主热水器', loadKw: HW_MAIN_KW },
+      { time: endTime,   action: 'off', device: 'main_hw', deviceId: HW_MAIN_DEVICE_ID, deviceName: '主热水器', loadKw: 0 },
+    );
+    console.log(`\n🚿 主热水器窗口: ${startTime}–${endTime} (${hwMainWindow.hours}h)`);
+    console.log(`   Avg buy: ${hwMainWindow.avgBuy.toFixed(1)}c  Avg PV: ${hwMainWindow.avgPv.toFixed(2)}kW`);
   } else {
-    console.log(`\n🚿 Hot water: no suitable window found (no gap in ${HOT_WATER_EARLIEST}:00–${HOT_WATER_LATEST}:00)`);
+    console.log(`\n🚿 主热水器: 未找到合适窗口（${HW_EARLIEST}:00–${HW_LATEST}:00 内无空闲/低价时段）`);
   }
-  const hwStartH = hwWindow?.startH ?? null;
-  const hwEndH   = hwWindow?.endH   ?? null;
+  if (hwGfWindow) {
+    const startTime = fmtTime(hwGfWindow.startH, hwGfWindow.startMin || 0);
+    const endMins = hwGfWindow.startH * 60 + (hwGfWindow.startMin || 0) + hwGfWindow.hours * 60;
+    const endTime = fmtTime(Math.floor(endMins/60), endMins % 60);
+    hardwareTasks.push(
+      { time: startTime, action: 'on',  device: 'gf_hw', deviceId: HW_GF_DEVICE_ID, deviceName: 'GF热水器', loadKw: HW_GF_KW },
+      { time: endTime,   action: 'off', device: 'gf_hw', deviceId: HW_GF_DEVICE_ID, deviceName: 'GF热水器', loadKw: 0 },
+    );
+    console.log(`\n🛁 GF热水器窗口: ${startTime}–${endTime} (${hwGfWindow.hours}h)`);
+    console.log(`   Avg buy: ${hwGfWindow.avgBuy.toFixed(1)}c  Avg PV: ${hwGfWindow.avgPv.toFixed(2)}kW`);
+  } else {
+    console.log(`\n🛁 GF热水器: 未找到合适窗口（可能与主热水器窗口冲突或全时段有DW）`);
+  }
+  if (hardwareTasks.length > 0) {
+    console.log(`\n🔧 Hardware tasks (${hardwareTasks.length}):`);
+    hardwareTasks.sort((a, b) => a.time.localeCompare(b.time));
+    for (const t of hardwareTasks) {
+      console.log(`   ${t.time}  ${t.action.toUpperCase().padEnd(3)}  ${t.deviceName}`);
+    }
+  }
+
+  // Determine which slots have hot water load for energy simulation
+  // Use start/end in minutes for precise matching
+  const hwMainStartMins = hwMainWindow ? hwMainWindow.startH * 60 + (hwMainWindow.startMin || 0) : null;
+  const hwMainEndMins   = hwMainWindow ? hwMainStartMins + hwMainWindow.hours * 60 : null;
+  const hwGfStartMins   = hwGfWindow ? hwGfWindow.startH * 60 + (hwGfWindow.startMin || 0) : null;
+  const hwGfEndMins     = hwGfWindow ? hwGfStartMins + hwGfWindow.hours * 60 : null;
 
   // ── 4. Walk slots and build plan ────────────────────────────────────────────
   console.log('\n Time    Buy¢  FdIn¢  PV kW  Load kW  NetKwh  SOC%  Action      ChargeKw');
@@ -282,9 +344,14 @@ async function main() {
 
   for (const slot of slots) {
     const h       = slot.hour;
-    const inHW    = hwStartH !== null && h >= hwStartH && h < hwEndH;
+    const slotMin = parseInt(slot.key?.split('T')[1]?.substring(3,5) || '0');
+    const slotMins = h * 60 + slotMin;
+    const inMainHW = hwMainStartMins !== null && slotMins >= hwMainStartMins && slotMins < hwMainEndMins;
+    const inGfHW   = hwGfStartMins !== null && slotMins >= hwGfStartMins && slotMins < hwGfEndMins;
+    const inHW     = inMainHW || inGfHW;
+    const hwLoad   = (inMainHW ? HW_MAIN_KW : 0) + (inGfHW ? HW_GF_KW : 0);
     const baseLoad = homeLoadKw(h);
-    const load    = baseLoad + (inHW ? HOT_WATER_KW : 0);  // total load incl. hot water
+    const load    = baseLoad + hwLoad;
     const pv      = pvByHour[h] ?? 0;
     const netKwh  = (pv - load) * INTERVAL_H;
     const inDW    = slot.demandWindow;
@@ -415,9 +482,13 @@ async function main() {
       buyThresholdC,
       sellMinC: SELL_MIN_C,
       pvDiscount: PV_DISCOUNT,
-      hotWater: hwWindow
-        ? { startH: hwWindow.startH, endH: hwWindow.endH, avgBuyC: parseFloat(hwWindow.avgBuy.toFixed(1)), avgPvKw: parseFloat(hwWindow.avgPv.toFixed(2)) }
+      mainHotWater: hwMainWindow
+        ? { startH: hwMainWindow.startH, endH: hwMainWindow.endH, avgBuyC: parseFloat(hwMainWindow.avgBuy.toFixed(1)), avgPvKw: parseFloat(hwMainWindow.avgPv.toFixed(2)) }
         : null,
+      gfHotWater: hwGfWindow
+        ? { startH: hwGfWindow.startH, endH: hwGfWindow.endH, avgBuyC: parseFloat(hwGfWindow.avgBuy.toFixed(1)), avgPvKw: parseFloat(hwGfWindow.avgPv.toFixed(2)) }
+        : null,
+      hardwareTasks,
     }),
   );
 

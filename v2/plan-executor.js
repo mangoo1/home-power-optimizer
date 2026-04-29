@@ -473,9 +473,7 @@ async function controlHotWater(on) {
   return ok;
 }
 
-// 主热水器：由 plan-today hw_window_json 驱动
-// source='grid' → 开热水器时把充电功率设 0.1kW（电网直供，电池几乎不动）
-// source='batt' → Self-use（电池放电供热水器）
+// 主热水器：由 plan-today hardware_tasks 驱动（notes.hardwareTasks 中 device='main_hw'）
 async function handleHotWaterWindow(planRow, db, syd) {
   const today = syd.date;
   const nowMins = syd.hh * 60 + syd.mi;
@@ -487,10 +485,7 @@ async function handleHotWaterWindow(planRow, db, syd) {
   const isOff = !!db.prepare("SELECT 1 FROM kv_store WHERE key=?").get(offKey);
   const MAX_HW_MINS = 150; // 最大运行2.5小时，超过强制关
 
-  if (isOn && !isOff && (!planRow?.hw_window_json)) {
-    // 热水器开着但计划没有窗口 → 检查是否超时
-    // 用 onKey 写入时间估算（简化：用当天06:00作为最早开始时间）
-    // 如果当前时间 > 最早可能开始时间 + MAX_HW_MINS，强制关
+  if (isOn && !isOff) {
     const hwOpenRow = db.prepare("SELECT value FROM kv_store WHERE key=?").get(`hw_main:${today}:open_time`);
     const openMins = hwOpenRow ? parseInt(hwOpenRow.value) : null;
     if (openMins !== null && nowMins - openMins >= MAX_HW_MINS) {
@@ -501,101 +496,70 @@ async function handleHotWaterWindow(planRow, db, syd) {
         db.prepare("INSERT OR REPLACE INTO kv_store (key,value) VALUES (?,?)").run(offKey, '1');
         await sendAlert(`⚠️ 主热水器已超时自动关闭（开了${Math.round((nowMins-openMins)/60*10)/10}h）`);
       }
+      return;
     }
-    return; // 没有窗口就不继续处理开关逻辑
   }
 
-  if (!planRow?.hw_window_json) return;
-  let hw;
-  try { hw = JSON.parse(planRow.hw_window_json); } catch { return; }
-  if (!hw?.startKey || !hw?.endKey) return;
+  // Read hardware_tasks from plan notes
+  if (!planRow?.notes) return;
+  let notes;
+  try { notes = JSON.parse(planRow.notes); } catch { return; }
+  const tasks = notes?.hardwareTasks?.filter(t => t.device === 'main_hw') ?? [];
+  if (tasks.length === 0) return;
 
-  // nowMins already declared above
-  const [sh, sm] = hw.startKey.split(':').map(Number);
-  const [eh, em] = hw.endKey.split(':').map(Number);
-  // today already declared above
-  const source = hw.source ?? 'grid';
+  for (const task of tasks) {
+    const [th, tm] = task.time.split(':').map(Number);
+    const taskMins = th * 60 + tm;
 
-  // 开：窗口已开始（nowMins 在 startTime 到 startTime+30min 之间）且今天还没开过
-  // 用30分钟而不是±5分钟，因为 plan-today 可能在窗口开始后才重新生成计划
-  if (nowMins >= sh*60+sm && nowMins < sh*60+sm + 30) {
-    const key = `hw_main:${today}:on`;
-    if (!db.prepare("SELECT 1 FROM kv_store WHERE key=?").get(key)) {
-      const ok = await controlHotWater(true);
-      if (ok) {
-        // source='batt' 时切 Self-use（电池放电供热水器）
-        // source='grid' 时不需要额外操作——断路器保护逻辑会自动限制充电功率
-        if (source === 'batt') {
-          await essApi.switchToSelfUse('hw-batt-supply', 'plan-executor');
-          console.log('[主热水器] 电池供电，切Self-use');
-        } else {
-          console.log('[主热水器] 电网直供，断路器保护自动调整充电功率');
+    if (nowMins >= taskMins && nowMins < taskMins + 30) {
+      const isOnTask = task.action === 'on';
+      const key = isOnTask ? onKey : offKey;
+      if (!db.prepare("SELECT 1 FROM kv_store WHERE key=?").get(key)) {
+        const ok = await controlHotWater(isOnTask);
+        if (ok) {
+          logHwAction(db, HW_MAIN_ID, '主热水器', isOnTask, { triggeredBy: 'executor', planWindow: task.time });
+          db.prepare("INSERT OR REPLACE INTO kv_store (key,value) VALUES (?,?)").run(key, '1');
+          if (isOnTask) {
+            db.prepare("INSERT OR REPLACE INTO kv_store (key,value) VALUES (?,?)").run(`hw_main:${today}:open_time`, String(nowMins));
+          }
+          await sendAlert(`${isOnTask ? '🚿' : '🔴'} 主热水器已${isOnTask ? '开' : '关'}（${task.time}，plan-today 计划）`);
         }
-        logHwAction(db, HW_MAIN_ID, '主热水器', true, { triggeredBy: 'executor', source: source, planWindow: `${hw.startKey}-${hw.endKey}` });
-        db.prepare("INSERT OR REPLACE INTO kv_store (key,value) VALUES (?,?)").run(key, '1');
-        // 记录开启时间（分钟），用于兜底超时保护
-        db.prepare("INSERT OR REPLACE INTO kv_store (key,value) VALUES (?,?)").run(`hw_main:${today}:open_time`, String(nowMins));
-        await sendAlert(`🚿 主热水器已开（${hw.startKey}，${source==='grid'?'电网':'电池'}供，${hw.avgBuyC}¢）`);
-      }
-    }
-  }
-  if (nowMins >= eh*60+em && nowMins < eh*60+em + 30) {
-    const key = `hw_main:${today}:off`;
-    if (!db.prepare("SELECT 1 FROM kv_store WHERE key=?").get(key)) {
-      const ok = await controlHotWater(false);
-      if (ok) {
-        // 关闭后主循环下个周期自动重算充电功率
-        db.prepare("INSERT OR REPLACE INTO kv_store (key,value) VALUES (?,?)").run(key, '1');
-        await sendAlert(`🔴 主热水器已关（${hw.endKey}）`);
       }
     }
   }
 }
 
-// GF热水器：plan-today gf_window_json（动态计划）+ 固定兜底窗口
-// source 逻辑同主热水器
+// GF热水器：所有窗口由 plan-today hardware_tasks 动态生成，executor 只读取执行
+// 不再有凌晨04:00的硬编码兜底窗口
+
 async function handleGfHotWater(db, syd) {
   const nowMins = syd.hh * 60 + syd.mi;
   const today = syd.date;
 
-  // 先尝试读 plan-today 算出的 GF 窗口
-  const planRow = db.prepare("SELECT gf_window_json FROM daily_plan WHERE date=? AND is_active=1 ORDER BY rowid DESC LIMIT 1").get(today);
-  let planWins = [];
-  if (planRow?.gf_window_json) {
-    try {
-      const w = JSON.parse(planRow.gf_window_json);
-      if (w?.startKey) planWins.push({ start: w.startKey, end: w.endKey, source: w.source ?? 'grid', label: `计划窗口(${w.avgBuyC}¢)` });
-    } catch {}
-  }
-  // 兜底：固定凌晨04:00窗口（plan-today 不覆盖凌晨，电池供热）
-  const hasFixedWindow = planWins.some(w => w.start === '04:00');
-  if (!hasFixedWindow) planWins.push({ start: '04:00', end: '05:00', source: 'batt', label: '凌晨电池供热' });
+  // 读 plan-today 生成的 hardware_tasks（在 notes JSON 里）
+  const planRow = db.prepare("SELECT notes FROM daily_plan WHERE date=? AND is_active=1 ORDER BY rowid DESC LIMIT 1").get(today);
+  if (!planRow?.notes) return;
 
-  for (const win of planWins) {
-    const [sh, sm] = win.start.split(':').map(Number);
-    const [eh, em] = win.end.split(':').map(Number);
+  let notes;
+  try { notes = JSON.parse(planRow.notes); } catch { return; }
+  const tasks = notes?.hardwareTasks?.filter(t => t.device === 'gf_hw') ?? [];
+  if (tasks.length === 0) return;
 
-    if (nowMins >= sh*60+sm && nowMins < sh*60+sm + 30) {
-      const key = `hw_gf:${today}:${win.start}:on`;
+  for (const task of tasks) {
+    const [th, tm] = task.time.split(':').map(Number);
+    const taskMins = th * 60 + tm;
+
+    // Execute within a 30-minute window of the scheduled time
+    if (nowMins >= taskMins && nowMins < taskMins + 30) {
+      const isOn = task.action === 'on';
+      const key = `hw_gf:${today}:${task.time}:${task.action}`;
       if (!db.prepare("SELECT 1 FROM kv_store WHERE key=?").get(key)) {
-        const ok = await tuyaControl(HW_GF_ID, true);
-        console.log(`[GF热水器] 开 ${win.start}（${win.label}）${ok?'✅':'❌'}`);
+        const ok = await tuyaControl(HW_GF_ID, isOn);
+        console.log(`[GF热水器] ${isOn ? '开' : '关'} ${task.time} ${ok ? '✅' : '❌'}`);
         if (ok) {
-          logHwAction(db, HW_GF_ID, 'GF热水器', true, { triggeredBy: 'executor', planWindow: `${win.start}-${win.end}` });
+          logHwAction(db, HW_GF_ID, 'GF热水器', isOn, { triggeredBy: 'executor', planWindow: task.time });
           db.prepare("INSERT OR REPLACE INTO kv_store (key,value) VALUES (?,?)").run(key, '1');
-          await sendAlert(`🛁 GF热水器已开（${win.start}，${win.label}）`);
-        }
-      }
-    }
-    if (nowMins >= eh*60+em && nowMins < eh*60+em + 30) {
-      const key = `hw_gf:${today}:${win.start}:off`;
-      if (!db.prepare("SELECT 1 FROM kv_store WHERE key=?").get(key)) {
-        const ok = await tuyaControl(HW_GF_ID, false);
-        console.log(`[GF热水器] 关 ${win.end}（${win.label}）${ok?'✅':'❌'}`);
-        if (ok) {
-          logHwAction(db, HW_GF_ID, 'GF热水器', false, { triggeredBy: 'executor', planWindow: `${win.start}-${win.end}` });
-          db.prepare("INSERT OR REPLACE INTO kv_store (key,value) VALUES (?,?)").run(key, '1');
-          await sendAlert(`🔴 GF热水器已关（${win.end}）`);
+          await sendAlert(`${isOn ? '🛁' : '🔴'} GF热水器已${isOn ? '开' : '关'}（${task.time}，plan-today 计划）`);
         }
       }
     }
