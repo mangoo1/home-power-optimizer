@@ -646,7 +646,7 @@ async function main() {
     // 无计划时段：什么都不做，逆变器按已设时间窗口运行
     action = 'no-slot';
 
-  } else if (slot.action === 'charge') {
+  } else if (slot.action === 'charge' || slot.action === 'charge+hw') {
     const buyThreshold = JSON.parse(planRow?.notes ?? '{}').buyThreshold ?? planRow?.buy_threshold_c ?? 10;
     const realBuyPrice = amber?.buyPrice ?? null;
     // 从 plan notes 读今日充电目标（plan-today 按PV预测动态设定：晴天85%，阴天93%）
