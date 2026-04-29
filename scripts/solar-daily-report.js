@@ -98,26 +98,39 @@ async function main() {
   const loadPower = getValue(loadData, '0x1274');     // 家庭用电 kW
   const loadTotal = getValue(loadData, '0x1262');     // 累计用电 kWh
 
-  // 今日增量
-  const todayBought = prevState.gridBought != null ? (gridBought - prevState.gridBought).toFixed(2) : 'N/A';
-  const todaySold   = prevState.gridSold   != null ? (gridSold   - prevState.gridSold  ).toFixed(2) : 'N/A';
-  const todayCharged    = prevState.battCharged    != null ? (battCharged    - prevState.battCharged   ).toFixed(2) : 'N/A';
-  const todayDischarged = prevState.battDischarged != null ? (battDischarged - prevState.battDischarged).toFixed(2) : 'N/A';
-  const todayLoad   = prevState.loadTotal  != null ? (loadTotal  - prevState.loadTotal ).toFixed(2) : 'N/A';
-
-  // 今日 PV 发电量：从 energy_log 取当天最大累计值
-  let todayPv = '0';
+  // ── 今日数据：从 energy_log 取逆变器 today_* 字段（最准确）──────────
+  // 这些字段是逆变器自身的今日累计，在 UTC 午夜重置
+  // 23:55 Sydney = ~13:55 UTC，还没重置，数据完整
+  let todayBought = 'N/A', todaySold = 'N/A', todayCharged = 'N/A';
+  let todayDischarged = 'N/A', todayLoad = 'N/A', todayPv = '0';
   try {
     const Database = require('better-sqlite3');
     const dbPath = path.join(__dirname, '../data/energy.db');
     const db = new Database(dbPath);
-    const sydDate = new Date(new Date().getTime() + 10*3600000).toISOString().slice(0,10);
-    const pvRow = db.prepare(
-      "SELECT MAX(today_pv_kwh) as pv FROM energy_log WHERE DATE(ts, '+10 hours') = ?"
-    ).get(sydDate);
-    todayPv = pvRow?.pv?.toFixed(1) ?? '0';
+    const row = db.prepare(`
+      SELECT today_charge_kwh, today_discharge_kwh, today_pv_kwh,
+             today_grid_buy_kwh, today_grid_sell_kwh, today_home_kwh
+      FROM energy_log
+      WHERE today_pv_kwh IS NOT NULL AND today_pv_kwh > 0
+      ORDER BY ts DESC LIMIT 1
+    `).get();
+    if (row) {
+      todayCharged    = (row.today_charge_kwh    ?? 0).toFixed(2);
+      todayDischarged = (row.today_discharge_kwh ?? 0).toFixed(2);
+      todayBought     = (row.today_grid_buy_kwh  ?? 0).toFixed(2);
+      todaySold       = (row.today_grid_sell_kwh ?? 0).toFixed(2);
+      todayLoad       = (row.today_home_kwh      ?? 0).toFixed(2);
+      todayPv         = (row.today_pv_kwh        ?? 0).toFixed(1);
+    }
     db.close();
-  } catch {}
+  } catch(e) {
+    console.warn('Failed to read energy_log, falling back to cumulative delta:', e.message);
+    todayBought = prevState.gridBought != null ? (gridBought - prevState.gridBought).toFixed(2) : 'N/A';
+    todaySold   = prevState.gridSold   != null ? (gridSold   - prevState.gridSold  ).toFixed(2) : 'N/A';
+    todayCharged    = prevState.battCharged    != null ? (battCharged    - prevState.battCharged   ).toFixed(2) : 'N/A';
+    todayDischarged = prevState.battDischarged != null ? (battDischarged - prevState.battDischarged).toFixed(2) : 'N/A';
+    todayLoad   = prevState.loadTotal  != null ? (loadTotal  - prevState.loadTotal ).toFixed(2) : 'N/A';
+  }
 
   // Amber 今日用电金额估算（用均价 ~25c 买电，卖电用 feedIn 均价）
   // 实际用 Amber API 今日历史价格来算更准，但简化用当前均价
