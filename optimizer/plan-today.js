@@ -169,9 +169,12 @@ async function fetchAmberPrices() {
       byTime[x.nemTime].feedin = Math.abs(x.perKwh);
     }
   });
-  return Object.values(byTime)
-    .filter(x => x.buy !== undefined)
-    .sort((a, b) => new Date(a.nemTime) - new Date(b.nemTime));
+  // Fill missing feedIn: estimate as ~70% of buy price (typical Amber ratio)
+  const entries = Object.values(byTime).filter(x => x.buy !== undefined);
+  for (const e of entries) {
+    if (e.feedin == null) e.feedin = Math.max(0, e.buy * 0.7);
+  }
+  return entries.sort((a, b) => new Date(a.nemTime) - new Date(b.nemTime));
 }
 
 // ── Aggregate 5-min → 30-min slots ───────────────────────────────────────────

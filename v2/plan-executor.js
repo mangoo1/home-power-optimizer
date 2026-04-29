@@ -714,6 +714,11 @@ async function main() {
     } else if (amber && amber.feedInPrice != null) {
       const planSellMinC = JSON.parse(planRow?.notes ?? '{}').sellMinC ?? 9.9;
       if (amber.feedInPrice >= planSellMinC) {
+        // 确保逆变器在 Timed 模式（Self-use 下不会按窗口放电）
+        if (ess.reportedMode !== 1) {
+          await essApi.setParam('0x300C', 1, 'sell-restore-timed', 'plan-executor');
+          console.log(`[卖电] 模式 ${ess.reportedMode} → Timed(1)`);
+        }
         // 用计划里该槽的 sellKw，fallback 到 MAX_SELL_KW
         const plannedSellKw = slot.sellKw > 0 ? slot.sellKw : MAX_SELL_KW;
         const actualSellKw = parseFloat(Math.max(0.5, Math.min(MAX_SELL_KW, plannedSellKw)).toFixed(2));
@@ -752,11 +757,22 @@ async function main() {
 
   } else if (slot.action === 'standby' || slot.action === 'self-use') {
     // 自用/待机：充电窗口由 plan-today 决定，executor 不做机会充电
-    // 若逆变器还在 Timed 模式，切回 Self-use
+    // 若逆变器还在 Timed 模式，检查后续是否有 sell 时段——有的话保留 Timed
     {
       if (ess.reportedMode === 1) {
-        await switchToSelfUse('self-use-slot');
-        logData(db, ess, amber, slot, 'mode-switch-selfuse', { modeFrom: 1, modeTo: 0 });
+        const nowMins = syd.hh * 60 + syd.mi;
+        const hasFutureSell = intervals.some(s => {
+          if (s.action !== 'sell') return false;
+          const h = parseInt(s.nemTime?.substring(11,13) ?? s.key?.substring(0,2) ?? '0');
+          const m = parseInt(s.nemTime?.substring(14,16) ?? s.key?.substring(3,5) ?? '0');
+          return h*60+m > nowMins;
+        });
+        if (hasFutureSell) {
+          console.log(`[模式] self-use 时段但后续有 sell 窗口，保留 Timed 模式`);
+        } else {
+          await switchToSelfUse('self-use-slot');
+          logData(db, ess, amber, slot, 'mode-switch-selfuse', { modeFrom: 1, modeTo: 0 });
+        }
       }
       action = slot.action;
     }
