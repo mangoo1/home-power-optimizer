@@ -178,9 +178,10 @@ function aggregateAmberTo30min(raw, today) {
     const mm  = parseInt(sydStart.toISOString().substring(14, 16)) < 30 ? '00' : '30';
     const key = `${hh}:${mm}`;
 
-    if (!slots[key]) slots[key] = { buySum: 0, feedInSum: 0, count: 0, demandWindow: false, nemTime: p.nemTime };
+    if (!slots[key]) slots[key] = { buySum: 0, feedInSum: 0, clSum: 0, clCount: 0, count: 0, demandWindow: false, nemTime: p.nemTime };
     if (p.channelType === 'general') { slots[key].buySum += p.perKwh; slots[key].count++; }
     if (p.channelType === 'feedIn')  slots[key].feedInSum += Math.abs(p.perKwh);
+    if (p.channelType === 'controlledLoad') { slots[key].clSum += p.perKwh; slots[key].clCount++; }
     if (p.tariffInformation?.demandWindow) slots[key].demandWindow = true;
   }
 
@@ -190,6 +191,7 @@ function aggregateAmberTo30min(raw, today) {
       nemTime: v.nemTime,
       buyC:    v.count > 0 ? parseFloat((v.buySum    / v.count).toFixed(2)) : 0,
       feedInC: v.count > 0 ? parseFloat((v.feedInSum / v.count).toFixed(2)) : 0,
+      clC:     v.clCount > 0 ? parseFloat((v.clSum   / v.clCount).toFixed(2)) : 0,
       dw:      v.demandWindow,
     }))
     .sort((a, b) => a.key.localeCompare(b.key));
@@ -391,12 +393,17 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5, nightReser
     }
   }
 
-  // SOC 偏低时，把早晨所有低价槽也纳入（不能等到中午才开始充）
-  // 逻辑：如果现在 SOC < 65%，7:00–12:00 之间 buyC < BUY_MAX_C 的候选槽全充
+  // SOC 偏低时，允许选择更早的便宜槽提前开始充电
+  // 逻辑：如果 SOC < 65%，从 07:00 起按价格排序补选槽，直到 neededKwh 满足
   if (currentSoc < 65) {
-    for (const s of candidateSlots) {
-      if (chargeKeys.has(s.key)) continue;
-      if (s.h >= 7 && s.h < 12) chargeKeys.add(s.key);
+    const earlySlots = candidateSlots
+      .filter(s => !chargeKeys.has(s.key) && s.h >= 7)
+      .sort((a, b) => a.buyC - b.buyC);
+    let extra = 0;
+    for (const s of earlySlots) {
+      if (accumulated + extra >= neededKwh) break;
+      chargeKeys.add(s.key);
+      extra += s.chargeKwhPer;
     }
     const newFirst = [...chargeKeys].sort()[0];
     console.log(`[低SOC扩充] SOC=${currentSoc}% < 65%，早晨充电提前到 ${newFirst ?? '-'}`);
@@ -841,66 +848,34 @@ function calcHotWaterWindows(slots, pvByHour) {
 
   console.log(`[热水器截止] 危险起点=${Math.floor(dangerStartMins/60)}:${String(dangerStartMins%60).padStart(2,'0')} 主热水器截止=${Math.floor(mainDeadlineMins/60)}:${String(mainDeadlineMins%60).padStart(2,'0')} GF截止=${Math.floor(allHwDeadlineMins/60)}:${String(allHwDeadlineMins%60).padStart(2,'0')}`);
 
-  // 候选槽：08:00 到主热水器截止前，非 DW，电价 < BUY_MAX_C
+  // 候选槽：08:00 到主热水器截止前，非 DW
+  // 主热水器接 controlled load，用 CL 价格排序（如有），否则回退 general 价格
+  const useClPrice = slots.some(s => s.clC > 0);
   const mainCandidates = slots.filter(s => {
     const [h, m] = s.key.split(':').map(Number);
     const endMins = h*60+m+30; // 这个槽的结束时间
-    return h >= 8 && endMins <= mainDeadlineMins && !s.dw && s.buyC < BUY_MAX_C;
+    const price = useClPrice ? s.clC : s.buyC;
+    return h >= 8 && endMins <= mainDeadlineMins && !s.dw && price < BUY_MAX_C;
   });
 
   if (mainCandidates.length < 4) {
-    console.log('[热水器] 主热水器候选槽不足4个，无法安排');
-    return { main: null, gf: null };
+    console.log('[热水器] 主热水器候选槽不足4个，无法安排主热水器');
   }
 
-  // 主热水器：最早的、PV足够强的连续4槽（2小时）
-  // 越早开越好——热水器结束后剩余PV时段更多，电池有更长时间充满
-  // "PV足够强" = 窗口平均PV >= 今天候选槽PV峰值的60%
-  const pvValues = mainCandidates.map(s => pvAt30min(pvByHour, parseInt(s.key)));
-  const peakPv = Math.max(...pvValues, 0.1);
-  const pvThreshold = peakPv * 0.6;
-
-  let bestIdx = -1;
-  for (let i = 0; i <= mainCandidates.length - 4; i++) {
-    const w4 = mainCandidates.slice(i, i + 4);
-    const avgPv = w4.reduce((s, x) => s + pvAt30min(pvByHour, parseInt(x.key)), 0) / 4;
-    if (avgPv >= pvThreshold) { bestIdx = i; break; } // 找到最早满足条件的，立即停止
-  }
-  if (bestIdx === -1) { // 没有满足阈值的，退而用PV最强的
-    let bestPv = -Infinity;
-    for (let i = 0; i <= mainCandidates.length - 4; i++) {
-      const avgPv = mainCandidates.slice(i,i+4).reduce((s,x)=>s+pvAt30min(pvByHour,parseInt(x.key)),0)/4;
-      if (avgPv > bestPv) { bestPv = avgPv; bestIdx = i; }
-    }
-  }
-
-  const mainSlots  = mainCandidates.slice(bestIdx, bestIdx + 4);
-  const [meh, mem] = mainSlots[3].key.split(':').map(Number);
-  const mainEndMins = meh*60+mem+30;
-  const mainEndKey  = `${String(Math.floor(mainEndMins/60)).padStart(2,'0')}:${String(mainEndMins%60).padStart(2,'0')}`;
-  const mainAvgC = mainSlots.reduce((s,x) => s+x.buyC, 0) / 4;
-  const mainWin = {
-    startKey: mainSlots[0].key,
-    endKey:   mainEndKey,
-    avgBuyC:  parseFloat(mainAvgC.toFixed(2)),
-    source:   hwSource(mainAvgC),
-  };
-  const mainAvgPv = mainSlots.reduce((s,x)=>s+pvAt30min(pvByHour,parseInt(x.key)),0)/4;
-  console.log(`[主热水器] ${mainWin.startKey}–${mainWin.endKey} avgPV=${mainAvgPv.toFixed(1)}kW avgPrice=${mainAvgC.toFixed(2)}¢`);
-
-  // GF 热水器：主热水器结束后，到 allHwDeadlineMins 前，最后的低价无DW连续4槽（2小时）
-  // 策略：尽量靠后（最后的低价窗口），让电池先充满再开
+  // GF 热水器：必须开！选全天（08:00到截止前）最便宜的连续4槽（2小时）
+  // 不再依赖主热水器结束时间，独立选最低价窗口
   const gfCandidates = slots.filter(s => {
     const [h, m] = s.key.split(':').map(Number);
     const endMins = h*60+m+30;
-    return h*60+m >= mainEndMins && endMins <= allHwDeadlineMins && !s.dw && s.buyC < BUY_MAX_C;
+    return h >= 8 && endMins <= allHwDeadlineMins && !s.dw && s.buyC < BUY_MAX_C;
   });
 
   let gfWin = null;
   if (gfCandidates.length >= 4) {
-    // 找最靠后的连续4槽（从后往前扫）
+    // 找最便宜的连续4槽
     let bestGfIdx = -1;
-    for (let i = gfCandidates.length - 4; i >= 0; i--) {
+    let bestGfPrice = Infinity;
+    for (let i = 0; i <= gfCandidates.length - 4; i++) {
       const w = gfCandidates.slice(i, i+4);
       // 检查连续性（每槽间隔30分钟）
       let consecutive = true;
@@ -909,7 +884,9 @@ function calcHotWaterWindows(slots, pvByHour) {
         const [h2,m2] = w[j+1].key.split(':').map(Number);
         if ((h2*60+m2) - (h1*60+m1) !== 30) { consecutive = false; break; }
       }
-      if (consecutive) { bestGfIdx = i; break; }
+      if (!consecutive) continue;
+      const avgPrice = w.reduce((s, x) => s + x.buyC, 0) / 4;
+      if (avgPrice < bestGfPrice) { bestGfPrice = avgPrice; bestGfIdx = i; }
     }
     if (bestGfIdx >= 0) {
       const gfSlots = gfCandidates.slice(bestGfIdx, bestGfIdx + 4);
@@ -922,13 +899,93 @@ function calcHotWaterWindows(slots, pvByHour) {
         avgBuyC:  parseFloat(gfAvgC.toFixed(2)),
         source:   hwSource(gfAvgC),
       };
-      console.log(`[GF热水器] ${gfWin.startKey}–${gfWin.endKey} avgPrice=${gfAvgC.toFixed(2)}¢（最后低价窗口，2小时）`);
+      console.log(`[GF热水器] ${gfWin.startKey}–${gfWin.endKey} avgPrice=${gfAvgC.toFixed(2)}¢（最便宜连续2小时）`);
     } else {
-      console.log('[GF热水器] 无连续4槽可用，今日跳过');
+      // 无连续4槽——放宽到任意4槽按价格最低（不要求连续）
+      const sorted = [...gfCandidates].sort((a,b) => a.buyC - b.buyC).slice(0, 4);
+      sorted.sort((a,b) => a.key.localeCompare(b.key));
+      const [geh, gem] = sorted[3].key.split(':').map(Number);
+      const gfEndMins = geh*60+gem+30;
+      const gfAvgC = sorted.reduce((s,x) => s+x.buyC, 0) / 4;
+      gfWin = {
+        startKey: sorted[0].key,
+        endKey:   `${String(Math.floor(gfEndMins/60)).padStart(2,'0')}:${String(gfEndMins%60).padStart(2,'0')}`,
+        avgBuyC:  parseFloat(gfAvgC.toFixed(2)),
+        source:   hwSource(gfAvgC),
+      };
+      console.log(`[GF热水器] ${gfWin.startKey}–${gfWin.endKey} avgPrice=${gfAvgC.toFixed(2)}¢（非连续，最便宜4槽）`);
     }
   } else {
-    console.log('[GF热水器] 候选槽不足4个，今日跳过');
+    // 候选槽不足4个也要开！用所有可用的槽
+    const sorted = [...gfCandidates].sort((a,b) => a.buyC - b.buyC);
+    if (sorted.length > 0) {
+      const last = sorted[sorted.length - 1];
+      const [geh, gem] = last.key.split(':').map(Number);
+      const gfEndMins = geh*60+gem+30;
+      const gfAvgC = sorted.reduce((s,x) => s+x.buyC, 0) / sorted.length;
+      gfWin = {
+        startKey: sorted[0].key,
+        endKey:   `${String(Math.floor(gfEndMins/60)).padStart(2,'0')}:${String(gfEndMins%60).padStart(2,'0')}`,
+        avgBuyC:  parseFloat(gfAvgC.toFixed(2)),
+        source:   hwSource(gfAvgC),
+      };
+      console.log(`[GF热水器] ${gfWin.startKey}–${gfWin.endKey} avgPrice=${gfAvgC.toFixed(2)}¢（仅${sorted.length}槽可用，强制开）`);
+    } else {
+      console.log('[GF热水器] 无候选槽，使用默认 10:00–12:00');
+      gfWin = { startKey: '10:00', endKey: '12:00', avgBuyC: 99, source: 'grid' };
+    }
   }
+
+  // 主热水器：避开 GF 时段，选 CL 最便宜的连续4槽（2小时）
+  // 候选槽不能与 GF 重叠（两台不能同时开！）
+  const gfKeySet = new Set();
+  if (gfWin) {
+    for (const s of slots) {
+      if (s.key >= gfWin.startKey && s.key < gfWin.endKey) gfKeySet.add(s.key);
+    }
+  }
+  const mainCandidatesFiltered = mainCandidates.filter(s => !gfKeySet.has(s.key));
+
+  if (mainCandidatesFiltered.length < 4) {
+    console.log('[主热水器] 排除GF时段后候选不足4个，无法安排');
+    return { main: null, gf: gfWin };
+  }
+
+  // 主热水器：选 CL 价格最便宜的连续4槽（2小时）
+  // 同时不能让总负荷超空开（热水器5kW + 充电功率 ≤ 7.7kW）
+  let bestIdx = -1;
+  let bestAvgPrice = Infinity;
+  for (let i = 0; i <= mainCandidatesFiltered.length - 4; i++) {
+    const w4 = mainCandidatesFiltered.slice(i, i + 4);
+    // 检查连续性
+    let consecutive = true;
+    for (let j = 0; j < 3; j++) {
+      const [h1,m1] = w4[j].key.split(':').map(Number);
+      const [h2,m2] = w4[j+1].key.split(':').map(Number);
+      if ((h2*60+m2) - (h1*60+m1) !== 30) { consecutive = false; break; }
+    }
+    if (!consecutive) continue;
+    const avgPrice = w4.reduce((s, x) => s + (useClPrice ? x.clC : x.buyC), 0) / 4;
+    if (avgPrice < bestAvgPrice) { bestAvgPrice = avgPrice; bestIdx = i; }
+  }
+  if (bestIdx === -1) { // 没有连续4槽，退而用最便宜的非连续
+    bestIdx = 0;
+  }
+
+  const mainSlots  = mainCandidatesFiltered.slice(bestIdx, bestIdx + 4);
+  const [meh, mem] = mainSlots[3].key.split(':').map(Number);
+  const mainEndMins = meh*60+mem+30;
+  const mainEndKey  = `${String(Math.floor(mainEndMins/60)).padStart(2,'0')}:${String(mainEndMins%60).padStart(2,'0')}`;
+  const mainAvgC = mainSlots.reduce((s,x) => s + (useClPrice ? x.clC : x.buyC), 0) / 4;
+  const mainWin = {
+    startKey: mainSlots[0].key,
+    endKey:   mainEndKey,
+    avgBuyC:  parseFloat(mainAvgC.toFixed(2)),
+    source:   hwSource(mainAvgC),
+    priceType: useClPrice ? 'CL' : 'general',
+  };
+  const mainAvgPv = mainSlots.reduce((s,x)=>s+pvAt30min(pvByHour,parseInt(x.key)),0)/4;
+  console.log(`[主热水器] ${mainWin.startKey}–${mainWin.endKey} avgPV=${mainAvgPv.toFixed(1)}kW avg${useClPrice?'CL':''}Price=${mainAvgC.toFixed(2)}¢`);
 
   return { main: mainWin, gf: gfWin };
 }
@@ -1039,19 +1096,31 @@ async function main() {
     ? dryChargeSlots.reduce((s, x) => s + x.buyC, 0) / dryChargeSlots.length
     : BUY_MIN_C + 1;
 
-  // 用今天实际已充电的买电均价（更准确），如果没有历史数据则用 dry-run 估算
+  // 用今天实际已充电的加权买电均价（按实际用量加权，更准确）
   let realAvgBuyC = dryAvgBuyC;
   try {
-    const actualRow = db.prepare(`
-      SELECT AVG(buy_price) as avg FROM energy_log
+    // 优先用 cost_log 加权均价（buy_cost / buy_kwh）
+    const costRow = db.prepare(`
+      SELECT SUM(buy_cost_c) as totalCost, SUM(buy_kwh) as totalKwh FROM cost_log
       WHERE DATE(ts, 'localtime') = DATE('now', 'localtime')
-        AND buy_price > 0 AND buy_price < ${BUY_MAX_C}
+        AND buy_kwh > 0
     `).get();
-    if (actualRow?.avg != null && actualRow.avg > 0) {
-      realAvgBuyC = parseFloat(actualRow.avg.toFixed(2));
-      console.log(`[买入均价] 今日实际 ${realAvgBuyC}¢（历史数据），dry-run估算 ${dryAvgBuyC.toFixed(2)}¢`);
+    if (costRow?.totalKwh > 0.1) {
+      realAvgBuyC = parseFloat((costRow.totalCost / costRow.totalKwh).toFixed(2));
+      console.log(`[买入均价] 今日加权实际 ${realAvgBuyC}¢（${costRow.totalKwh.toFixed(1)}kWh），dry-run估算 ${dryAvgBuyC.toFixed(2)}¢`);
     } else {
-      console.log(`[买入均价] 无历史数据，用dry-run估算 ${realAvgBuyC.toFixed(2)}¢`);
+      // 回退到 energy_log 简单均价
+      const actualRow = db.prepare(`
+        SELECT AVG(buy_price) as avg FROM energy_log
+        WHERE DATE(ts, 'localtime') = DATE('now', 'localtime')
+          AND buy_price > 0 AND buy_price < ${BUY_MAX_C}
+      `).get();
+      if (actualRow?.avg != null && actualRow.avg > 0) {
+        realAvgBuyC = parseFloat(actualRow.avg.toFixed(2));
+        console.log(`[买入均价] 今日实际 ${realAvgBuyC}¢（energy_log），dry-run估算 ${dryAvgBuyC.toFixed(2)}¢`);
+      } else {
+        console.log(`[买入均价] 无历史数据，用dry-run估算 ${realAvgBuyC.toFixed(2)}¢`);
+      }
     }
   } catch { console.log(`[买入均价] ${realAvgBuyC.toFixed(2)}¢`); }
   console.log(`[卖电门槛] max(${SELL_FLOOR_C}¢, ${realAvgBuyC}+${SELL_MIN_MARGIN_C}¢) = ${Math.max(SELL_FLOOR_C, realAvgBuyC + SELL_MIN_MARGIN_C).toFixed(1)}¢`);

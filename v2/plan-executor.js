@@ -792,6 +792,31 @@ async function main() {
     alert:    (isDW && !slotIsDW) ? 'unexpected-DW' : null,
   });
 
+  // 7b. 记录本次5分钟电费到 cost_log
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS cost_log (
+      ts TEXT PRIMARY KEY,
+      buy_kwh REAL, buy_price_c REAL, buy_cost_c REAL,
+      sell_kwh REAL, sell_price_c REAL, sell_revenue_c REAL,
+      cl_price_c REAL
+    )`);
+    // 从 energy_log 取最近一条的 meter delta
+    const lastLog = db.prepare(
+      "SELECT meter_buy_delta, meter_sell_delta FROM energy_log ORDER BY ts DESC LIMIT 1"
+    ).get();
+    if (lastLog && amber) {
+      const buyCost = (lastLog.meter_buy_delta ?? 0) * (amber.buyPrice ?? 0);
+      const sellRev = (lastLog.meter_sell_delta ?? 0) * (amber.feedInPrice ?? 0);
+      db.prepare(`INSERT OR REPLACE INTO cost_log (ts, buy_kwh, buy_price_c, buy_cost_c, sell_kwh, sell_price_c, sell_revenue_c, cl_price_c)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        new Date().toISOString(),
+        lastLog.meter_buy_delta ?? 0, amber.buyPrice ?? 0, parseFloat(buyCost.toFixed(4)),
+        lastLog.meter_sell_delta ?? 0, amber.feedInPrice ?? 0, parseFloat(sellRev.toFixed(4)),
+        amber.clPrice ?? null
+      );
+    }
+  } catch(e) { console.warn('[cost_log] 写入失败:', e.message); }
+
   // 8. 热水器窗口控制
   await handleHotWaterWindow(planRow, db, syd);  // 主热水器：plan-today hwWindow
   await handleGfHotWater(db, syd);               // GF热水器：固定 04:00+14:00
