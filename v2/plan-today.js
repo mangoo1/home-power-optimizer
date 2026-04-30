@@ -742,11 +742,21 @@ function savePlan(db, today, plan, meta) {
     (() => {
       // 动态计算过夜 SOC 底线：夜间家用 + GF凌晨热水器 + 10%保底（主热水器由电网直供不计）
       const nightKwh  = meta.avgNightKwh ?? 7;   // 近7天夜间家用均值
-      const gfHwKwh   = 3.5;                      // GF热水器凌晨04:00固定1小时
+      const gfHwKwh   = 0;                        // GF热水器已改为白天2小时，不再凌晨运行
       const bufferKwh = BATT_KWH * 0.10;          // 10%保底
       const totalKwh  = nightKwh + gfHwKwh + bufferKwh;
       const overnightSocPct = Math.min(60, Math.ceil(totalKwh / BATT_KWH * 100));
-      return JSON.stringify({ buyThreshold: meta.buyThreshold, sellMinC: meta.sellMinC, calibFactor: meta.calibFactor, gridChargeTarget: Math.round(meta.gridChargeTarget * 100), overnightSocPct });
+      // 生成 hardwareTasks 供 executor 执行热水器开关
+      const hardwareTasks = [];
+      if (meta.mainWin) {
+        hardwareTasks.push({ device: 'main_hw', action: 'on',  time: meta.mainWin.startKey });
+        hardwareTasks.push({ device: 'main_hw', action: 'off', time: meta.mainWin.endKey });
+      }
+      if (meta.gfWin) {
+        hardwareTasks.push({ device: 'gf_hw', action: 'on',  time: meta.gfWin.startKey });
+        hardwareTasks.push({ device: 'gf_hw', action: 'off', time: meta.gfWin.endKey });
+      }
+      return JSON.stringify({ buyThreshold: meta.buyThreshold, sellMinC: meta.sellMinC, calibFactor: meta.calibFactor, gridChargeTarget: Math.round(meta.gridChargeTarget * 100), overnightSocPct, hardwareTasks });
     })(),
     parseFloat(meta.buyThreshold.toFixed(2)),
     meta.sellMinC,
@@ -876,8 +886,8 @@ function calcHotWaterWindows(slots, pvByHour) {
   const mainAvgPv = mainSlots.reduce((s,x)=>s+pvAt30min(pvByHour,parseInt(x.key)),0)/4;
   console.log(`[主热水器] ${mainWin.startKey}–${mainWin.endKey} avgPV=${mainAvgPv.toFixed(1)}kW avgPrice=${mainAvgC.toFixed(2)}¢`);
 
-  // GF 热水器：主热水器结束后，到 allHwDeadlineMins（日落前）前，买电价最低的连续2槽（1小时）
-  // 策略：尽量早、尽量便宜，不依赖PV强弱
+  // GF 热水器：主热水器结束后，到 allHwDeadlineMins 前，最后的低价无DW连续4槽（2小时）
+  // 策略：尽量靠后（最后的低价窗口），让电池先充满再开
   const gfCandidates = slots.filter(s => {
     const [h, m] = s.key.split(':').map(Number);
     const endMins = h*60+m+30;
@@ -885,26 +895,37 @@ function calcHotWaterWindows(slots, pvByHour) {
   });
 
   let gfWin = null;
-  if (gfCandidates.length >= 2) {
-    let bestGfC = Infinity, bestGfIdx = 0;
-    for (let i = 0; i <= gfCandidates.length - 2; i++) {
-      const w = gfCandidates.slice(i, i+2);
-      const avgC = w.reduce((s,x) => s+x.buyC, 0) / 2;
-      if (avgC < bestGfC) { bestGfC = avgC; bestGfIdx = i; }
+  if (gfCandidates.length >= 4) {
+    // 找最靠后的连续4槽（从后往前扫）
+    let bestGfIdx = -1;
+    for (let i = gfCandidates.length - 4; i >= 0; i--) {
+      const w = gfCandidates.slice(i, i+4);
+      // 检查连续性（每槽间隔30分钟）
+      let consecutive = true;
+      for (let j = 0; j < 3; j++) {
+        const [h1,m1] = w[j].key.split(':').map(Number);
+        const [h2,m2] = w[j+1].key.split(':').map(Number);
+        if ((h2*60+m2) - (h1*60+m1) !== 30) { consecutive = false; break; }
+      }
+      if (consecutive) { bestGfIdx = i; break; }
     }
-    const gfSlots = gfCandidates.slice(bestGfIdx, bestGfIdx + 2);
-    const [geh, gem] = gfSlots[1].key.split(':').map(Number);
-    const gfEndMins = geh*60+gem+30;
-    const gfAvgC = gfSlots.reduce((s,x) => s+x.buyC, 0) / 2;
-    gfWin = {
-      startKey: gfSlots[0].key,
-      endKey:   `${String(Math.floor(gfEndMins/60)).padStart(2,'0')}:${String(gfEndMins%60).padStart(2,'0')}`,
-      avgBuyC:  parseFloat(gfAvgC.toFixed(2)),
-      source:   hwSource(gfAvgC),
-    };
-    console.log(`[GF热水器] ${gfWin.startKey}–${gfWin.endKey} avgPrice=${gfAvgC.toFixed(2)}¢（最低价窗口，日落前）`);
+    if (bestGfIdx >= 0) {
+      const gfSlots = gfCandidates.slice(bestGfIdx, bestGfIdx + 4);
+      const [geh, gem] = gfSlots[3].key.split(':').map(Number);
+      const gfEndMins = geh*60+gem+30;
+      const gfAvgC = gfSlots.reduce((s,x) => s+x.buyC, 0) / 4;
+      gfWin = {
+        startKey: gfSlots[0].key,
+        endKey:   `${String(Math.floor(gfEndMins/60)).padStart(2,'0')}:${String(gfEndMins%60).padStart(2,'0')}`,
+        avgBuyC:  parseFloat(gfAvgC.toFixed(2)),
+        source:   hwSource(gfAvgC),
+      };
+      console.log(`[GF热水器] ${gfWin.startKey}–${gfWin.endKey} avgPrice=${gfAvgC.toFixed(2)}¢（最后低价窗口，2小时）`);
+    } else {
+      console.log('[GF热水器] 无连续4槽可用，今日跳过');
+    }
   } else {
-    console.log('[GF热水器] 候选槽不足，今日跳过（凌晨04:00固定窗口仍会执行）');
+    console.log('[GF热水器] 候选槽不足4个，今日跳过');
   }
 
   return { main: mainWin, gf: gfWin };
