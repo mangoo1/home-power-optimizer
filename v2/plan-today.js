@@ -936,56 +936,68 @@ function calcHotWaterWindows(slots, pvByHour) {
     }
   }
 
-  // 主热水器：避开 GF 时段，选 CL 最便宜的连续4槽（2小时）
-  // 候选槽不能与 GF 重叠（两台不能同时开！）
-  const gfKeySet = new Set();
+  // 主热水器：紧邻 GF 前面或后面（CL 价格更低的那个），两台集中在低价时段
+  // 不能与 GF 重叠，不能超出截止时间
+  let mainWin = null;
   if (gfWin) {
-    for (const s of slots) {
-      if (s.key >= gfWin.startKey && s.key < gfWin.endKey) gfKeySet.add(s.key);
+    const gfStartMins = parseInt(gfWin.startKey.split(':')[0])*60 + parseInt(gfWin.startKey.split(':')[1]);
+    const gfEndMins = parseInt(gfWin.endKey.split(':')[0])*60 + parseInt(gfWin.endKey.split(':')[1]);
+
+    // 方案A：主热水器在 GF 前面（endKey = gfWin.startKey）
+    const beforeStartMins = gfStartMins - 120; // 2小时前
+    const beforeSlots = slots.filter(s => {
+      const [h,m] = s.key.split(':').map(Number);
+      const mins = h*60+m;
+      return mins >= beforeStartMins && mins < gfStartMins && h >= 8 && !s.dw;
+    });
+    const beforeAvgCL = beforeSlots.length === 4
+      ? beforeSlots.reduce((sum,s) => sum + (useClPrice ? s.clC : s.buyC), 0) / 4
+      : Infinity;
+
+    // 方案B：主热水器在 GF 后面（startKey = gfWin.endKey）
+    const afterEndMins = gfEndMins + 120;
+    const afterSlots = slots.filter(s => {
+      const [h,m] = s.key.split(':').map(Number);
+      const mins = h*60+m;
+      return mins >= gfEndMins && mins < gfEndMins + 120 && (mins+30) <= mainDeadlineMins && !s.dw;
+    });
+    const afterAvgCL = afterSlots.length === 4
+      ? afterSlots.reduce((sum,s) => sum + (useClPrice ? s.clC : s.buyC), 0) / 4
+      : Infinity;
+
+    let chosenSlots = null;
+    if (beforeAvgCL <= afterAvgCL && beforeSlots.length === 4) {
+      chosenSlots = beforeSlots;
+      console.log(`[主热水器] 选GF前 ${beforeSlots[0].key}–${gfWin.startKey} CL均价=${beforeAvgCL.toFixed(2)}¢`);
+    } else if (afterSlots.length === 4) {
+      chosenSlots = afterSlots;
+      const afterEndKey = `${String(Math.floor((gfEndMins+120)/60)).padStart(2,'0')}:${String((gfEndMins+120)%60).padStart(2,'0')}`;
+      console.log(`[主热水器] 选GF后 ${gfWin.endKey}–${afterEndKey} CL均价=${afterAvgCL.toFixed(2)}¢`);
+    } else if (beforeSlots.length === 4) {
+      chosenSlots = beforeSlots;
+      console.log(`[主热水器] 只能选GF前 ${beforeSlots[0].key}–${gfWin.startKey} CL均价=${beforeAvgCL.toFixed(2)}¢`);
     }
-  }
-  const mainCandidatesFiltered = mainCandidates.filter(s => !gfKeySet.has(s.key));
 
-  if (mainCandidatesFiltered.length < 4) {
-    console.log('[主热水器] 排除GF时段后候选不足4个，无法安排');
-    return { main: null, gf: gfWin };
-  }
-
-  // 主热水器：选 CL 价格最便宜的连续4槽（2小时）
-  // 同时不能让总负荷超空开（热水器5kW + 充电功率 ≤ 7.7kW）
-  let bestIdx = -1;
-  let bestAvgPrice = Infinity;
-  for (let i = 0; i <= mainCandidatesFiltered.length - 4; i++) {
-    const w4 = mainCandidatesFiltered.slice(i, i + 4);
-    // 检查连续性
-    let consecutive = true;
-    for (let j = 0; j < 3; j++) {
-      const [h1,m1] = w4[j].key.split(':').map(Number);
-      const [h2,m2] = w4[j+1].key.split(':').map(Number);
-      if ((h2*60+m2) - (h1*60+m1) !== 30) { consecutive = false; break; }
+    if (chosenSlots && chosenSlots.length === 4) {
+      const [meh, mem] = chosenSlots[3].key.split(':').map(Number);
+      const mainEndMins = meh*60+mem+30;
+      const mainEndKey = `${String(Math.floor(mainEndMins/60)).padStart(2,'0')}:${String(mainEndMins%60).padStart(2,'0')}`;
+      const mainAvgC = chosenSlots.reduce((s,x) => s + (useClPrice ? x.clC : x.buyC), 0) / 4;
+      mainWin = {
+        startKey: chosenSlots[0].key,
+        endKey:   mainEndKey,
+        avgBuyC:  parseFloat(mainAvgC.toFixed(2)),
+        source:   hwSource(mainAvgC),
+        priceType: useClPrice ? 'CL' : 'general',
+      };
+      const mainAvgPv = chosenSlots.reduce((s,x)=>s+pvAt30min(pvByHour,parseInt(x.key)),0)/4;
+      console.log(`[主热水器] ${mainWin.startKey}–${mainWin.endKey} avgPV=${mainAvgPv.toFixed(1)}kW avg${useClPrice?'CL':''}Price=${mainAvgC.toFixed(2)}¢`);
+    } else {
+      console.log('[主热水器] GF前后均无法安排连续2小时');
     }
-    if (!consecutive) continue;
-    const avgPrice = w4.reduce((s, x) => s + (useClPrice ? x.clC : x.buyC), 0) / 4;
-    if (avgPrice < bestAvgPrice) { bestAvgPrice = avgPrice; bestIdx = i; }
+  } else {
+    console.log('[主热水器] 无GF计划，无法定位');
   }
-  if (bestIdx === -1) { // 没有连续4槽，退而用最便宜的非连续
-    bestIdx = 0;
-  }
-
-  const mainSlots  = mainCandidatesFiltered.slice(bestIdx, bestIdx + 4);
-  const [meh, mem] = mainSlots[3].key.split(':').map(Number);
-  const mainEndMins = meh*60+mem+30;
-  const mainEndKey  = `${String(Math.floor(mainEndMins/60)).padStart(2,'0')}:${String(mainEndMins%60).padStart(2,'0')}`;
-  const mainAvgC = mainSlots.reduce((s,x) => s + (useClPrice ? x.clC : x.buyC), 0) / 4;
-  const mainWin = {
-    startKey: mainSlots[0].key,
-    endKey:   mainEndKey,
-    avgBuyC:  parseFloat(mainAvgC.toFixed(2)),
-    source:   hwSource(mainAvgC),
-    priceType: useClPrice ? 'CL' : 'general',
-  };
-  const mainAvgPv = mainSlots.reduce((s,x)=>s+pvAt30min(pvByHour,parseInt(x.key)),0)/4;
-  console.log(`[主热水器] ${mainWin.startKey}–${mainWin.endKey} avgPV=${mainAvgPv.toFixed(1)}kW avg${useClPrice?'CL':''}Price=${mainAvgC.toFixed(2)}¢`);
 
   return { main: mainWin, gf: gfWin };
 }
