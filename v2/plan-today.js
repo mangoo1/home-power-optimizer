@@ -756,7 +756,9 @@ function savePlan(db, today, plan, meta) {
         hardwareTasks.push({ device: 'gf_hw', action: 'on',  time: meta.gfWin.startKey });
         hardwareTasks.push({ device: 'gf_hw', action: 'off', time: meta.gfWin.endKey });
       }
-      return JSON.stringify({ buyThreshold: meta.buyThreshold, sellMinC: meta.sellMinC, calibFactor: meta.calibFactor, gridChargeTarget: Math.round(meta.gridChargeTarget * 100), overnightSocPct, hardwareTasks });
+      // 如果当前计算没产生热水器窗口（时间已过），保留之前的 tasks
+      const finalTasks = hardwareTasks.length > 0 ? hardwareTasks : (meta.prevHardwareTasks ?? []);
+      return JSON.stringify({ buyThreshold: meta.buyThreshold, sellMinC: meta.sellMinC, calibFactor: meta.calibFactor, gridChargeTarget: Math.round(meta.gridChargeTarget * 100), overnightSocPct, hardwareTasks: finalTasks });
     })(),
     parseFloat(meta.buyThreshold.toFixed(2)),
     meta.sellMinC,
@@ -1071,7 +1073,7 @@ async function main() {
   console.log('\n[过夜检阅] ' + overnightLine);
 
   // 7. 存 DB
-  const prevPlan = db.prepare("SELECT charge_windows_json, intervals_json FROM daily_plan WHERE date=? AND is_active=1").get(today);
+  const prevPlan = db.prepare("SELECT charge_windows_json, intervals_json, notes FROM daily_plan WHERE date=? AND is_active=1").get(today);
   const prevChargeSlots = prevPlan ? JSON.parse(prevPlan.intervals_json ?? '[]').filter(s=>s.action==='charge').map(s=>s.key).join(',') : '';
   const prevSellSlots   = prevPlan ? JSON.parse(prevPlan.intervals_json ?? '[]').filter(s=>s.action==='sell').map(s=>s.key).join(',') : '';
 
@@ -1079,6 +1081,7 @@ async function main() {
     currentSocPct, hasDW, pvForecastKwh, pvPeakKw, calibFactor: PV_SCALE,
     gridChargeTarget,
     buyThreshold, chargeTargetBy, sellMinC, mainWin, gfWin, avgNightKwh,
+    prevHardwareTasks: prevPlan?.notes ? (() => { try { return JSON.parse(prevPlan.notes).hardwareTasks; } catch { return null; } })() : null,
   });
   db.close();
 
