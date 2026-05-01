@@ -1111,7 +1111,7 @@ async function main() {
       SELECT SUM(buy_cost_c) as totalCost, SUM(buy_kwh) as totalKwh FROM cost_log
       WHERE DATE(ts, 'localtime') = DATE('now', 'localtime') AND buy_kwh > 0
     `).get();
-    if (costRow?.totalKwh > 0.5) {
+    if (costRow?.totalKwh > 1.0) {
       estimatedBuyCost = costRow.totalCost / costRow.totalKwh;
     }
   } catch {}
@@ -1167,7 +1167,7 @@ async function main() {
       WHERE DATE(ts, 'localtime') = DATE('now', 'localtime')
         AND buy_kwh > 0
     `).get();
-    if (costRow?.totalKwh > 0.1) {
+    if (costRow?.totalKwh > 1.0) {
       realAvgBuyC = parseFloat((costRow.totalCost / costRow.totalKwh).toFixed(2));
       console.log(`[买入均价] 今日加权实际 ${realAvgBuyC}¢（${costRow.totalKwh.toFixed(1)}kWh），dry-run估算 ${dryAvgBuyC.toFixed(2)}¢`);
     } else {
