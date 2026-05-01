@@ -1171,17 +1171,18 @@ async function main() {
       realAvgBuyC = parseFloat((costRow.totalCost / costRow.totalKwh).toFixed(2));
       console.log(`[买入均价] 今日加权实际 ${realAvgBuyC}¢（${costRow.totalKwh.toFixed(1)}kWh），dry-run估算 ${dryAvgBuyC.toFixed(2)}¢`);
     } else {
-      // 回退到 energy_log 简单均价
+      // 回退到 energy_log 加权均价（按 meter_buy_delta 加权）
       const actualRow = db.prepare(`
-        SELECT AVG(buy_price) as avg FROM energy_log
+        SELECT SUM(buy_price * meter_buy_delta) as weightedCost, SUM(meter_buy_delta) as totalKwh FROM energy_log
         WHERE DATE(ts, 'localtime') = DATE('now', 'localtime')
           AND buy_price > 0 AND buy_price < ${BUY_MAX_C}
+          AND meter_buy_delta > 0
       `).get();
-      if (actualRow?.avg != null && actualRow.avg > 0) {
-        realAvgBuyC = parseFloat(actualRow.avg.toFixed(2));
-        console.log(`[买入均价] 今日实际 ${realAvgBuyC}¢（energy_log），dry-run估算 ${dryAvgBuyC.toFixed(2)}¢`);
+      if (actualRow?.totalKwh > 1.0) {
+        realAvgBuyC = parseFloat((actualRow.weightedCost / actualRow.totalKwh).toFixed(2));
+        console.log(`[买入均价] 今日加权实际 ${realAvgBuyC}¢（${actualRow.totalKwh.toFixed(1)}kWh, energy_log），dry-run估算 ${dryAvgBuyC.toFixed(2)}¢`);
       } else {
-        console.log(`[买入均价] 无历史数据，用dry-run估算 ${realAvgBuyC.toFixed(2)}¢`);
+        console.log(`[买入均价] 数据不足（${(actualRow?.totalKwh??0).toFixed(1)}kWh），用dry-run估算 ${realAvgBuyC.toFixed(2)}¢`);
       }
     }
   } catch { console.log(`[买入均价] ${realAvgBuyC.toFixed(2)}¢`); }
