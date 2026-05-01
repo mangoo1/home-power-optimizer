@@ -279,40 +279,15 @@ async function emergencyStop(reason) {
 const calcSafeChargeKw = essApi.calcSafeChargeKw;
 
 // ── 动态充电中止判断 ─────────────────────────────────────────
-// 原则：电池是蓄水池，只蓄便宜电。"便宜"是相对的，不是绝对的。
-// 判断逻辑：
-// 1. 如果 SOC 低且今天剩余时间不多 → 不 abort（必须充电过夜）
-// 2. 如果后面还有更便宜的时段且时间充裕 → abort 等便宜的
-// 3. 如果当前价格是今天剩余里最便宜的一批 → 不 abort
+// 原则：计划说充就充。只有极端高价才 abort。
+// 电池是蓄水池，过滤高价电——但"高价"用绝对上限保护，不用相对判断。
+// plan-today 已经做了价格优化选槽，executor 信任计划。
 function shouldAbortCharge(realBuyPrice, buyThreshold, ess, planRow, amber) {
-  const soc = ess.soc ?? 50;
-  const now = new Date();
-  const sydHour = new Date(now.getTime() + 10*3600*1000).getUTCHours(); // approx Sydney hour
+  // 绝对上限保护：超过 BUY_MAX_C（默认25¢）才 abort
+  const BUY_MAX_C = parseFloat(process.env.BUY_MAX_C || '25');
+  if (realBuyPrice >= BUY_MAX_C) return true;
 
-  // 过夜底线：如果 SOC 不够过夜（<75%且已过中午），绝不 abort
-  if (soc < 75 && sydHour >= 12) return false;
-
-  // 如果实际电价在计划阈值 +4¢ 以上，无论如何 abort（异常高价保护）
-  if (realBuyPrice > buyThreshold + 4) return true;
-
-  // 看计划里剩余充电槽的价格，如果后面有明显更便宜的（>2¢差距）且时间充裕，可以等
-  try {
-    const intervals = planRow ? JSON.parse(planRow.intervals_json) : [];
-    const futureChargeSlots = intervals.filter(s => {
-      const [h] = (s.key || '').split(':').map(Number);
-      return s.action === 'charge' && h > sydHour;
-    });
-    if (futureChargeSlots.length >= 4) {
-      // 后面还有 ≥2 小时充电时段
-      const futureAvg = futureChargeSlots.reduce((sum, s) => sum + (s.buyC || 99), 0) / futureChargeSlots.length;
-      if (realBuyPrice > futureAvg + 2) {
-        // 当前比后面贵 2¢ 以上，且 SOC 不紧急，等一等
-        return true;
-      }
-    }
-  } catch {}
-
-  // 默认：不 abort，充就充
+  // 其他情况：信任计划，不 abort
   return false;
 }
 

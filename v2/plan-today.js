@@ -473,6 +473,13 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5, nightReser
       const hwNote = hwKeys.has(s.key) ? ' +HW↓' : '';
       reason   = `buy=${s.buyC}¢ grid-charge${hwNote}`;
 
+    } else if (socKwh < gridTargetKwh && h < gridChargeEndHour && !s.dw && maxChargeKw >= 0.5 && s.buyC < BUY_MAX_C) {
+      // 兜底充电：SOC 未达标 + 截止前 + 非DW + 价格可接受 → 也充
+      // 防止选槽不足时后面全是 self-use 导致电池放空
+      action   = 'charge';
+      chargeKw = maxChargeKw;
+      reason   = `buy=${s.buyC}¢ fallback-charge (SOC ${Math.round(socKwh/BATT_KWH*100)}% < target)`;
+
     } else if (hasPv && battCanAbsorb && maxChargeKw >= 0.3) {
       // PV 时段（有阳光）且电池未满（<93%）：充电消纳PV
       // 关键约束：充电功率不超过 PV 出力（不让电网替PV付钱）
