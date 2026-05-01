@@ -293,7 +293,7 @@ function homeLoadKw(hour) {
 
 // ── Step 5: 生成半小时充放电计划 ─────────────────────────────
 function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5, nightReserveKwh = null, hwWindow = null, gridChargeTarget = SOC_TARGET) {
-  const targetKwh  = SOC_TARGET * BATT_KWH;               // 目标 kWh（85%）
+  const targetKwh  = gridChargeTarget * BATT_KWH;           // 动态目标 kWh
   const currentKwh = currentSoc / 100 * BATT_KWH;
 
   // 热水器运行时段 set（key格式 "HH:MM"）
@@ -1087,14 +1087,15 @@ async function main() {
   const pvByHour = getPvForecast(db, today);
   const pvForecastKwh = Math.min(MAX_DAILY_KWH, Object.values(pvByHour).reduce((s, v) => s + v, 0));
   const pvPeakKw = Math.max(...Object.values(pvByHour), 0);
-  // 充电目标：看剩余PV（从现在到日落），不够就直接充到93%
+  // 充电目标：基础 65%（过夜够用）+ 如果卖电有利可图则扩展
   const PV_SUFFICIENT_KWH = parseFloat(process.env.PV_SUFFICIENT_KWH || '5');
   const nowHour = parseInt(syd.hh);
   const pvRemaining = Object.entries(pvByHour)
     .filter(([h]) => parseInt(h) >= nowHour)
     .reduce((s, [, v]) => s + v, 0);
-  const gridChargeTarget = pvRemaining >= PV_SUFFICIENT_KWH ? SOC_TARGET : SOC_PV_LIMIT;
-  console.log(`[PV预测] 今日预计: ${pvForecastKwh.toFixed(1)}kWh, 剩余: ${pvRemaining.toFixed(1)}kWh → 充电目标 ${Math.round(gridChargeTarget*100)}%`);
+
+  // 先用基础目标 65%
+  let gridChargeTarget = SOC_TARGET; // 65%
 
   // 4. Amber 价格预测
   console.log('\n[Amber] 拉取价格预测...');
@@ -1102,6 +1103,48 @@ async function main() {
   const slots    = aggregateAmberTo30min(rawAmber, today);
   const hasDW    = slots.some(s => s.dw);
   console.log(`[Amber] ${slots.length} 个半小时槽, DW: ${hasDW}`);
+
+  // 买入成本：优先用今天实际加权均价（cost_log），否则用预测便宜时段均价
+  let estimatedBuyCost;
+  try {
+    const costRow = db.prepare(`
+      SELECT SUM(buy_cost_c) as totalCost, SUM(buy_kwh) as totalKwh FROM cost_log
+      WHERE DATE(ts, 'localtime') = DATE('now', 'localtime') AND buy_kwh > 0
+    `).get();
+    if (costRow?.totalKwh > 0.5) {
+      estimatedBuyCost = costRow.totalCost / costRow.totalKwh;
+    }
+  } catch {}
+  if (!estimatedBuyCost) {
+    const cheapSlots = slots.filter(s => {
+      const h = parseInt(s.key.split(':')[0]);
+      return h >= 8 && h < 15 && !s.dw && s.buyC > 0;
+    });
+    estimatedBuyCost = cheapSlots.length > 0
+      ? cheapSlots.reduce((sum, s) => sum + s.buyC, 0) / cheapSlots.length
+      : 99;
+  }
+
+  // 看晚间卖电是否有利可图
+  const eveningSlots = slots.filter(s => {
+    const h = parseInt(s.key.split(':')[0]);
+    return h >= 16 && h < 21 && !s.dw && s.feedInC > 0;
+  });
+  const profitableSlots = eveningSlots.filter(s => s.feedInC > estimatedBuyCost + SELL_MIN_MARGIN_C);
+
+  if (profitableSlots.length > 0) {
+    const sellableHours = profitableSlots.length * 0.5;
+    const extraKwh = sellableHours * MAX_SELL_KW;
+    gridChargeTarget = Math.min(0.90, SOC_TARGET + extraKwh / BATT_KWH);
+    const avgFeedIn = profitableSlots.reduce((sum, s) => sum + s.feedInC, 0) / profitableSlots.length;
+    const profit = avgFeedIn - estimatedBuyCost;
+    console.log(`[充电目标] 卖电有利: ${profitableSlots.length}槽 feedIn均价=${avgFeedIn.toFixed(1)}¢ > 买入=${estimatedBuyCost.toFixed(1)}¢+${SELL_MIN_MARGIN_C}¢, 净利=${profit.toFixed(1)}¢/kWh`);
+    console.log(`[充电目标] 扩展到 ${Math.round(gridChargeTarget*100)}%（多充 ${extraKwh.toFixed(1)}kWh 用于卖电）`);
+  } else {
+    console.log(`[充电目标] 卖电无利: 无 feedIn > 买入${estimatedBuyCost.toFixed(1)}¢+${SELL_MIN_MARGIN_C}¢ 的时段, 目标 ${Math.round(gridChargeTarget*100)}%（仅过夜）`);
+  }
+
+  console.log(`[PV预测] 今日预计: ${pvForecastKwh.toFixed(1)}kWh, 剩余: ${pvRemaining.toFixed(1)}kWh → 充电目标 ${Math.round(gridChargeTarget*100)}%`);
 
   // 5a. 热水器计划（先算，buildPlan 需要知道热水器时段）
     const { main: mainWin, gf: gfWin } = calcHotWaterWindows(slots, pvByHour);
