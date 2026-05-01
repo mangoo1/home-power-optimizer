@@ -414,6 +414,38 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5, nightReser
 
   console.log(`\n[电网充电] 选中 ${chargeKeys.size} 槽 (${firstChargeKey ?? '-'}–${lastChargeKey ?? '-'}) | 最贵: ${buyThreshold.toFixed(1)}¢ | 卖电门槛: ${sellMinC.toFixed(1)}¢`);
 
+  // ── Phase 2b: 预选卖电槽（按 feedIn 从高到低，限制可卖总量）──
+  // 可卖电量 = 预计峰值 SOC - 过夜保底
+  const peakSocKwh = Math.min(BATT_KWH, gridTargetKwh); // 充满后的峰值
+  const overnightReserveKwh = nightReserveKwh
+    ? Math.max(SOC_SELL_FLOOR * BATT_KWH, nightReserveKwh * 1.2)
+    : SOC_SELL_FLOOR * BATT_KWH;
+  const maxSellableKwh = Math.max(0, peakSocKwh - overnightReserveKwh);
+  
+  // 候选卖电槽：下午16点后，无DW，feedIn >= 门槛
+  const sellCandidates = slots
+    .filter(s => {
+      const h = parseInt(s.key.split(':')[0]);
+      return h >= 16 && !s.dw && s.feedInC >= sellMinC;
+    })
+    .sort((a, b) => b.feedInC - a.feedInC); // 从最贵到最便宜
+  
+  const sellKeys = new Set();
+  let sellAccumulated = 0;
+  for (const s of sellCandidates) {
+    if (sellAccumulated >= maxSellableKwh) break;
+    sellKeys.add(s.key);
+    sellAccumulated += MAX_SELL_KW * 0.5; // 每槽最多卖 MAX_SELL_KW * 0.5h
+  }
+  
+  if (sellKeys.size > 0) {
+    const sortedSellKeys = [...sellKeys].sort();
+    const sellPrices = sellCandidates.filter(s => sellKeys.has(s.key)).map(s => s.feedInC);
+    console.log(`[卖电] 预选 ${sellKeys.size} 槽 (${sortedSellKeys[0]}–${sortedSellKeys[sortedSellKeys.length-1]}) | feedIn ${Math.min(...sellPrices).toFixed(1)}–${Math.max(...sellPrices).toFixed(1)}¢ | 可卖 ${maxSellableKwh.toFixed(1)}kWh, 计划卖 ${sellAccumulated.toFixed(1)}kWh | 过夜保底 ${overnightReserveKwh.toFixed(1)}kWh`);
+  } else {
+    console.log(`[卖电] 无符合条件的卖电槽（门槛 ${sellMinC.toFixed(1)}¢，可卖 ${maxSellableKwh.toFixed(1)}kWh）`);
+  }
+
   // ── Phase 3: 顺序扫描生成完整计划（含卖电）──────────────────
   let socKwh = currentKwh;
   const plan = [];
@@ -498,8 +530,8 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5, nightReser
         chargeKw = 0;
       }
 
-    } else if (!hasPv && s.feedInC >= sellMinC && maxSellKw >= 0.5 && h >= 16) {
-      // 晚间卖电：PV已落山（无PV出力），电价够高，有足够SOC
+    } else if (!hasPv && sellKeys.has(s.key) && maxSellKw >= 0.5 && h >= 16) {
+      // 晚间卖电：已预选的卖电槽，按 feedIn 从高到低选出，限制了总量
       action = 'sell';
       sellKw = maxSellKw;
       reason = `feedIn=${s.feedInC}¢ ≥ ${sellMinC.toFixed(1)}¢`;
