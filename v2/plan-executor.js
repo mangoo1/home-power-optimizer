@@ -199,7 +199,8 @@ async function readEss() {
 // ── Amber API ─────────────────────────────────────────────────
 async function readAmber() {
   try {
-    const url = `https://api.amber.com.au/v1/sites/${AMBER_SITE_ID}/prices/current?next=3`;
+    // 拿当前 + 今天剩余所有时段的预测（next=48 覆盖24h）
+    const url = `https://api.amber.com.au/v1/sites/${AMBER_SITE_ID}/prices/current?next=48`;
     const raw = await httpsGet(url, { Authorization:`Bearer ${AMBER_TOKEN}` });
     if (!Array.isArray(raw)) return null;
 
@@ -207,6 +208,10 @@ async function readAmber() {
     let clPrice = null, clDescriptor = null, clTariffPeriod = null;
     let demandWindow = false, nemTime = null, descriptor = null, tariffPeriod = null;
     let renewables = null, nextDemandMin = null;
+
+    // 收集今天剩余时段的买价预测（用于相对判断）
+    const futureBuyPrices = [];
+    const todayDate = new Date(Date.now() + 10*3600*1000).toISOString().slice(0,10);
 
     for (const p of raw) {
       if (p.type === 'CurrentInterval') {
@@ -226,6 +231,13 @@ async function readAmber() {
           clTariffPeriod = p.tariffInformation?.period ?? null;
         }
       }
+      // 收集今天的 general 预测价格
+      if ((p.type === 'CurrentInterval' || p.type === 'ForecastInterval') && p.channelType === 'general') {
+        const pDate = p.startTime ? new Date(new Date(p.startTime).getTime() + 10*3600*1000).toISOString().slice(0,10) : null;
+        if (pDate === todayDate && p.perKwh != null) {
+          futureBuyPrices.push(p.perKwh);
+        }
+      }
       // 找最近的 DW 开始时间
       if (p.type === 'ForecastInterval' && p.tariffInformation?.demandWindow && nextDemandMin === null) {
         const diffMs = new Date(p.startTime) - Date.now();
@@ -237,6 +249,7 @@ async function readAmber() {
       clPrice, clDescriptor, clTariffPeriod,
       demandWindow, nemTime, descriptor, tariffPeriod,
       renewables, nextDemandMin,
+      futureBuyPrices, // 今天剩余时段的买价列表
     };
   } catch { return null; }
 }
@@ -278,17 +291,63 @@ async function emergencyStop(reason) {
 // ── 计算动态充电功率（不超断路器）────────────────────────────
 const calcSafeChargeKw = essApi.calcSafeChargeKw;
 
-// ── 动态充电中止判断 ─────────────────────────────────────────
-// 原则：计划说充就充。只有极端高价才 abort。
-// 电池是蓄水池，过滤高价电——但"高价"用绝对上限保护，不用相对判断。
-// plan-today 已经做了价格优化选槽，executor 信任计划。
+// ── 动态充电中止判断（相对电价逻辑）───────────────────────────
+// 原则：电池是蓄水池，只在"今天相对便宜"的时段充电。
+// "便宜"不用绝对值，而是看：当前价格在今天剩余时段里排第几？
+//
+// 逻辑：
+// 1. 拿到今天剩余所有时段的实时/预测价格，排序
+// 2. 计算充到目标需要几个槽（neededSlots）
+// 3. 当前价格 ≤ 第 neededSlots 便宜的价格 → 充（属于最便宜的那批）
+// 4. 当前价格 > 第 neededSlots 便宜的价格 → 等更便宜的
+// 5. 但如果：剩余时间 ≤ neededSlots → 不管价格，必须充（时间不够挑了）
+//
 function shouldAbortCharge(realBuyPrice, buyThreshold, ess, planRow, amber) {
-  // 绝对上限保护：超过 BUY_MAX_C（默认25¢）才 abort
   const BUY_MAX_C = parseFloat(process.env.BUY_MAX_C || '25');
+  // 极端高价保护
   if (realBuyPrice >= BUY_MAX_C) return true;
 
-  // 其他情况：信任计划，不 abort
-  return false;
+  const soc = ess.soc ?? 50;
+  const BATT_KWH = 42;
+  const MAX_CHARGE_KW = 5;
+  const chargeTargetPct = JSON.parse(planRow?.notes ?? '{}').gridChargeTarget ?? 65;
+  const targetKwh = chargeTargetPct / 100 * BATT_KWH;
+  const currentKwh = soc / 100 * BATT_KWH;
+  const neededKwh = Math.max(0, targetKwh - currentKwh);
+
+  // 已达目标，不需要充
+  if (neededKwh <= 0) return false; // 不 abort（让上层的 SOC>=target 逻辑处理）
+
+  // 计算需要几个半小时槽才能充到目标
+  const kwhPerSlot = MAX_CHARGE_KW * 0.5 * 0.95; // ~2.375kWh/slot
+  const neededSlots = Math.ceil(neededKwh / kwhPerSlot);
+
+  // 从 Amber 拿今天剩余时段的价格
+  const futurePrices = amber?.futureBuyPrices ?? [];
+
+  if (futurePrices.length === 0) {
+    // 没有预测数据，信任计划不 abort
+    return false;
+  }
+
+  // 剩余时段不够选 → 必须充，不挑了
+  if (futurePrices.length <= neededSlots) {
+    return false;
+  }
+
+  // 排序，取第 neededSlots 便宜的价格作为门槛
+  const sorted = [...futurePrices].sort((a, b) => a - b);
+  const cutoffPrice = sorted[Math.min(neededSlots - 1, sorted.length - 1)];
+
+  // 当前价格在最便宜的 N 个之内 → 充
+  // 加 1¢ 容差（预测可能有小偏差）
+  if (realBuyPrice <= cutoffPrice + 1) {
+    return false; // 不 abort，充
+  }
+
+  // 当前价格太贵，等更便宜的
+  console.log(`[充电判断] ${realBuyPrice.toFixed(1)}¢ > 门槛${cutoffPrice.toFixed(1)}¢+1（需${neededSlots}槽/${futurePrices.length}剩余），等便宜时段`);
+  return true;
 }
 
 // ── 记录数据到 energy_log ─────────────────────────────────────
@@ -688,11 +747,11 @@ async function main() {
         action = 'charge-done';
       }
     } else if (realBuyPrice != null && shouldAbortCharge(realBuyPrice, buyThreshold, ess, planRow, amber)) {
-      // 动态判断：当前价格相对今天剩余时段是否太贵
-      console.log(`[充电] 实际电价 ${realBuyPrice.toFixed(1)}¢ 太贵，停止充电切 self-use`);
-      await switchToSelfUse(`charge-abort: realBuy=${realBuyPrice.toFixed(1)}c`);
-      logData(db, ess, amber, slot, 'charge-abort-price', { buyPrice: realBuyPrice, threshold: buyThreshold });
-      action = 'charge-abort';
+      // 动态判断：当前价格相对今天剩余时段太贵
+      console.log(`[充电] 实际电价 ${realBuyPrice.toFixed(1)}¢ 相对太贵，等更便宜时段`);
+      await switchToSelfUse(`charge-skip: realBuy=${realBuyPrice.toFixed(1)}c relative-expensive`);
+      logData(db, ess, amber, slot, 'charge-skip-price', { buyPrice: realBuyPrice, threshold: buyThreshold });
+      action = 'charge-skip';
     } else {
       // 电价合理，正常充电
       if (ess.reportedMode !== 1) {
