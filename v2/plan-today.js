@@ -534,7 +534,7 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5, nightReser
 
 // ── 21:00 过夜电量检阅 ────────────────────────────────────────
 function calcAvgNightKwh(db) {
-  // 过去7天 21:00–次日07:00 实际用电均值
+  // 过去7天 21:00–次日10:00 实际用电均值（电池要供到次日便宜时段开始）
   try {
     const cutoff = new Date(Date.now() - 8*86400*1000).toISOString();
     const nightRows = db.prepare(
@@ -545,7 +545,7 @@ function calcAvgNightKwh(db) {
       const d = new Date(r.ts);
       const sydHour = (d.getUTCHours() + 11) % 24;
       const sydDate = new Date(d.getTime() + 11*3600*1000).toISOString().slice(0,10);
-      if (sydHour >= 21 || sydHour < 7) {
+      if (sydHour >= 21 || sydHour < 10) {
         nightByDay[sydDate] = (nightByDay[sydDate] || 0) + r.home_load * (5/60);
       }
     }
