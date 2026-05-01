@@ -418,7 +418,7 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5, nightReser
   // 可卖电量 = 预计峰值 SOC - 过夜保底
   const peakSocKwh = Math.min(BATT_KWH, gridTargetKwh); // 充满后的峰值
   const overnightReserveKwh = nightReserveKwh
-    ? Math.max(SOC_SELL_FLOOR * BATT_KWH, nightReserveKwh * 1.2)
+    ? Math.max(SOC_SELL_FLOOR * BATT_KWH, nightReserveKwh * 1.3 + 3) // 30% buffer + 3kWh safety
     : SOC_SELL_FLOOR * BATT_KWH;
   const maxSellableKwh = Math.max(0, peakSocKwh - overnightReserveKwh);
   
@@ -433,9 +433,10 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5, nightReser
   const sellKeys = new Set();
   let sellAccumulated = 0;
   for (const s of sellCandidates) {
-    if (sellAccumulated >= maxSellableKwh) break;
+    const slotKwh = MAX_SELL_KW * 0.5;
+    if (sellAccumulated + slotKwh > maxSellableKwh) break; // 严格不超
     sellKeys.add(s.key);
-    sellAccumulated += MAX_SELL_KW * 0.5; // 每槽最多卖 MAX_SELL_KW * 0.5h
+    sellAccumulated += slotKwh;
   }
   
   if (sellKeys.size > 0) {
