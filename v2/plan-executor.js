@@ -746,10 +746,10 @@ async function main() {
         console.log(`[充电] SOC ${ess.soc}% ≥ ${chargeTargetPct}%，无PV，切self-use`);
         action = 'charge-done';
       }
-    } else if (realBuyPrice != null && shouldAbortCharge(realBuyPrice, buyThreshold, ess, planRow, amber)) {
-      // 动态判断：当前价格相对今天剩余时段太贵
-      console.log(`[充电] 实际电价 ${realBuyPrice.toFixed(1)}¢ 相对太贵，等更便宜时段`);
-      await switchToSelfUse(`charge-skip: realBuy=${realBuyPrice.toFixed(1)}c relative-expensive`);
+    } else if (realBuyPrice != null && realBuyPrice > 25) {
+      // 极端高价（>25¢）才 abort 充电——信任计划，不自作主张跳过
+      console.log(`[充电] 实际电价 ${realBuyPrice.toFixed(1)}¢ 极端高价（>25¢），暂停充电`);
+      await switchToSelfUse(`charge-skip: realBuy=${realBuyPrice.toFixed(1)}c extreme-price`);
       logData(db, ess, amber, slot, 'charge-skip-price', { buyPrice: realBuyPrice, threshold: buyThreshold });
       action = 'charge-skip';
     } else {
