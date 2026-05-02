@@ -726,24 +726,16 @@ async function main() {
     const chargeTargetPct = planNotes.gridChargeTarget ?? parseFloat(process.env.CHARGE_TARGET_PCT || '85');
 
     if (ess.soc !== null && ess.soc >= chargeTargetPct) {
-      // SOC 已达 85%：不再从电网充，降到刚好消纳 PV 的功率
-      // chargeKw = max(0, pvPower - homeLoad)，让 PV 全部被电池吸收，不卖出
+      // SOC 已达目标：只消纳 PV，不从电网充电
       const pvAbsorb = parseFloat(Math.max(0, (pvPower ?? 0) - (homeLoad ?? 0.6)).toFixed(2));
-      // 85%以后：有PV时消纳PV，无PV时小功率慢充（2kW），直到达到最终目标
-      const TRICKLE_KW = parseFloat(process.env.TRICKLE_CHARGE_KW || '2.0');
-      const trickleKw = Math.min(TRICKLE_KW, calcSafeChargeKw(homeLoad, pvPower, ess.gridPower, ess.battPower));
       if (pvAbsorb >= 0.2) {
         await updateChargeKw(pvAbsorb, `pv-absorb: soc=${ess.soc}% pv=${pvPower}kW home=${homeLoad}kW`);
         console.log(`[充电] SOC ${ess.soc}% ≥ ${chargeTargetPct}%，PV消纳 ${pvAbsorb}kW`);
         action = 'charge-pv-only';
-      } else if (trickleKw >= 0.2) {
-        await updateChargeKw(trickleKw, `trickle: soc=${ess.soc}% target=${chargeTargetPct}%`);
-        console.log(`[充电] SOC ${ess.soc}% ≥ ${chargeTargetPct}%，无PV，慢充 ${trickleKw}kW`);
-        action = 'charge-trickle';
       } else {
-        // PV 不足以消纳（阴天或夜间），切 self-use
-        await switchToSelfUse(`charge-done-no-pv: soc=${ess.soc}%`);
-        console.log(`[充电] SOC ${ess.soc}% ≥ ${chargeTargetPct}%，无PV，切self-use`);
+        // 无 PV 可消纳 + SOC 已达标 → 切 self-use，不花钱充电
+        await switchToSelfUse(`charge-done: soc=${ess.soc}% >= target=${chargeTargetPct}%`);
+        console.log(`[充电] SOC ${ess.soc}% ≥ ${chargeTargetPct}%，已达标，切self-use`);
         action = 'charge-done';
       }
     } else if (realBuyPrice != null && realBuyPrice > 25) {
