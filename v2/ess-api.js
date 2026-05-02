@@ -156,15 +156,18 @@ async function emergencyStop(reason = 'emergency', caller = 'unknown') {
 
 /** 动态计算安全充电功率（不超断路器） */
 function calcSafeChargeKw(homeLoad, pvPower, gridPower, battPower) {
-  // gridPower 包含当前充电功率，需要先扣除才能算真实余量
-  // battPower > 0 表示电池正在充电，这部分已计入 gridPower
-  // 基础负载 = gridPower - 当前充电功率（即不充电时电网需要供多少）
+  // gridPower: 负值=从电网买入, 正值=卖电
+  // battPower: 正值=充电, 负值=放电
+  // 基础负载 = |gridPower| - 当前充电功率（不充电时电网需供多少）
   const currentCharge = (battPower != null && battPower > 0) ? battPower : 0;
+  const gridImport = gridPower != null ? Math.abs(gridPower) : null;
   let headroom;
-  if (gridPower != null && gridPower > 0) {
-    const baseGridLoad = gridPower - currentCharge;
-    headroom = BREAKER_KW - BREAKER_BUFFER - Math.max(0, baseGridLoad);
+  if (gridImport != null && gridPower < 0) {
+    // 电网在买入（负值），扣除当前充电得到基础负载
+    const baseGridLoad = Math.max(0, gridImport - currentCharge);
+    headroom = BREAKER_KW - BREAKER_BUFFER - baseGridLoad;
   } else {
+    // 电网在卖电或无数据，用 homeLoad - pvPower 估算
     const net = (homeLoad ?? 0) - (pvPower ?? 0);
     headroom = BREAKER_KW - BREAKER_BUFFER - Math.max(0, net);
   }
