@@ -155,13 +155,15 @@ async function emergencyStop(reason = 'emergency', caller = 'unknown') {
 }
 
 /** 动态计算安全充电功率（不超断路器） */
-function calcSafeChargeKw(homeLoad, pvPower, gridPower) {
-  // 优先用实际电网进口功率计算余量（更准确）
-  // gridPower = 电表实时进口，正=买电，直接反映断路器负荷
-  // 如果没有 gridPower，退而用 homeLoad - pvPower 估算
+function calcSafeChargeKw(homeLoad, pvPower, gridPower, battPower) {
+  // gridPower 包含当前充电功率，需要先扣除才能算真实余量
+  // battPower > 0 表示电池正在充电，这部分已计入 gridPower
+  // 基础负载 = gridPower - 当前充电功率（即不充电时电网需要供多少）
+  const currentCharge = (battPower != null && battPower > 0) ? battPower : 0;
   let headroom;
   if (gridPower != null && gridPower > 0) {
-    headroom = BREAKER_KW - BREAKER_BUFFER - gridPower;
+    const baseGridLoad = gridPower - currentCharge;
+    headroom = BREAKER_KW - BREAKER_BUFFER - Math.max(0, baseGridLoad);
   } else {
     const net = (homeLoad ?? 0) - (pvPower ?? 0);
     headroom = BREAKER_KW - BREAKER_BUFFER - Math.max(0, net);
