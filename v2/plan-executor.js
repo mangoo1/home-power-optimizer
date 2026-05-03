@@ -607,6 +607,55 @@ async function handleHotWaterWindow(planRow, db, syd) {
 async function handleGfHotWater(db, syd) {
   const nowMins = syd.hh * 60 + syd.mi;
   const today = syd.date;
+  const MAX_GF_MINS = 150; // 最大运行2.5小时
+
+  // ── 兜底保护：GF热水器超时强制关闭 ──
+  const gfOpenRow = db.prepare("SELECT value FROM kv_store WHERE key=?").get(`hw_gf:${today}:open_time`);
+  const gfOffDone = !!db.prepare("SELECT 1 FROM kv_store WHERE key LIKE ? AND key LIKE '%off%'")
+    .get(`hw_gf:${today}:%`);
+  if (gfOpenRow && !gfOffDone) {
+    const openMins = parseInt(gfOpenRow.value);
+    if (nowMins - openMins >= MAX_GF_MINS) {
+      console.warn(`[GF热水器] ⚠️ 已开 ${nowMins - openMins}min，超过最大 ${MAX_GF_MINS}min，强制关闭`);
+      const ok = await tuyaControl(HW_GF_ID, false);
+      if (ok) {
+        logHwAction(db, HW_GF_ID, 'GF热水器', false, { triggeredBy: 'executor-timeout' });
+        await sendAlert(`⚠️ GF热水器已超时自动关闭（开了${Math.round((nowMins-openMins)/60*10)/10}h）`);
+      } else {
+        await sendAlert(`🚨 GF热水器超时关闭失败！已开 ${nowMins - openMins}min，请手动关闭！`);
+      }
+      // 无论成功与否都标记，避免每5分钟重复告警（但下面的状态回查会继续重试）
+    }
+  }
+
+  // ── 状态回查：每次 executor 跑都检查 GF 热水器是否该关但还开着 ──
+  const lastOffTask = db.prepare(
+    "SELECT value FROM kv_store WHERE key LIKE ? AND key LIKE '%:off'"
+  ).get(`hw_gf:${today}:%`);
+  if (lastOffTask) {
+    // 已经执行过关闭任务，验证设备实际状态
+    try {
+      const { execSync } = require('child_process');
+      const statusRaw = execSync(
+        `npx mcporter call tuya tuya_get_device_status ${HW_GF_ID}`,
+        { cwd: HW_TUYA_CWD, timeout: 15000, encoding: 'utf8' }
+      );
+      const s = JSON.parse(statusRaw);
+      if (s?.data?.switch === true) {
+        console.warn(`[GF热水器] ⚠️ 状态回查：应该关但实际还开着！重新关闭...`);
+        const ok = await tuyaControl(HW_GF_ID, false);
+        if (ok) {
+          console.log(`[GF热水器] 状态回查关闭成功 ✅`);
+          await sendAlert(`⚠️ GF热水器状态回查：发现未关，已重新关闭`);
+        } else {
+          console.error(`[GF热水器] 状态回查关闭失败 ❌`);
+          await sendAlert(`🚨 GF热水器状态回查关闭失败！请手动关闭！`);
+        }
+      }
+    } catch (e) {
+      console.warn(`[GF热水器] 状态回查异常: ${e.message}`);
+    }
+  }
 
   // 读 plan-today 生成的 hardware_tasks（在 notes JSON 里）
   const planRow = db.prepare("SELECT notes FROM daily_plan WHERE date=? AND is_active=1 ORDER BY rowid DESC LIMIT 1").get(today);
@@ -631,7 +680,13 @@ async function handleGfHotWater(db, syd) {
         if (ok) {
           logHwAction(db, HW_GF_ID, 'GF热水器', isOn, { triggeredBy: 'executor', planWindow: task.time });
           db.prepare("INSERT OR REPLACE INTO kv_store (key,value) VALUES (?,?)").run(key, '1');
+          if (isOn) {
+            db.prepare("INSERT OR REPLACE INTO kv_store (key,value) VALUES (?,?)").run(`hw_gf:${today}:open_time`, String(nowMins));
+          }
           await sendAlert(`${isOn ? '🛁' : '🔴'} GF热水器已${isOn ? '开' : '关'}（${task.time}，plan-today 计划）`);
+        } else if (!isOn) {
+          // 关闭失败！不标记 key，下次 executor 跑时重试
+          await sendAlert(`🚨 GF热水器关闭失败（${task.time}），将在下次重试`);
         }
       }
     }

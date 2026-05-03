@@ -40,7 +40,8 @@ async function main() {
   const dailyRows = db.prepare(`SELECT * FROM daily_summary ORDER BY date DESC LIMIT 7`).all();
   const planRows  = db.prepare(`SELECT date, version, generated_at, source, soc_at_gen,
     has_demand_window, charge_cutoff_hour, pv_forecast_kwh, pv_peak_kw,
-    charge_windows_json, intervals_json, notes, is_active
+    charge_windows_json, intervals_json, notes, is_active,
+    buy_threshold_c, sell_min_c, hw_window_json, gf_window_json
     FROM daily_plan ORDER BY generated_at DESC LIMIT 14`).all();
   const reportRows = db.prepare(`SELECT * FROM daily_plan_report ORDER BY date DESC LIMIT 7`).all();
   db.close();
@@ -99,12 +100,15 @@ async function main() {
     const batch = planRows.map(r => ({
       sql: `INSERT OR REPLACE INTO daily_plan
         (date,version,generated_at,source,soc_at_gen,has_demand_window,charge_cutoff_hour,
-         pv_forecast_kwh,pv_peak_kw,charge_windows_json,intervals_json,notes,is_active)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+         pv_forecast_kwh,pv_peak_kw,charge_windows_json,intervals_json,notes,is_active,
+         buy_threshold_c,sell_min_c,hw_window_json,gf_window_json)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       args: [r.date, r.version, r.generated_at, r.source, r.soc_at_gen,
              r.has_demand_window||0, r.charge_cutoff_hour, r.pv_forecast_kwh,
              r.pv_peak_kw, r.charge_windows_json, r.intervals_json,
-             r.notes, r.is_active||0]
+             r.notes, r.is_active||0,
+             r.buy_threshold_c ?? null, r.sell_min_c ?? null,
+             r.hw_window_json ?? null, r.gf_window_json ?? null]
     }));
     await client.batch(batch, 'write');
   }
