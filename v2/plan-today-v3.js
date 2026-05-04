@@ -365,6 +365,134 @@ async function main() {
   const report = printPlan(plan, currentSocPct, today, chargeTargetPct, sellSlotCount);
   console.log(report);
 
+  // ── 写入 DB ─────────────────────────────────────────────────
+  // 确保表结构
+  try { db.prepare('ALTER TABLE daily_plan ADD COLUMN hw_window_json TEXT').run(); } catch {}
+  try { db.prepare('ALTER TABLE daily_plan ADD COLUMN gf_window_json TEXT').run(); } catch {}
+
+  db.prepare('UPDATE daily_plan SET is_active=0 WHERE date=? AND is_active=1').run(today);
+  const lastVer = db.prepare('SELECT MAX(version) as v FROM daily_plan WHERE date=?').get(today);
+  const version = (lastVer?.v ?? 0) + 1;
+
+  const chargeSlots = plan.filter(s => s.action === 'charge');
+  const chargeWindows = chargeSlots.length > 0 ? [{
+    startHour: parseInt(chargeSlots[0].key),
+    endHour:   parseInt(chargeSlots[chargeSlots.length-1].key) + 1,
+    avgBuyC:   parseFloat((chargeSlots.reduce((s,x)=>s+x.buyC,0)/chargeSlots.length).toFixed(1)),
+  }] : [];
+
+  const notes = JSON.stringify({
+    strategy: 'v3-sell',
+    overnightReservePct: OVERNIGHT_RESERVE_PCT,
+    sellSlotCount,
+    chargeTargetPct,
+  });
+
+  db.prepare(`
+    INSERT INTO daily_plan
+      (date, version, generated_at, source, created_by, soc_at_gen,
+       has_demand_window, charge_cutoff_hour,
+       pv_forecast_kwh, pv_peak_kw,
+       charge_windows_json, intervals_json, notes,
+       buy_threshold_c, sell_min_c, is_active)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)
+  `).run(
+    today, version, new Date().toISOString(), 'v3-sell', 'v2/plan-today-v3.js',
+    currentSocPct,
+    slots.some(s => s.dw) ? 1 : 0,
+    CHARGE_DEADLINE_HOUR,
+    parseFloat(pvTotal.toFixed(2)),
+    parseFloat(Math.max(...Object.values(pvByHour), 0).toFixed(2)),
+    JSON.stringify(chargeWindows),
+    JSON.stringify(plan),
+    notes,
+    chargeSlots.length > 0 ? parseFloat(Math.max(...chargeSlots.map(s=>s.buyC)).toFixed(2)) : 0,
+    SELL_MIN_FEEDIN_C,
+  );
+  console.log(`\n✅ 计划 v${version} 已存入 DB (source=v3-sell)`);
+
+  // ── 逆变器设置 ─────────────────────────────────────────────
+  const ESS_HEADERS = {
+    Authorization: ESS_TOKEN, lang: 'en', showloading: 'false',
+    Referer: 'https://eu.ess-link.com/appViews/appHome', 'User-Agent': 'Mozilla/5.0',
+  };
+  async function setParam(index, data) {
+    const r = await httpsPost('https://eu.ess-link.com/api/app/deviceInfo/setDeviceParam',
+      { macHex: ESS_MAC_HEX, index, data }, ESS_HEADERS).catch(() => ({}));
+    return r.code === 200;
+  }
+  async function setWeekParam(index, data) {
+    const r = await httpsPost('https://eu.ess-link.com/api/app/deviceInfo/setDeviceWeekParam',
+      { macHex: ESS_MAC_HEX, index, data }, ESS_HEADERS).catch(() => ({}));
+    return r.code === 200;
+  }
+  async function setDateParam(index, data) {
+    const r = await httpsPost('https://eu.ess-link.com/api/app/deviceInfo/setDeviceDateOrTimeParam',
+      { macHex: ESS_MAC_HEX, index, data }, ESS_HEADERS).catch(() => ({}));
+    return r.code === 200;
+  }
+  function hhmm(h, m=0) { return String(h).padStart(2,'0') + String(m).padStart(2,'0'); }
+
+  // 充电窗口
+  let chargeStartHHMM = '0000', chargeEndHHMM = '0000';
+  if (chargeSlots.length > 0) {
+    const [fh, fm] = chargeSlots[0].key.split(':').map(Number);
+    const [lh, lm] = chargeSlots[chargeSlots.length-1].key.split(':').map(Number);
+    chargeStartHHMM = hhmm(fh, fm);
+    const endMins = lh*60+lm+30;
+    chargeEndHHMM = hhmm(Math.floor(endMins/60), endMins%60);
+  }
+
+  // 卖电窗口
+  const sellPlan = plan.filter(s => s.action === 'sell');
+  let sellStartHHMM = '0000', sellEndHHMM = '0000';
+  if (sellPlan.length > 0) {
+    const [fh, fm] = sellPlan[0].key.split(':').map(Number);
+    const [lh, lm] = sellPlan[sellPlan.length-1].key.split(':').map(Number);
+    sellStartHHMM = hhmm(fh, fm);
+    const endMins = lh*60+lm+30;
+    sellEndHHMM = hhmm(Math.floor(endMins/60), endMins%60);
+  }
+
+  console.log(`[逆变器] 充电: ${chargeStartHHMM}–${chargeEndHHMM} | 卖电: ${sellStartHHMM}–${sellEndHHMM}`);
+
+  const sydNowMs = Date.now() + 11*3600*1000;
+  const yesterday = new Date(sydNowMs - 86400*1000).toISOString().slice(0,10);
+  const tomorrow  = new Date(sydNowMs + 86400*1000).toISOString().slice(0,10);
+
+  const steps = [
+    ['mode=Timed(1)',                  () => setParam('0x300C', 1)],
+    [`chargeStart=${chargeStartHHMM}`, () => setParam('0xC014', chargeStartHHMM)],
+    [`chargeEnd=${chargeEndHHMM}`,     () => setParam('0xC016', chargeEndHHMM)],
+    [`chargeKw=${MAX_CHARGE_KW}`,      () => setParam('0xC0BA', MAX_CHARGE_KW)],
+    [`sellStart=${sellStartHHMM}`,     () => setParam('0xC018', sellStartHHMM)],
+    [`sellEnd=${sellEndHHMM}`,         () => setParam('0xC01A', sellEndHHMM)],
+    [`sellKw=${MAX_SELL_KW}`,          () => setParam('0xC0BC', MAX_SELL_KW)],
+    ['otherMode=0',                    () => setParam('0x314E', 0)],
+    ['weekdays=all',                   () => setWeekParam('0xC0B4', [1,2,3,4,5,6,0])],
+    [`startDate=${yesterday}`,         () => setDateParam('0xC0B6', yesterday)],
+    [`endDate=${tomorrow}`,            () => setDateParam('0xC0B8', tomorrow)],
+  ];
+
+  for (const [label, fn] of steps) {
+    const ok = await fn();
+    console.log(`  ${ok ? '✅' : '❌'} ${label}`);
+    await new Promise(r => setTimeout(r, 350));
+  }
+
+  // ── Turso 同步 ─────────────────────────────────────────────
+  try {
+    const { execSync } = require('child_process');
+    execSync('node scripts/turso-sync.js', {
+      cwd: path.join(__dirname, '..'),
+      env: { ...process.env },
+      timeout: 30000,
+    });
+    console.log('✅ Turso 同步完成');
+  } catch(e) {
+    console.warn('[turso-sync] 同步失败:', e.message);
+  }
+
   db.close();
 }
 
