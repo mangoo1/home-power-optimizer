@@ -52,7 +52,10 @@ const CHARGE_BUFFER  = e('CHARGE_BUFFER_KW',    0.5);
 const HW_LOAD_KW     = e('HW_LOAD_KW',          5.0);
 const PV_SCALE       = e('PV_SCALE',            0.0032);
 const PV_PEAK_KW     = e('PV_PEAK_KW',          4.2);  // 实测峰值 4.2kW
-const BUY_MAX_C      = e('BUY_MAX_C',           12.0);
+const BUY_MAX_C_BASE = e('BUY_MAX_C',           12.0);
+// Dynamic BUY_MAX_C: when SOC is critically low, accept higher prices to avoid running out
+// This is resolved at plan generation time based on current SOC
+let BUY_MAX_C = BUY_MAX_C_BASE;
 const BUY_MIN_C      = e('BUY_THRESHOLD_C',      8.0);
 const SELL_MIN_MARGIN_PCT = e('SELL_MIN_MARGIN_PCT', 0.30); // feedIn > 买入成本 × 1.3 才卖（覆盖电池损耗）
 const SELL_FLOOR_C   = e('SELL_FLOOR_C',        5.0);   // 绝对底线 5¢（低于这个不值得卖）
@@ -295,6 +298,17 @@ function homeLoadKw(hour) {
 function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5, nightReserveKwh = null, hwWindow = null, gridChargeTarget = SOC_TARGET) {
   const targetKwh  = gridChargeTarget * BATT_KWH;           // 动态目标 kWh
   const currentKwh = currentSoc / 100 * BATT_KWH;
+
+  // SOC 极低时放宽价格上限——避免全天电价 >12¢ 时完全不充电
+  if (currentSoc < 30) {
+    BUY_MAX_C = Math.max(BUY_MAX_C_BASE, 18);  // 接受最高 18¢
+    console.log(`[低SOC紧急] SOC=${currentSoc}% < 30%，BUY_MAX_C 放宽到 ${BUY_MAX_C}¢`);
+  } else if (currentSoc < 50) {
+    BUY_MAX_C = Math.max(BUY_MAX_C_BASE, 15);  // 接受最高 15¢
+    console.log(`[低SOC] SOC=${currentSoc}% < 50%，BUY_MAX_C 放宽到 ${BUY_MAX_C}¢`);
+  } else {
+    BUY_MAX_C = BUY_MAX_C_BASE;
+  }
 
   // 热水器运行时段 set（key格式 "HH:MM"）
   const hwKeys = new Set();
