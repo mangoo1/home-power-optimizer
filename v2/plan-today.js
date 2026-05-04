@@ -353,7 +353,8 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5, nightReser
       const chargeKwhPer = maxChargeKw * 0.5 * 0.95;
       return { ...s, h, pv, hl, maxChargeKw, chargeKwhPer };
     })
-    .filter(s => s.h < gridChargeEndHour && !s.dw && s.maxChargeKw >= 0.5 && s.buyC > 0 && s.buyC < BUY_MAX_C);
+    .filter(s => s.h < gridChargeEndHour && !s.dw && s.buyC > 0 && s.buyC < BUY_MAX_C
+      && (s.maxChargeKw >= 0.5 || hwKeys.has(s.key))); // HW slots always included (prevent battery discharge)
 
   // 早晨消耗估算（等待第一个充电槽期间的自放）
   const nowHour = parseInt(slots[0]?.key?.split(':')[0] ?? '0');
