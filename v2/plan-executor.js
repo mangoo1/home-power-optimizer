@@ -716,11 +716,12 @@ async function main() {
 
   const intervals = planRow ? JSON.parse(planRow.intervals_json) : [];
 
-  // 找当前半小时时段
+  // 找当前半小时时段 — 优先用 key（"HH:MM" 标准槽），fallback nemTime
   const nowMins = syd.hh * 60 + syd.mi;
   const slot = intervals.find(s => {
-    const h = parseInt(s.nemTime?.substring(11,13) ?? s.key?.substring(0,2) ?? '0');
-    const m = parseInt(s.nemTime?.substring(14,16) ?? s.key?.substring(3,5) ?? '0');
+    const k = s.key || '';
+    const h = parseInt(k.substring(0,2) || s.nemTime?.substring(11,13) || '0');
+    const m = parseInt(k.substring(3,5) || s.nemTime?.substring(14,16) || '0');
     return nowMins >= h*60+m && nowMins < h*60+m+30;
   });
 
