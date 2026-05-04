@@ -572,6 +572,13 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5, nightReser
       sellKw = maxSellKw;
       reason = `feedIn=${s.feedInC}¢ ≥ ${sellMinC.toFixed(1)}¢`;
 
+    } else if (hwKeys.has(s.key) && hwExtra > 0) {
+      // 热水器运行时段：绝不能 self-use（会导致电池放电供热水器）
+      // 用 Timed charge=0.1kW 让电池待机，电网直供热水器
+      action = 'charge';
+      chargeKw = Math.max(0.1, maxChargeKw);
+      reason = `buy=${s.buyC}¢ HW-protect: charge=${chargeKw}kW (prevent batt discharge)`;
+
     } else {
       action = 'self-use';
       reason = `buy=${s.buyC}¢ feedIn=${s.feedInC}¢ pv=${pv.toFixed(1)}kW`;
