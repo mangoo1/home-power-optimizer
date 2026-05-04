@@ -1000,7 +1000,10 @@ function calcHotWaterWindows(slots, pvByHour) {
       }
       if (!consecutive) continue;
       const avgPrice = w.reduce((s, x) => s + x.buyC, 0) / 4;
-      if (avgPrice < bestGfPrice) { bestGfPrice = avgPrice; bestGfIdx = i; }
+      // GF 小热水器保温优先：价格差 ≤1¢ 时选更晚的槽（越晚加热越保温）
+      if (avgPrice < bestGfPrice - 1.0 || (avgPrice <= bestGfPrice + 1.0 && i > bestGfIdx)) {
+        bestGfPrice = avgPrice; bestGfIdx = i;
+      }
     }
     if (bestGfIdx >= 0) {
       const gfSlots = gfCandidates.slice(bestGfIdx, bestGfIdx + 4);
