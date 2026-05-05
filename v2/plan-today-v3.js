@@ -40,6 +40,9 @@ const BREAKER_KW     = e('BREAKER_KW', 7.7);
 const CHARGE_BUFFER  = e('CHARGE_BUFFER_KW', 0.5);
 const PV_SCALE       = e('PV_SCALE', 0.0032);
 const HW_LOAD_KW     = e('HW_LOAD_KW', 5.0);
+const HW_GRID_MAX_C  = e('HW_GRID_MAX_C', 15.0); // 热水器可接受的最高电价
+const HW_EARLIEST_H  = 8;   // 最早 08:00 开热水器
+const HW_DURATION_SLOTS = 4; // 每台热水器 4 × 30min = 2h
 const DB_PATH        = path.join(__dirname, '..', 'data', 'energy.db');
 
 // ── 新策略常量 ────────────────────────────────────────────────
@@ -126,6 +129,43 @@ function aggregateAmberTo30min(raw, today) {
 }
 
 // ── PV 预测 ───────────────────────────────────────────────────
+const SOLAR_LATITUDE  = -33.87;
+const SOLAR_LONGITUDE = 151.21;
+const SOLAR_TIMEZONE  = 'Australia/Sydney';
+
+async function fetchSolarForecast(db, today) {
+  try {
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${SOLAR_LATITUDE}&longitude=${SOLAR_LONGITUDE}` +
+      `&hourly=shortwave_radiation,cloud_cover` +
+      `&timezone=${encodeURIComponent(SOLAR_TIMEZONE)}&forecast_days=3&models=best_match`;
+    const data = await httpsGet(url);
+    if (!data?.hourly?.time) throw new Error('Invalid Open-Meteo response');
+    const hourly = data.hourly;
+    try { db.prepare('ALTER TABLE solar_forecast ADD COLUMN forecast_json TEXT').run(); } catch {}
+    db.prepare(`
+      INSERT INTO solar_forecast (date, fetched_at, forecast_json, today_kwh_est, tomorrow_kwh_est, today_peak_wm2, tomorrow_peak_wm2, today_cloud_avg, tomorrow_cloud_avg)
+      VALUES (@date, @fetchedAt, @json, 0, 0, 0, 0, 0, 0)
+      ON CONFLICT(date) DO UPDATE SET fetched_at=@fetchedAt, forecast_json=@json
+    `).run({
+      date: today,
+      fetchedAt: new Date().toISOString(),
+      json: JSON.stringify({ time: hourly.time, sw: hourly.shortwave_radiation, cloud: hourly.cloud_cover }),
+    });
+    let peakWm2 = 0, cloudSum = 0, cloudCount = 0;
+    hourly.time.forEach((t, i) => {
+      if (!t.startsWith(today)) return;
+      const h = parseInt(t.substring(11, 13));
+      if (h < 6 || h > 20) return;
+      peakWm2 = Math.max(peakWm2, hourly.shortwave_radiation[i] ?? 0);
+      cloudSum += hourly.cloud_cover[i] ?? 0;
+      cloudCount++;
+    });
+    console.log(`[PV] Open-Meteo 更新 ✓ 峰值=${peakWm2}W/m² 云量=${cloudCount > 0 ? (cloudSum/cloudCount).toFixed(0) : '?'}%`);
+  } catch(e) {
+    console.warn(`[PV] Open-Meteo 获取失败: ${e.message}，使用 DB 缓存`);
+  }
+}
+
 function getPvForecast(db, today) {
   const row = db.prepare('SELECT forecast_json FROM solar_forecast WHERE date=? ORDER BY fetched_at DESC LIMIT 1').get(today);
   if (!row) return {};
@@ -148,6 +188,79 @@ function homeLoadKw(hour) {
   if (hour >= 17 && hour < 21) return 1.5;
   if (hour >= 21 || hour < 6)  return 0.35;
   return 0.6;
+}
+
+// ── 热水器调度 ────────────────────────────────────────────────
+function scheduleHotWater(slots) {
+  // 找危险截止时间（DW 或高价 >= HW_GRID_MAX_C，14:00 以后）
+  let dangerStartMins = 17 * 60; // 默认 17:00
+  for (const s of slots) {
+    const [h, m] = s.key.split(':').map(Number);
+    if ((s.buyC > HW_GRID_MAX_C || s.dw) && h >= 14) {
+      dangerStartMins = h * 60 + m;
+      break;
+    }
+  }
+  const allHwDeadlineMins = dangerStartMins - 30; // 所有热水器在危险前30分结束
+
+  console.log(`[热水器] 危险起点=${Math.floor(dangerStartMins/60)}:${String(dangerStartMins%60).padStart(2,'0')} 截止=${Math.floor(allHwDeadlineMins/60)}:${String(allHwDeadlineMins%60).padStart(2,'0')}`);
+
+  // 候选槽：08:00 ~ 截止，非DW，价格合理
+  const candidates = slots.filter(s => {
+    const [h, m] = s.key.split(':').map(Number);
+    const endMins = h * 60 + m + 30;
+    return h >= HW_EARLIEST_H && endMins <= allHwDeadlineMins && !s.dw;
+  });
+
+  // 找最便宜的连续 N 槽
+  function findCheapestWindow(pool, nSlots) {
+    if (pool.length < nSlots) return null;
+    let bestIdx = -1, bestAvg = Infinity;
+    for (let i = 0; i <= pool.length - nSlots; i++) {
+      // 检查连续性
+      let consecutive = true;
+      for (let j = 0; j < nSlots - 1; j++) {
+        const [h1, m1] = pool[i+j].key.split(':').map(Number);
+        const [h2, m2] = pool[i+j+1].key.split(':').map(Number);
+        if ((h2*60+m2) - (h1*60+m1) !== 30) { consecutive = false; break; }
+      }
+      if (!consecutive) continue;
+      const avg = pool.slice(i, i+nSlots).reduce((s, x) => s + x.buyC, 0) / nSlots;
+      if (avg < bestAvg) { bestAvg = avg; bestIdx = i; }
+    }
+    if (bestIdx < 0) return null;
+    const win = pool.slice(bestIdx, bestIdx + nSlots);
+    const [eh, em] = win[nSlots-1].key.split(':').map(Number);
+    const endMins = eh*60+em+30;
+    return {
+      startKey: win[0].key,
+      endKey: `${String(Math.floor(endMins/60)).padStart(2,'0')}:${String(endMins%60).padStart(2,'0')}`,
+      avgBuyC: parseFloat(bestAvg.toFixed(2)),
+      slots: win,
+    };
+  }
+
+  // 1. 先选 GF 热水器（小热水器，保温优先 → 选便宜且偏晚的）
+  const gfWin = findCheapestWindow(candidates, HW_DURATION_SLOTS);
+  if (!gfWin) {
+    console.log('[热水器] ⚠️ 无法安排 GF 热水器（候选槽不足）');
+    return { mainHw: null, gfHw: null };
+  }
+  console.log(`[GF热水器] ${gfWin.startKey}–${gfWin.endKey} 均价=${gfWin.avgBuyC}¢`);
+
+  // 2. 主热水器：排除 GF 时间段后，再选最便宜的连续4槽
+  const gfOccupied = new Set(gfWin.slots.map(s => s.key));
+  const mainCandidates = candidates.filter(s => !gfOccupied.has(s.key));
+  const mainWin = findCheapestWindow(mainCandidates, HW_DURATION_SLOTS);
+  if (!mainWin) {
+    console.log('[热水器] ⚠️ 无法安排主热水器（候选槽不足）');
+    return { mainHw: null, gfHw: gfWin };
+  }
+  console.log(`[主热水器] ${mainWin.startKey}–${mainWin.endKey} 均价=${mainWin.avgBuyC}¢`);
+
+  // 确保主热水器在前（时间顺序），如果 GF 更早则交换
+  // 规则：两台不重叠即可，谁先谁后取决于电价
+  return { mainHw: mainWin, gfHw: gfWin };
 }
 
 // ── 核心：新卖电策略 ──────────────────────────────────────────
@@ -345,7 +458,8 @@ async function main() {
   const currentSocPct = latest?.soc ?? 50;
   console.log(`[SOC] 当前: ${currentSocPct}%`);
 
-  // PV 预测
+  // PV 预测（先拉 Open-Meteo 更新 DB）
+  await fetchSolarForecast(db, today);
   const pvByHour = getPvForecast(db, today);
   const pvTotal = Object.values(pvByHour).reduce((s, v) => s + v, 0);
   console.log(`[PV] 今日预计: ${pvTotal.toFixed(1)}kWh`);
@@ -358,6 +472,18 @@ async function main() {
 
   // 核心：选卖电槽（带利润校验）
   let sellSlots = planSellSlots(slots);
+
+  // 热水器调度
+  const { mainHw, gfHw } = scheduleHotWater(slots);
+  const hardwareTasks = [];
+  if (mainHw) {
+    hardwareTasks.push({ device: 'main_hw', action: 'on',  time: mainHw.startKey });
+    hardwareTasks.push({ device: 'main_hw', action: 'off', time: mainHw.endKey });
+  }
+  if (gfHw) {
+    hardwareTasks.push({ device: 'gf_hw', action: 'on',  time: gfHw.startKey });
+    hardwareTasks.push({ device: 'gf_hw', action: 'off', time: gfHw.endKey });
+  }
 
   // 利润校验：预估充电均价，只有 avgFeedIn >= avgChargeCost * (1 + SELL_PROFIT_MARGIN) 才卖
   if (sellSlots.length > 0) {
@@ -413,6 +539,7 @@ async function main() {
     overnightReservePct: OVERNIGHT_RESERVE_PCT,
     sellSlotCount,
     chargeTargetPct,
+    hardwareTasks,
   });
 
   db.prepare(`
