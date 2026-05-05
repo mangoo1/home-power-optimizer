@@ -50,6 +50,7 @@ const SELL_WINDOW_START    = 16;     // 卖电窗口起始 16:00
 const SELL_WINDOW_END      = 21;     // 卖电窗口结束 21:00（最晚）
 const CHARGE_DEADLINE_HOUR = 15;     // 充电截止时间 15:00（之后转 self-use 等卖电）
 const SELL_MIN_FEEDIN_C    = e('SELL_FLOOR_C', 5.0); // 最低卖电价 5¢
+const SELL_PROFIT_MARGIN   = e('SELL_PROFIT_MARGIN', 0.25); // 卖电利润率门槛 25%（avgFeedIn >= avgChargeCost * 1.25）
 // 不再用固定 BUY_MAX_C 硬性限制——只要卖电利润覆盖买入成本就值得充
 
 // ── 工具函数 ──────────────────────────────────────────────────
@@ -355,8 +356,34 @@ async function main() {
   const slots = aggregateAmberTo30min(rawAmber, today);
   console.log(`[Amber] ${slots.length} 个半小时槽, DW: ${slots.some(s => s.dw)}`);
 
-  // 核心：选卖电槽
-  const sellSlots = planSellSlots(slots);
+  // 核心：选卖电槽（带利润校验）
+  let sellSlots = planSellSlots(slots);
+
+  // 利润校验：预估充电均价，只有 avgFeedIn >= avgChargeCost * (1 + SELL_PROFIT_MARGIN) 才卖
+  if (sellSlots.length > 0) {
+    const avgFeedIn = sellSlots.reduce((s, x) => s + x.feedInC, 0) / sellSlots.length;
+    // 预估充电成本：选最便宜的槽（和 buildPlan 一样的逻辑）
+    const chargeCandidates = slots
+      .filter(s => {
+        const h = parseInt(s.key.split(':')[0]);
+        return h < CHARGE_DEADLINE_HOUR && !s.dw && s.buyC > 0;
+      })
+      .sort((a, b) => a.buyC - b.buyC);
+    // 需要充多少槽来覆盖卖电
+    const sellKwh = sellSlots.length * SELL_KWH_PER_HOUR / 2;
+    const chargeForSell = chargeCandidates.slice(0, sellSlots.length); // 粗略等量
+    const avgChargeCost = chargeForSell.length > 0
+      ? chargeForSell.reduce((s, x) => s + x.buyC, 0) / chargeForSell.length
+      : 999;
+    const minRequired = avgChargeCost * (1 + SELL_PROFIT_MARGIN);
+    console.log(`[利润校验] avgFeedIn=${avgFeedIn.toFixed(1)}¢ avgChargeCost=${avgChargeCost.toFixed(1)}¢ 需要>=${minRequired.toFixed(1)}¢ (${(SELL_PROFIT_MARGIN*100).toFixed(0)}%利润)`);
+    if (avgFeedIn < minRequired) {
+      console.log(`[利润校验] ❌ 利润不足 ${((avgFeedIn/avgChargeCost-1)*100).toFixed(0)}% < ${(SELL_PROFIT_MARGIN*100).toFixed(0)}%，取消卖电`);
+      sellSlots = [];
+    } else {
+      console.log(`[利润校验] ✅ 利润 ${((avgFeedIn/avgChargeCost-1)*100).toFixed(0)}% >= ${(SELL_PROFIT_MARGIN*100).toFixed(0)}%，执行卖电`);
+    }
+  }
 
   // 生成计划
   const { plan, chargeTargetPct, sellSlotCount } = buildPlan(slots, pvByHour, currentSocPct, sellSlots);
