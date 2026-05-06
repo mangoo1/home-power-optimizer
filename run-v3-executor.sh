@@ -1,4 +1,5 @@
 #!/bin/bash
+export PATH="/home/deven/.npm-global/bin:/home/deven/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 set -a
 source /home/deven/.openclaw/workspace/home-power-optimizer/.env
 set +a
