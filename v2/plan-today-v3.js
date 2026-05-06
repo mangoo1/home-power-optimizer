@@ -46,7 +46,8 @@ const HW_DURATION_SLOTS = 4; // 每台热水器 4 × 30min = 2h
 const DB_PATH        = path.join(__dirname, '..', 'data', 'energy.db');
 
 // ── 新策略常量 ────────────────────────────────────────────────
-const OVERNIGHT_RESERVE_PCT = 35;     // 过夜保底 35%
+const OVERNIGHT_RESERVE_PCT = 35;     // 卖电时过夜保底 35%
+const NO_SELL_RESERVE_PCT   = 55;     // 不卖电时过夜保底 55%（覆盖15:00→次日10:00）
 const SELL_KWH_PER_HOUR    = 5.0;    // 每小时卖电约5kWh
 const SELL_PCT_PER_HOUR    = 12;     // ≈ 5/42 × 100 ≈ 12%
 const SELL_WINDOW_START    = 16;     // 卖电窗口起始 16:00
@@ -183,11 +184,19 @@ function getPvForecast(db, today) {
 }
 
 // ── 家庭负载估算 ──────────────────────────────────────────────
-function homeLoadKw(hour) {
-  if (hour >= 6  && hour < 10) return 1.2;
-  if (hour >= 17 && hour < 21) return 1.5;
-  if (hour >= 21 || hour < 6)  return 0.35;
-  return 0.6;
+function homeLoadKw(hour, minute, hwSlots) {
+  let base;
+  if (hour >= 6  && hour < 10) base = 1.2;
+  else if (hour >= 17 && hour < 21) base = 1.5;
+  else if (hour >= 21 || hour < 6)  base = 0.35;
+  else base = 0.6;
+
+  // 加上热水器负载（如果当前时段有热水器运行）
+  if (hwSlots) {
+    const key = `${String(hour).padStart(2,'0')}:${String(minute ?? 0).padStart(2,'0')}`;
+    if (hwSlots.has(key)) base += HW_LOAD_KW;
+  }
+  return base;
 }
 
 // ── 热水器调度 ────────────────────────────────────────────────
@@ -284,12 +293,13 @@ function planSellSlots(slots) {
 function calcChargeTarget(sellSlotCount) {
   // 每个半小时槽消耗 6% SOC（= 12% / 2）
   const sellPct = sellSlotCount * (SELL_PCT_PER_HOUR / 2);
-  const target = Math.min(100, OVERNIGHT_RESERVE_PCT + sellPct);
+  const basePct = sellSlotCount > 0 ? OVERNIGHT_RESERVE_PCT : NO_SELL_RESERVE_PCT;
+  const target = Math.min(100, basePct + sellPct);
   return target;
 }
 
 // ── 生成完整计划 ──────────────────────────────────────────────
-function buildPlan(slots, pvByHour, currentSocPct, sellSlots) {
+function buildPlan(slots, pvByHour, currentSocPct, sellSlots, hwSlots) {
   const sellKeys = new Set(sellSlots.map(s => s.key));
   const chargeTargetPct = calcChargeTarget(sellSlots.length);
   const chargeTargetKwh = chargeTargetPct / 100 * BATT_KWH;
@@ -313,9 +323,9 @@ function buildPlan(slots, pvByHour, currentSocPct, sellSlots) {
   let accKwh = 0;
   for (const s of chargeCandidates) {
     if (accKwh >= neededKwh) break;
-    const h = parseInt(s.key.split(':')[0]);
+    const [h, m] = s.key.split(":").map(Number);
     const pv = pvByHour[h] ?? 0;
-    const hl = homeLoadKw(h);
+    const hl = homeLoadKw(h, m, hwSlots);
     const gridHeadroom = BREAKER_KW - Math.max(0, hl - pv) - CHARGE_BUFFER;
     const maxKw = Math.min(MAX_CHARGE_KW, Math.max(0, gridHeadroom));
     const slotKwh = maxKw * 0.5 * 0.95;
@@ -348,9 +358,9 @@ function buildPlan(slots, pvByHour, currentSocPct, sellSlots) {
   const plan = [];
 
   for (const s of slots) {
-    const h = parseInt(s.key.split(':')[0]);
+    const [h, m] = s.key.split(":").map(Number);
     const pv = pvByHour[h] ?? 0;
-    const hl = homeLoadKw(h);
+    const hl = homeLoadKw(h, m, hwSlots);
     const net = hl - pv; // 正=需供电，负=PV有余
 
     const gridHeadroom = BREAKER_KW - Math.max(0, net) - CHARGE_BUFFER;
@@ -512,7 +522,52 @@ async function main() {
   }
 
   // 生成计划
-  const { plan, chargeTargetPct, sellSlotCount } = buildPlan(slots, pvByHour, currentSocPct, sellSlots);
+  // 构建热水器时段 Set（key 格式 "HH:MM"）
+  const hwSlots = new Set();
+  function addHwRange(startKey, endKey) {
+    if (!startKey || !endKey) return;
+    const [sh, sm] = startKey.split(':').map(Number);
+    const [eh, em] = endKey.split(':').map(Number);
+    let mins = sh * 60 + sm;
+    const endMins = eh * 60 + em;
+    while (mins < endMins) {
+      hwSlots.add(`${String(Math.floor(mins/60)).padStart(2,'0')}:${String(mins%60).padStart(2,'0')}`);
+      mins += 30;
+    }
+  }
+  if (mainHw) addHwRange(mainHw.startKey, mainHw.endKey);
+  if (gfHw)   addHwRange(gfHw.startKey, gfHw.endKey);
+  console.log(`[热水器负载] 占用时段: ${[...hwSlots].sort().join(', ') || '无'}`);
+
+  // 可行性检查：估算实际可充入量，如果不够支撑卖电则削减
+  {
+    const chargeCandidates = slots
+      .filter(s => {
+        const h = parseInt(s.key.split(':')[0]);
+        return h < CHARGE_DEADLINE_HOUR && !s.dw && s.buyC > 0;
+      })
+      .sort((a, b) => a.buyC - b.buyC);
+    let estChargeKwh = 0;
+    for (const s of chargeCandidates) {
+      const [h, m] = s.key.split(':').map(Number);
+      const pv = pvByHour[h] ?? 0;
+      const hl = homeLoadKw(h, m, hwSlots);
+      const gridHeadroom = BREAKER_KW - Math.max(0, hl - pv) - CHARGE_BUFFER;
+      const maxKw = Math.min(MAX_CHARGE_KW, Math.max(0, gridHeadroom));
+      estChargeKwh += maxKw * 0.5 * 0.95;
+    }
+    const achievableKwh = currentSocPct / 100 * BATT_KWH + estChargeKwh;
+    const achievablePct = Math.round(achievableKwh / BATT_KWH * 100);
+    const surplusKwh = Math.max(0, achievableKwh - (NO_SELL_RESERVE_PCT / 100 * BATT_KWH));
+    const maxSellSlots = Math.floor(surplusKwh / (SELL_KWH_PER_HOUR / 2));
+    console.log(`[可行性] 最大可充到 ${achievablePct}% (${achievableKwh.toFixed(1)}kWh)，过夜保底 ${NO_SELL_RESERVE_PCT}%，可卖 ${maxSellSlots} 槽`);
+    if (maxSellSlots < sellSlots.length) {
+      console.log(`[可行性] ⚠️ 削减卖电: ${sellSlots.length} → ${maxSellSlots}（选最贵的）`);
+      sellSlots = sellSlots.sort((a, b) => b.feedInC - a.feedInC).slice(0, maxSellSlots);
+    }
+  }
+
+  const { plan, chargeTargetPct, sellSlotCount } = buildPlan(slots, pvByHour, currentSocPct, sellSlots, hwSlots);
 
   // 打印
   const report = printPlan(plan, currentSocPct, today, chargeTargetPct, sellSlotCount);
