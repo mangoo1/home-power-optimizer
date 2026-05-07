@@ -96,7 +96,7 @@ function httpsPost(url, body, headers = {}) {
 
 // ── Amber 价格 ────────────────────────────────────────────────
 async function fetchAmberPrices() {
-  const url = `https://api.amber.com.au/v1/sites/${AMBER_SITE_ID}/prices/current?next=288`;
+  const url = `https://api.amber.com.au/v1/sites/${AMBER_SITE_ID}/prices/current?next=288&previous=48`;
   for (let attempt = 1; attempt <= 3; attempt++) {
     const data = await httpsGet(url, { Authorization: `Bearer ${AMBER_TOKEN}` });
     if (Array.isArray(data)) return data;
@@ -335,15 +335,32 @@ function buildPlan(slots, pvByHour, currentSocPct, sellSlots, hwSlots) {
   }
 
   // 填充电连续性：首到尾之间所有非DW槽都补上（避免中间空洞导致切换）
+  // 但跳过充电功率 < 1kW 的垃圾槽
   const sortedCK = [...chargeKeys].sort();
   if (sortedCK.length >= 2) {
     const first = sortedCK[0], last = sortedCK[sortedCK.length - 1];
     for (const s of slots) {
       const h = parseInt(s.key.split(':')[0]);
       if (!chargeKeys.has(s.key) && s.key >= first && s.key <= last && !s.dw && h < CHARGE_DEADLINE_HOUR) {
+        // 检查该槽是否有足够充电空间
+        const [sh, sm] = s.key.split(':').map(Number);
+        const pv = pvByHour[sh] ?? 0;
+        const hl = homeLoadKw(sh, sm, hwSlots);
+        const gridHeadroom = BREAKER_KW - Math.max(0, hl - pv) - CHARGE_BUFFER;
+        const maxKw = Math.min(MAX_CHARGE_KW, Math.max(0, gridHeadroom));
+        if (maxKw < 1.0) continue; // 跳过低功率垃圾槽
         chargeKeys.add(s.key);
       }
     }
+  }
+  // 同样从原始选择中移除低功率槽
+  for (const key of [...chargeKeys]) {
+    const [h, m] = key.split(':').map(Number);
+    const pv = pvByHour[h] ?? 0;
+    const hl = homeLoadKw(h, m, hwSlots);
+    const gridHeadroom = BREAKER_KW - Math.max(0, hl - pv) - CHARGE_BUFFER;
+    const maxKw = Math.min(MAX_CHARGE_KW, Math.max(0, gridHeadroom));
+    if (maxKw < 1.0) chargeKeys.delete(key);
   }
 
   console.log(`[充电] 选中 ${chargeKeys.size} 槽, 预计充入 ${accKwh.toFixed(1)}kWh`);
@@ -354,6 +371,7 @@ function buildPlan(slots, pvByHour, currentSocPct, sellSlots, hwSlots) {
   }
 
   // 生成逐槽计划
+  const avgSellC = sellSlots.length > 0 ? sellSlots.reduce((s, x) => s + x.feedInC, 0) / sellSlots.length : 15;
   let socKwh = currentKwh;
   const plan = [];
 
@@ -379,11 +397,17 @@ function buildPlan(slots, pvByHour, currentSocPct, sellSlots, hwSlots) {
       action = 'sell';
       sellKw = MAX_SELL_KW;
       reason = `feedIn=${s.feedInC}¢`;
+    } else if (socKwh < chargeTargetKwh && s.buyC < avgSellC * 0.8) {
+      // 低价补充：买价 < 卖电均价80%，值得从电网充（不只靠PV余量）
+      action = 'charge';
+      const gridRoom = parseFloat(Math.min(maxChargeKw, BREAKER_KW - hl - CHARGE_BUFFER).toFixed(2));
+      chargeKw = Math.max(0.5, gridRoom);
+      reason = `cheap buy=${s.buyC}¢<${(avgSellC*0.8).toFixed(1)}¢ grid-charge`;
     } else if (pv > 0.2 && socKwh < chargeTargetKwh) {
-      // PV 消纳
+      // PV 消纳（纯太阳能余量，不管电价）
       action = 'charge';
       chargeKw = parseFloat(Math.min(maxChargeKw, Math.max(0, pv - hl)).toFixed(2));
-      if (chargeKw < 0.2) { action = 'self-use'; chargeKw = 0; reason = `pv=${pv.toFixed(1)}kW self`; }
+      if (chargeKw < 1.0) { action = 'self-use'; chargeKw = 0; reason = `pv=${pv.toFixed(1)}kW self`; }
       else reason = `pv=${pv.toFixed(1)}kW absorb`;
     } else {
       action = 'self-use';
@@ -477,8 +501,11 @@ async function main() {
   // Amber 价格
   console.log('[Amber] 拉取价格...');
   const rawAmber = await fetchAmberPrices();
-  const slots = aggregateAmberTo30min(rawAmber, today);
-  console.log(`[Amber] ${slots.length} 个半小时槽, DW: ${slots.some(s => s.dw)}`);
+  const allSlots = aggregateAmberTo30min(rawAmber, today);
+  // 过滤掉已过去的时段
+  const nowKey = `${String(syd.hh).padStart(2,'0')}:${syd.mi < 30 ? '00' : '30'}`;
+  const slots = allSlots.filter(s => s.key >= nowKey);
+  console.log(`[Amber] ${allSlots.length} 个半小时槽 (未来${slots.length}个), DW: ${slots.some(s => s.dw)}`);
 
   // 核心：选卖电槽（带利润校验）
   let sellSlots = planSellSlots(slots);
@@ -499,10 +526,11 @@ async function main() {
   if (sellSlots.length > 0) {
     const avgFeedIn = sellSlots.reduce((s, x) => s + x.feedInC, 0) / sellSlots.length;
     // 预估充电成本：选最便宜的槽（和 buildPlan 一样的逻辑）
+    const avgSellCEst = sellSlots.length > 0 ? sellSlots.reduce((s,x) => s + x.feedInC, 0) / sellSlots.length : 15;
     const chargeCandidates = slots
       .filter(s => {
         const h = parseInt(s.key.split(':')[0]);
-        return h < CHARGE_DEADLINE_HOUR && !s.dw && s.buyC > 0;
+        return !s.dw && s.buyC > 0 && (h < CHARGE_DEADLINE_HOUR || s.buyC < avgSellCEst * 0.8);
       })
       .sort((a, b) => a.buyC - b.buyC);
     // 需要充多少槽来覆盖卖电
@@ -510,7 +538,7 @@ async function main() {
     const chargeForSell = chargeCandidates.slice(0, sellSlots.length); // 粗略等量
     const avgChargeCost = chargeForSell.length > 0
       ? chargeForSell.reduce((s, x) => s + x.buyC, 0) / chargeForSell.length
-      : 999;
+      : 0; // 电池已有电，沉没成本=0，卖出即赚
     const minRequired = avgChargeCost * (1 + SELL_PROFIT_MARGIN);
     console.log(`[利润校验] avgFeedIn=${avgFeedIn.toFixed(1)}¢ avgChargeCost=${avgChargeCost.toFixed(1)}¢ 需要>=${minRequired.toFixed(1)}¢ (${(SELL_PROFIT_MARGIN*100).toFixed(0)}%利润)`);
     if (avgFeedIn < minRequired) {
@@ -541,10 +569,11 @@ async function main() {
 
   // 可行性检查：估算实际可充入量，如果不够支撑卖电则削减
   {
+    const avgSellCFeas = sellSlots.length > 0 ? sellSlots.reduce((s,x) => s + x.feedInC, 0) / sellSlots.length : 15;
     const chargeCandidates = slots
       .filter(s => {
         const h = parseInt(s.key.split(':')[0]);
-        return h < CHARGE_DEADLINE_HOUR && !s.dw && s.buyC > 0;
+        return !s.dw && s.buyC > 0 && (h < CHARGE_DEADLINE_HOUR || s.buyC < avgSellCFeas * 0.8);
       })
       .sort((a, b) => a.buyC - b.buyC);
     let estChargeKwh = 0;
@@ -558,7 +587,7 @@ async function main() {
     }
     const achievableKwh = currentSocPct / 100 * BATT_KWH + estChargeKwh;
     const achievablePct = Math.round(achievableKwh / BATT_KWH * 100);
-    const surplusKwh = Math.max(0, achievableKwh - (NO_SELL_RESERVE_PCT / 100 * BATT_KWH));
+    const surplusKwh = Math.max(0, achievableKwh - (OVERNIGHT_RESERVE_PCT / 100 * BATT_KWH));
     const maxSellSlots = Math.floor(surplusKwh / (SELL_KWH_PER_HOUR / 2));
     console.log(`[可行性] 最大可充到 ${achievablePct}% (${achievableKwh.toFixed(1)}kWh)，过夜保底 ${NO_SELL_RESERVE_PCT}%，可卖 ${maxSellSlots} 槽`);
     if (maxSellSlots < sellSlots.length) {
@@ -665,11 +694,16 @@ async function main() {
 
   console.log(`[逆变器] 充电: ${chargeStartHHMM}–${chargeEndHHMM} | 卖电: ${sellStartHHMM}–${sellEndHHMM}`);
 
-  const sydNowMs = Date.now() + 11*3600*1000;
-  const yesterday = new Date(sydNowMs - 86400*1000).toISOString().slice(0,10);
-  const tomorrow  = new Date(sydNowMs + 86400*1000).toISOString().slice(0,10);
+  const sydNow = new Date(); // TZ already set to Australia/Sydney
+  const yesterday = new Date(sydNow - 86400*1000).toISOString().slice(0,10);
+  const tomorrow  = new Date(+sydNow + 86400*1000).toISOString().slice(0,10);
+  // 时钟同步字符串：YYYY-MM-DD HH:MM:SS（Sydney 本地时间）
+  const pad = n => String(n).padStart(2,'0');
+  const clockStr = `${sydNow.getFullYear()}-${pad(sydNow.getMonth()+1)}-${pad(sydNow.getDate())} ${pad(sydNow.getHours())}:${pad(sydNow.getMinutes())}:${pad(sydNow.getSeconds())}`;
 
   const steps = [
+    [`syncClock=${clockStr}`,          () => httpsPost('https://eu.ess-link.com/api/app/deviceInfo/setDeviceDateParam',
+      { data: clockStr, macHex: ESS_MAC_HEX, index: '0x3050' }, ESS_HEADERS).then(r => r.code === 200).catch(() => false)],
     ['mode=Timed(1)',                  () => setParam('0x300C', 1)],
     [`chargeStart=${chargeStartHHMM}`, () => setParam('0xC014', chargeStartHHMM)],
     [`chargeEnd=${chargeEndHHMM}`,     () => setParam('0xC016', chargeEndHHMM)],
