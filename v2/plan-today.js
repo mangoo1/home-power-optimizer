@@ -400,22 +400,31 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5, nightReser
     accumulated += s.chargeKwhPer;
   }
 
-  // Phase 2: 卖电额外充电——只选 buyC × 1.3 < sellMinC 的槽（不亏本）
+  // Phase 2: 卖电额外充电——只要 feedIn > buyC × 1.25（25%利润）就值得买电充
   if (sellExtraKwh > 0) {
     let extraAcc = 0;
-    const maxBuyForSell = sellMinC / (1 + SELL_MIN_MARGIN_PCT);
+    // 用实际卖电时段的平均 feedIn（不是 sellMinC 门槛）
+    // 取17:00-21:00的feedIn（这是真正的卖电高峰）
+    const sellSlots = slots.filter(s => {
+      const h = parseInt(s.key.split(':')[0]);
+      return h >= 16 && h <= 21 && s.feedInC > 10;
+    });
+    const actualAvgFeedIn = sellSlots.length > 0
+      ? sellSlots.reduce((sum, s) => sum + s.feedInC, 0) / sellSlots.length
+      : sellMinC;
+    console.log(`[卖电充电] 实际feedIn均价=${actualAvgFeedIn.toFixed(1)}¢, 25%利润买价上限=${(actualAvgFeedIn/1.25).toFixed(1)}¢`);
     for (const s of sortedByPrice) {
       if (extraAcc >= sellExtraKwh) break;
       if (chargeKeys.has(s.key)) continue;
-      if (s.buyC > maxBuyForSell) {
-        // 这个槽买入太贵，充来卖会亏本，跳过
+      // 核心判断：实际卖电收入 vs 买电成本，25%利润即可
+      if (actualAvgFeedIn < s.buyC * 1.25) {
         continue;
       }
       chargeKeys.add(s.key);
       extraAcc += s.chargeKwhPer;
     }
     if (extraAcc < sellExtraKwh) {
-      console.log(`[卖电充电] 只选到 ${extraAcc.toFixed(1)}/${sellExtraKwh.toFixed(1)}kWh（买价上限 ${maxBuyForSell.toFixed(1)}¢ 限制）`);
+      console.log(`[卖电充电] 只选到 ${extraAcc.toFixed(1)}/${sellExtraKwh.toFixed(1)}kWh（需 feedIn>${'buyC×1.25'}）`);
     }
   }
 
@@ -552,11 +561,18 @@ function buildPlan(slots, pvByHour, currentSoc, hasDW, avgBuyC = 6.5, nightReser
       // 但如果已超过基础目标(65%)，剩余是卖电用的，必须有利润
       const baseKwh = SOC_TARGET * BATT_KWH;
       const isForSell = socKwh >= baseKwh;
-      const maxBuyForSell = sellMinC / (1 + SELL_MIN_MARGIN_PCT);
-      if (isForSell && s.buyC > maxBuyForSell) {
-        // 买来卖会亏本，不充
+      // 用实际卖电feedIn判断，25%利润即可
+      const sellSlotsForCheck = slots.filter(sl => {
+        const sh = parseInt(sl.key.split(':')[0]);
+        return sh >= 16 && sh <= 21 && sl.feedInC > 10;
+      });
+      const checkFeedIn = sellSlotsForCheck.length > 0
+        ? sellSlotsForCheck.reduce((sum, sl) => sum + sl.feedInC, 0) / sellSlotsForCheck.length
+        : sellMinC;
+      if (isForSell && checkFeedIn < s.buyC * 1.25) {
+        // 卖电利润不足25%，不充
         action = 'self-use';
-        reason = `buy=${s.buyC}¢ > sell-limit ${maxBuyForSell.toFixed(1)}¢, skip`;
+        reason = `buy=${s.buyC}¢, feedIn=${checkFeedIn.toFixed(1)}¢ <25%利润, skip`;
       } else {
         action   = 'charge';
         chargeKw = maxChargeKw;
