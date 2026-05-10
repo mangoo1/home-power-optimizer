@@ -106,18 +106,34 @@ async function fetchAmberPrices() {
 }
 
 function aggregateAmberTo30min(raw, today) {
-  const slots = {};
+  // 先按 5 分钟间隔分组，优先用 Actual/Current 价格，只有没有实际价时才用 Forecast
+  const fiveMin = {};
   for (const p of raw) {
     const sydStart = new Date(new Date(p.startTime).getTime() + 10 * 3600 * 1000);
     const sydDate  = sydStart.toISOString().substring(0, 10);
     if (sydDate !== today) continue;
-    const hh  = sydStart.toISOString().substring(11, 13);
-    const mm  = parseInt(sydStart.toISOString().substring(14, 16)) < 30 ? '00' : '30';
-    const key = `${hh}:${mm}`;
+    const ts = sydStart.toISOString().substring(11, 16); // HH:MM
+    const isActual = p.type === 'ActualInterval' || p.type === 'CurrentInterval';
+    if (!fiveMin[ts]) fiveMin[ts] = { actual: [], forecast: [], dw: false };
+    const entry = { channelType: p.channelType, perKwh: p.perKwh };
+    if (isActual) fiveMin[ts].actual.push(entry);
+    else          fiveMin[ts].forecast.push(entry);
+    if (p.tariffInformation?.demandWindow) fiveMin[ts].dw = true;
+  }
+
+  // 聚合到 30 分钟槽
+  const slots = {};
+  for (const [ts, data] of Object.entries(fiveMin)) {
+    const mm30 = parseInt(ts.substring(3, 5)) < 30 ? '00' : '30';
+    const key  = `${ts.substring(0, 2)}:${mm30}`;
     if (!slots[key]) slots[key] = { buySum: 0, feedInSum: 0, count: 0, demandWindow: false };
-    if (p.channelType === 'general') { slots[key].buySum += p.perKwh; slots[key].count++; }
-    if (p.channelType === 'feedIn')  slots[key].feedInSum += Math.abs(p.perKwh);
-    if (p.tariffInformation?.demandWindow) slots[key].demandWindow = true;
+    // 优先用 actual，没有才用 forecast
+    const prices = data.actual.length > 0 ? data.actual : data.forecast;
+    for (const e of prices) {
+      if (e.channelType === 'general') { slots[key].buySum += e.perKwh; slots[key].count++; }
+      if (e.channelType === 'feedIn')  slots[key].feedInSum += Math.abs(e.perKwh);
+    }
+    if (data.dw) slots[key].demandWindow = true;
   }
   return Object.entries(slots)
     .map(([key, v]) => ({
@@ -249,26 +265,25 @@ function scheduleHotWater(slots) {
     };
   }
 
-  // 1. 先选 GF 热水器（小热水器，保温优先 → 选便宜且偏晚的）
-  const gfWin = findCheapestWindow(candidates, HW_DURATION_SLOTS);
-  if (!gfWin) {
-    console.log('[热水器] ⚠️ 无法安排 GF 热水器（候选槽不足）');
-    return { mainHw: null, gfHw: null };
-  }
-  console.log(`[GF热水器] ${gfWin.startKey}–${gfWin.endKey} 均价=${gfWin.avgBuyC}¢`);
-
-  // 2. 主热水器：排除 GF 时间段后，再选最便宜的连续4槽
-  const gfOccupied = new Set(gfWin.slots.map(s => s.key));
-  const mainCandidates = candidates.filter(s => !gfOccupied.has(s.key));
-  const mainWin = findCheapestWindow(mainCandidates, HW_DURATION_SLOTS);
+  // 1. 先选主热水器（用电量大、优先级高）
+  const mainWin = findCheapestWindow(candidates, HW_DURATION_SLOTS);
   if (!mainWin) {
     console.log('[热水器] ⚠️ 无法安排主热水器（候选槽不足）');
-    return { mainHw: null, gfHw: gfWin };
+    return { mainHw: null, gfHw: null };
   }
   console.log(`[主热水器] ${mainWin.startKey}–${mainWin.endKey} 均价=${mainWin.avgBuyC}¢`);
 
-  // 确保主热水器在前（时间顺序），如果 GF 更早则交换
-  // 规则：两台不重叠即可，谁先谁后取决于电价
+  // 2. GF 热水器：必须排在主热水器之后（最后通电），排除主热水器时间段 + 之前的槽
+  const mainOccupied = new Set(mainWin.slots.map(s => s.key));
+  const mainEndKey = mainWin.endKey;
+  const gfCandidates = candidates.filter(s => !mainOccupied.has(s.key) && s.key >= mainEndKey);
+  const gfWin = findCheapestWindow(gfCandidates, HW_DURATION_SLOTS);
+  if (!gfWin) {
+    console.log('[热水器] ⚠️ 无法安排 GF 热水器（候选槽不足）');
+    return { mainHw: mainWin, gfHw: null };
+  }
+  console.log(`[GF热水器] ${gfWin.startKey}–${gfWin.endKey} 均价=${gfWin.avgBuyC}¢`);
+
   return { mainHw: mainWin, gfHw: gfWin };
 }
 
@@ -397,8 +412,9 @@ function buildPlan(slots, pvByHour, currentSocPct, sellSlots, hwSlots) {
       action = 'sell';
       sellKw = MAX_SELL_KW;
       reason = `feedIn=${s.feedInC}¢`;
-    } else if (socKwh < chargeTargetKwh && s.buyC < avgSellC * 0.8) {
-      // 低价补充：买价 < 卖电均价80%，值得从电网充（不只靠PV余量）
+    } else if (socKwh < chargeTargetKwh && s.buyC < avgSellC * 0.8 && s.buyC < 8) {
+      // 低价补充：买价 < 卖电均价80% 且 < 8¢（绝对低价），才值得从电网充
+      // 防止 10¢ 买入然后 10¢ 卖出的搞笑操作
       action = 'charge';
       const gridRoom = parseFloat(Math.min(maxChargeKw, BREAKER_KW - hl - CHARGE_BUFFER).toFixed(2));
       chargeKw = Math.max(0.5, gridRoom);
@@ -464,8 +480,8 @@ function printPlan(plan, currentSocPct, today, chargeTargetPct, sellSlotCount) {
   const sellSlots   = plan.filter(s => s.action === 'sell');
   const totalChargeKwh = chargeSlots.reduce((s, x) => s + x.chargeKw * 0.5 * 0.95, 0);
   const totalSellKwh   = sellSlots.reduce((s, x) => s + x.sellKw * 0.5, 0);
-  const avgBuyC  = chargeSlots.length > 0 ? chargeSlots.reduce((s,x) => s + x.buyC, 0) / chargeSlots.length : 0;
-  const avgSellC = sellSlots.length > 0 ? sellSlots.reduce((s,x) => s + x.feedInC, 0) / sellSlots.length : 0;
+  const avgBuyC  = totalChargeKwh > 0 ? chargeSlots.reduce((s,x) => s + x.buyC * x.chargeKw * 0.5 * 0.95, 0) / totalChargeKwh : 0;
+  const avgSellC = totalSellKwh > 0 ? sellSlots.reduce((s,x) => s + x.feedInC * x.sellKw * 0.5, 0) / totalSellKwh : 0;
 
   lines.push(`\n📊 摘要:`);
   lines.push(`  充电: ${chargeSlots.length}槽 ${totalChargeKwh.toFixed(1)}kWh 均价${avgBuyC.toFixed(1)}¢`);
@@ -612,10 +628,11 @@ async function main() {
   const version = (lastVer?.v ?? 0) + 1;
 
   const chargeSlots = plan.filter(s => s.action === 'charge');
+  const totalCKwh = chargeSlots.reduce((s, x) => s + x.chargeKw * 0.5 * 0.95, 0);
   const chargeWindows = chargeSlots.length > 0 ? [{
     startHour: parseInt(chargeSlots[0].key),
     endHour:   parseInt(chargeSlots[chargeSlots.length-1].key) + 1,
-    avgBuyC:   parseFloat((chargeSlots.reduce((s,x)=>s+x.buyC,0)/chargeSlots.length).toFixed(1)),
+    avgBuyC:   parseFloat((totalCKwh > 0 ? chargeSlots.reduce((s,x)=>s+x.buyC*x.chargeKw*0.5*0.95,0)/totalCKwh : 0).toFixed(1)),
   }] : [];
 
   const notes = JSON.stringify({

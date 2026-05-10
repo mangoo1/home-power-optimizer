@@ -282,7 +282,12 @@ async function main() {
   const mainExclude = hwMainWindow
     ? [{ startH: hwMainWindow.startH + (hwMainWindow.startMin||0)/60, endH: hwMainWindow.startH + (hwMainWindow.startMin||0)/60 + hwMainWindow.hours }]
     : [];
-  const hwGfWindow   = pickHwWindow(todaySlots, pvByHour, HW_GF_KW, mainExclude);
+  // GF 必须排在主热水器之后（最后通电）
+  const mainEndH = hwMainWindow ? hwMainWindow.startH + (hwMainWindow.startMin||0)/60 + hwMainWindow.hours : 0;
+  const gfExclude = hwMainWindow
+    ? [{ startH: 0, endH: mainEndH }]  // 排除主热水器结束之前的所有时间
+    : [];
+  const hwGfWindow   = pickHwWindow(todaySlots, pvByHour, HW_GF_KW, gfExclude);
 
   // Build hardware_tasks array (the single source of truth for executor)
   const hardwareTasks = [];
