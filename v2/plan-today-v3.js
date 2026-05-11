@@ -325,12 +325,21 @@ function buildPlan(slots, pvByHour, currentSocPct, sellSlots, hwSlots) {
   console.log(`[策略] 当前: ${currentSocPct}% (${currentKwh.toFixed(1)}kWh) | 需充: ${neededKwh.toFixed(1)}kWh`);
 
   // 选充电槽：15:00前最便宜的时段，充到目标
-  // 不设硬性价格上限——只要卖电价 > 买入价就有利润，值得充
-  // 按价格从低到高选，自然优先选便宜的
+  // 动态价格上限：买入价必须保证 SELL_PROFIT_MARGIN 利润率
+  // buyMaxC = avgFeedIn / (1 + SELL_PROFIT_MARGIN)，即卖价能覆盖买价+利润
+  const avgFeedInC = sellSlots.length > 0
+    ? sellSlots.reduce((s, x) => s + x.feedInC, 0) / sellSlots.length
+    : 0;
+  // 如果没有卖电槽，只充过夜用电——用保守上限 10¢
+  const buyMaxDynamic = sellSlots.length > 0
+    ? avgFeedInC / (1 + SELL_PROFIT_MARGIN)
+    : 10.0;
+  console.log(`[充电] 动态买价上限: ${buyMaxDynamic.toFixed(1)}¢ (avgFeedIn=${avgFeedInC.toFixed(1)}¢, 利润率=${(SELL_PROFIT_MARGIN*100).toFixed(0)}%)`);
+
   const chargeCandidates = slots
     .filter(s => {
       const h = parseInt(s.key.split(':')[0]);
-      return h < CHARGE_DEADLINE_HOUR && !s.dw && s.buyC > 0;
+      return h < CHARGE_DEADLINE_HOUR && !s.dw && s.buyC > 0 && s.buyC <= buyMaxDynamic;
     })
     .sort((a, b) => a.buyC - b.buyC);
 
@@ -356,7 +365,7 @@ function buildPlan(slots, pvByHour, currentSocPct, sellSlots, hwSlots) {
     const first = sortedCK[0], last = sortedCK[sortedCK.length - 1];
     for (const s of slots) {
       const h = parseInt(s.key.split(':')[0]);
-      if (!chargeKeys.has(s.key) && s.key >= first && s.key <= last && !s.dw && h < CHARGE_DEADLINE_HOUR) {
+      if (!chargeKeys.has(s.key) && s.key >= first && s.key <= last && !s.dw && h < CHARGE_DEADLINE_HOUR && s.buyC <= buyMaxDynamic) {
         // 检查该槽是否有足够充电空间
         const [sh, sm] = s.key.split(':').map(Number);
         const pv = pvByHour[sh] ?? 0;
