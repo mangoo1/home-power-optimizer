@@ -428,6 +428,12 @@ function buildPlan(slots, pvByHour, currentSocPct, sellSlots, hwSlots) {
       const gridRoom = parseFloat(Math.min(maxChargeKw, BREAKER_KW - hl - CHARGE_BUFFER).toFixed(2));
       chargeKw = Math.max(0.5, gridRoom);
       reason = `cheap buy=${s.buyC}¢<${(avgSellC*0.8).toFixed(1)}¢ grid-charge`;
+    } else if (hwSlots && hwSlots.has(s.key) && hl > 3) {
+      // 热水器运行时段：绝不能 self-use（会放电给热水器，浪费电池）
+      // 强制小功率充电或 backup，让电网供热水器
+      action = 'charge';
+      chargeKw = Math.max(0.1, maxChargeKw);
+      reason = `热水器运行中，禁止放电 buy=${s.buyC}¢`;
     } else if (pv > 0.2 && socKwh < chargeTargetKwh) {
       // PV 消纳（纯太阳能余量，不管电价）
       action = 'charge';
