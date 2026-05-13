@@ -265,26 +265,68 @@ function scheduleHotWater(slots) {
     };
   }
 
-  // 1. 先选主热水器（用电量大、优先级高）
-  const mainWin = findCheapestWindow(candidates, HW_DURATION_SLOTS);
-  if (!mainWin) {
-    console.log('[热水器] ⚠️ 无法安排主热水器（候选槽不足）');
-    return { mainHw: null, gfHw: null };
-  }
-  console.log(`[主热水器] ${mainWin.startKey}–${mainWin.endKey} 均价=${mainWin.avgBuyC}¢`);
+  // 两台热水器都必须排上，主在前 GF 在后，不重叠。
+  // 枚举所有主热水器窗口，对每个找其后最便宜的 GF 窗口，选总均价最低的组合。
+  const N = HW_DURATION_SLOTS;
+  let bestCombo = null, bestTotalAvg = Infinity;
 
-  // 2. GF 热水器：必须排在主热水器之后（最后通电），排除主热水器时间段 + 之前的槽
-  const mainOccupied = new Set(mainWin.slots.map(s => s.key));
-  const mainEndKey = mainWin.endKey;
-  const gfCandidates = candidates.filter(s => !mainOccupied.has(s.key) && s.key >= mainEndKey);
-  const gfWin = findCheapestWindow(gfCandidates, HW_DURATION_SLOTS);
-  if (!gfWin) {
-    console.log('[热水器] ⚠️ 无法安排 GF 热水器（候选槽不足）');
+  // 枚举所有合法的主热水器连续窗口
+  for (let i = 0; i <= candidates.length - N; i++) {
+    // 检查连续性
+    let consecutive = true;
+    for (let j = 0; j < N - 1; j++) {
+      const [h1, m1] = candidates[i+j].key.split(':').map(Number);
+      const [h2, m2] = candidates[i+j+1].key.split(':').map(Number);
+      if ((h2*60+m2) - (h1*60+m1) !== 30) { consecutive = false; break; }
+    }
+    if (!consecutive) continue;
+
+    const mainSlots = candidates.slice(i, i + N);
+    const mainEndKey = (() => {
+      const [eh, em] = mainSlots[N-1].key.split(':').map(Number);
+      const endMins = eh*60+em+30;
+      return `${String(Math.floor(endMins/60)).padStart(2,'0')}:${String(endMins%60).padStart(2,'0')}`;
+    })();
+    const mainOccupied = new Set(mainSlots.map(s => s.key));
+
+    // GF 候选：主热水器之后，不重叠
+    const gfPool = candidates.filter(s => !mainOccupied.has(s.key) && s.key >= mainEndKey);
+    const gfWin = findCheapestWindow(gfPool, N);
+    if (!gfWin) continue;
+
+    const mainAvg = mainSlots.reduce((s, x) => s + x.buyC, 0) / N;
+    const totalAvg = (mainAvg + gfWin.avgBuyC) / 2;
+    if (totalAvg < bestTotalAvg) {
+      bestTotalAvg = totalAvg;
+      const [meh, mem] = mainSlots[N-1].key.split(':').map(Number);
+      const mEndMins = meh*60+mem+30;
+      bestCombo = {
+        mainHw: {
+          startKey: mainSlots[0].key,
+          endKey: mainEndKey,
+          avgBuyC: parseFloat(mainAvg.toFixed(2)),
+          slots: mainSlots,
+        },
+        gfHw: gfWin,
+      };
+    }
+  }
+
+  if (!bestCombo) {
+    // 降级：至少排主热水器
+    const mainWin = findCheapestWindow(candidates, N);
+    if (!mainWin) {
+      console.log('[热水器] ⚠️ 无法安排任何热水器（候选槽不足）');
+      return { mainHw: null, gfHw: null };
+    }
+    console.log(`[主热水器] ${mainWin.startKey}–${mainWin.endKey} 均价=${mainWin.avgBuyC}¢`);
+    console.log('[热水器] ⚠️ 无法安排 GF 热水器（排完主热水器后候选槽不足）');
     return { mainHw: mainWin, gfHw: null };
   }
-  console.log(`[GF热水器] ${gfWin.startKey}–${gfWin.endKey} 均价=${gfWin.avgBuyC}¢`);
 
-  return { mainHw: mainWin, gfHw: gfWin };
+  console.log(`[主热水器] ${bestCombo.mainHw.startKey}–${bestCombo.mainHw.endKey} 均价=${bestCombo.mainHw.avgBuyC}¢`);
+  console.log(`[GF热水器] ${bestCombo.gfHw.startKey}–${bestCombo.gfHw.endKey} 均价=${bestCombo.gfHw.avgBuyC}¢`);
+  return bestCombo;
 }
 
 // ── 核心：新卖电策略 ──────────────────────────────────────────
