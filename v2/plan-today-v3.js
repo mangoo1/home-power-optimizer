@@ -54,8 +54,9 @@ const SELL_WINDOW_START    = 16;     // 卖电窗口起始 16:00
 const SELL_WINDOW_END      = 21;     // 卖电窗口结束 21:00（最晚）
 const CHARGE_DEADLINE_HOUR = 15;     // 充电截止时间 15:00（之后转 self-use 等卖电）
 const SELL_MIN_FEEDIN_C    = e('SELL_FLOOR_C', 5.0); // 最低卖电价 5¢
-const SELL_PROFIT_MARGIN   = e('SELL_PROFIT_MARGIN', 0.25); // 卖电利润率门槛 25%（avgFeedIn >= avgChargeCost * 1.25）
-// 不再用固定 BUY_MAX_C 硬性限制——只要卖电利润覆盖买入成本就值得充
+const SELL_PROFIT_MARGIN   = e('SELL_PROFIT_MARGIN', 0.25); // 卖电利润率门槛（保留变量兼容）
+const MIN_PROFIT_SPREAD_C = e('MIN_PROFIT_SPREAD_C', 3.0);  // 卖电绝对差价门槛：feedIn均价 > 充电均价 + 3¢ 即可卖
+// 决策逻辑：用上午充电区均价 vs 下午卖电区 feedIn 均价判断，差价 >= 3¢ 就充满去卖
 
 // ── 工具函数 ──────────────────────────────────────────────────
 function sydneyNow() {
@@ -367,16 +368,14 @@ function buildPlan(slots, pvByHour, currentSocPct, sellSlots, hwSlots) {
   console.log(`[策略] 当前: ${currentSocPct}% (${currentKwh.toFixed(1)}kWh) | 需充: ${neededKwh.toFixed(1)}kWh`);
 
   // 选充电槽：15:00前最便宜的时段，充到目标
-  // 动态价格上限：买入价必须保证 SELL_PROFIT_MARGIN 利润率
-  // buyMaxC = avgFeedIn / (1 + SELL_PROFIT_MARGIN)，即卖价能覆盖买价+利润
+  // 买价上限：卖电时 = feedIn均价 - 3¢（保底利润）；不卖电时 = 保守 12¢
   const avgFeedInC = sellSlots.length > 0
     ? sellSlots.reduce((s, x) => s + x.feedInC, 0) / sellSlots.length
     : 0;
-  // 如果没有卖电槽，只充过夜用电——用保守上限 10¢
   const buyMaxDynamic = sellSlots.length > 0
-    ? avgFeedInC / (1 + SELL_PROFIT_MARGIN)
-    : 10.0;
-  console.log(`[充电] 动态买价上限: ${buyMaxDynamic.toFixed(1)}¢ (avgFeedIn=${avgFeedInC.toFixed(1)}¢, 利润率=${(SELL_PROFIT_MARGIN*100).toFixed(0)}%)`);
+    ? avgFeedInC - MIN_PROFIT_SPREAD_C   // 卖15¢ → 最多买12¢
+    : 12.0;                               // 不卖电：过夜用，12¢以下都可以买
+  console.log(`[充电] 动态买价上限: ${buyMaxDynamic.toFixed(1)}¢ (avgFeedIn=${avgFeedInC.toFixed(1)}¢, 保底差价${MIN_PROFIT_SPREAD_C}¢)`);
 
   const chargeCandidates = slots
     .filter(s => {
@@ -622,40 +621,37 @@ async function main() {
     hardwareTasks.push({ device: 'gf_hw', action: 'off', time: gfHw.endKey });
   }
 
-  // 利润校验：预估充电均价，只有 avgFeedIn >= avgChargeCost * (1 + SELL_PROFIT_MARGIN) 才卖
+  // 利润校验：上午充电区均价 vs 下午卖电区 feedIn 均价，差价 >= 3¢ 就卖
   if (sellSlots.length > 0) {
     const avgFeedIn = sellSlots.reduce((s, x) => s + x.feedInC, 0) / sellSlots.length;
-    // 预估充电成本：选最便宜的槽（和 buildPlan 一样的逻辑）
-    const avgSellCEst = sellSlots.length > 0 ? sellSlots.reduce((s,x) => s + x.feedInC, 0) / sellSlots.length : 15;
-    const chargeCandidates = slots
-      .filter(s => {
-        const h = parseInt(s.key.split(':')[0]);
-        return !s.dw && s.buyC > 0 && (h < CHARGE_DEADLINE_HOUR || s.buyC < avgSellCEst * 0.8);
-      })
-      .sort((a, b) => a.buyC - b.buyC);
-    // 需要充多少槽来覆盖卖电
-    const sellKwh = sellSlots.length * SELL_KWH_PER_HOUR / 2;
-    const chargeForSell = chargeCandidates.slice(0, sellSlots.length); // 粗略等量
-    let avgChargeCost = chargeForSell.length > 0
-      ? chargeForSell.reduce((s, x) => s + x.buyC, 0) / chargeForSell.length
+
+    // 充电区均价：08:00-15:00 所有非DW的可用槽
+    const chargeZoneSlots = allSlots.filter(s => {
+      const h = parseInt(s.key.split(':')[0]);
+      return h >= HW_EARLIEST_H && h < CHARGE_DEADLINE_HOUR && !s.dw && s.buyC > 0;
+    });
+    let avgChargeCost = chargeZoneSlots.length > 0
+      ? chargeZoneSlots.reduce((s, x) => s + x.buyC, 0) / chargeZoneSlots.length
       : 0;
-    // 没有可用充电槽时，用今天实际充电均价（不能当0算，电不是免费的）
+
+    // 兜底：如果没有充电区价格数据，查今日实际充电均价或用 10¢
     if (avgChargeCost === 0) {
       try {
         const todayAvg = db.prepare(
           "SELECT AVG(buy_price) as avg_buy FROM energy_log WHERE date(ts, '+10 hours')=? AND charge_kw > 0 AND buy_price > 0"
         ).get(today);
-        avgChargeCost = todayAvg?.avg_buy || 10.0; // 兜底 10¢
-        console.log(`[利润校验] 无可用充电槽，用今日实际充电均价: ${avgChargeCost.toFixed(1)}¢`);
+        avgChargeCost = todayAvg?.avg_buy || 10.0;
+        console.log(`[利润校验] 无充电区价格，用今日实际充电均价: ${avgChargeCost.toFixed(1)}¢`);
       } catch { avgChargeCost = 10.0; }
     }
-    const minRequired = avgChargeCost * (1 + SELL_PROFIT_MARGIN);
-    console.log(`[利润校验] avgFeedIn=${avgFeedIn.toFixed(1)}¢ avgChargeCost=${avgChargeCost.toFixed(1)}¢ 需要>=${minRequired.toFixed(1)}¢ (${(SELL_PROFIT_MARGIN*100).toFixed(0)}%利润)`);
-    if (avgFeedIn < minRequired) {
-      console.log(`[利润校验] ❌ 利润不足 ${((avgFeedIn/avgChargeCost-1)*100).toFixed(0)}% < ${(SELL_PROFIT_MARGIN*100).toFixed(0)}%，取消卖电`);
+
+    const spread = avgFeedIn - avgChargeCost;
+    console.log(`[利润校验] 充电区均价=${avgChargeCost.toFixed(1)}¢ 卖电区feedIn=${avgFeedIn.toFixed(1)}¢ 差价=${spread.toFixed(1)}¢ (门槛>=${MIN_PROFIT_SPREAD_C}¢)`);
+    if (spread < MIN_PROFIT_SPREAD_C) {
+      console.log(`[利润校验] ❌ 差价${spread.toFixed(1)}¢ < ${MIN_PROFIT_SPREAD_C}¢，取消卖电`);
       sellSlots = [];
     } else {
-      console.log(`[利润校验] ✅ 利润 ${((avgFeedIn/avgChargeCost-1)*100).toFixed(0)}% >= ${(SELL_PROFIT_MARGIN*100).toFixed(0)}%，执行卖电`);
+      console.log(`[利润校验] ✅ 差价${spread.toFixed(1)}¢ >= ${MIN_PROFIT_SPREAD_C}¢，执行卖电`);
     }
   }
 
