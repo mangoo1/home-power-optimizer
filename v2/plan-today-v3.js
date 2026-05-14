@@ -372,10 +372,11 @@ function buildPlan(slots, pvByHour, currentSocPct, sellSlots, hwSlots) {
   const avgFeedInC = sellSlots.length > 0
     ? sellSlots.reduce((s, x) => s + x.feedInC, 0) / sellSlots.length
     : 0;
+  // 买价上限：卖电 feedIn 倒推，保证 25% 利润率或 3¢ 差价（取宽松的）
   const buyMaxDynamic = sellSlots.length > 0
-    ? avgFeedInC - MIN_PROFIT_SPREAD_C   // 卖15¢ → 最多买12¢
-    : 12.0;                               // 不卖电：过夜用，12¢以下都可以买
-  console.log(`[充电] 动态买价上限: ${buyMaxDynamic.toFixed(1)}¢ (avgFeedIn=${avgFeedInC.toFixed(1)}¢, 保底差价${MIN_PROFIT_SPREAD_C}¢)`);
+    ? Math.max(avgFeedInC / (1 + SELL_PROFIT_MARGIN), avgFeedInC - MIN_PROFIT_SPREAD_C)
+    : 12.0;
+  console.log(`[充电] 动态买价上限: ${buyMaxDynamic.toFixed(1)}¢ (avgFeedIn=${avgFeedInC.toFixed(1)}¢)`);
 
   const chargeCandidates = slots
     .filter(s => {
@@ -645,13 +646,15 @@ async function main() {
       } catch { avgChargeCost = 10.0; }
     }
 
-    const spread = avgFeedIn - avgChargeCost;
-    console.log(`[利润校验] 充电区均价=${avgChargeCost.toFixed(1)}¢ 卖电区feedIn=${avgFeedIn.toFixed(1)}¢ 差价=${spread.toFixed(1)}¢ (门槛>=${MIN_PROFIT_SPREAD_C}¢)`);
-    if (spread < MIN_PROFIT_SPREAD_C) {
-      console.log(`[利润校验] ❌ 差价${spread.toFixed(1)}¢ < ${MIN_PROFIT_SPREAD_C}¢，取消卖电`);
+    const minByMargin = avgChargeCost * (1 + SELL_PROFIT_MARGIN); // 25% 利润率
+    const minBySpread = avgChargeCost + MIN_PROFIT_SPREAD_C;      // 绝对差价 3¢
+    const minRequired = Math.min(minByMargin, minBySpread);       // 取较低门槛
+    console.log(`[利润校验] 充电区均价=${avgChargeCost.toFixed(1)}¢ 卖电区feedIn=${avgFeedIn.toFixed(1)}¢ 门槛=min(×1.25=${minByMargin.toFixed(1)}¢, +3¢=${minBySpread.toFixed(1)}¢)=${minRequired.toFixed(1)}¢`);
+    if (avgFeedIn < minRequired) {
+      console.log(`[利润校验] ❌ feedIn ${avgFeedIn.toFixed(1)}¢ < ${minRequired.toFixed(1)}¢，取消卖电`);
       sellSlots = [];
     } else {
-      console.log(`[利润校验] ✅ 差价${spread.toFixed(1)}¢ >= ${MIN_PROFIT_SPREAD_C}¢，执行卖电`);
+      console.log(`[利润校验] ✅ feedIn ${avgFeedIn.toFixed(1)}¢ >= ${minRequired.toFixed(1)}¢，执行卖电`);
     }
   }
 
