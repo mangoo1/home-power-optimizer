@@ -583,8 +583,35 @@ async function main() {
   // 核心：选卖电槽（带利润校验）
   let sellSlots = planSellSlots(slots);
 
-  // 热水器调度
-  const { mainHw, gfHw } = scheduleHotWater(slots);
+  // 热水器调度（用全天槽位排，不受"已过去"过滤影响）
+  let { mainHw, gfHw } = scheduleHotWater(allSlots);
+
+  // 如果重跑时排不上热水器，继承前一版本的安排
+  if (!mainHw || !gfHw) {
+    try {
+      const prev = db.prepare("SELECT notes FROM daily_plan WHERE date=? AND is_active=0 ORDER BY version DESC LIMIT 1").get(today);
+      if (prev) {
+        const prevNotes = JSON.parse(prev.notes || '{}');
+        const prevTasks = prevNotes.hardwareTasks || [];
+        if (!mainHw) {
+          const prevMainOn = prevTasks.find(t => t.device === 'main_hw' && t.action === 'on');
+          const prevMainOff = prevTasks.find(t => t.device === 'main_hw' && t.action === 'off');
+          if (prevMainOn && prevMainOff && prevMainOff.time > nowKey) {
+            mainHw = { startKey: prevMainOn.time, endKey: prevMainOff.time, avgBuyC: 0, slots: [] };
+            console.log(`[主热水器] 继承前版计划: ${mainHw.startKey}–${mainHw.endKey}`);
+          }
+        }
+        if (!gfHw) {
+          const prevGfOn = prevTasks.find(t => t.device === 'gf_hw' && t.action === 'on');
+          const prevGfOff = prevTasks.find(t => t.device === 'gf_hw' && t.action === 'off');
+          if (prevGfOn && prevGfOff && prevGfOff.time > nowKey) {
+            gfHw = { startKey: prevGfOn.time, endKey: prevGfOff.time, avgBuyC: 0, slots: [] };
+            console.log(`[GF热水器] 继承前版计划: ${gfHw.startKey}–${gfHw.endKey}`);
+          }
+        }
+      }
+    } catch (e) { console.warn('[热水器] 继承前版失败:', e.message); }
+  }
   const hardwareTasks = [];
   if (mainHw) {
     hardwareTasks.push({ device: 'main_hw', action: 'on',  time: mainHw.startKey });

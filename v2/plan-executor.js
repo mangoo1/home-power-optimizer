@@ -876,9 +876,18 @@ async function main() {
     action = 'hotwater';
 
   } else if (slot.action === 'standby' || slot.action === 'self-use') {
+    // 热水器保护：homeLoad 高时停止电池放电，让电网供热水器
+    if (ess.homeLoad > 4.0 && ess.battPower < -1.0) {
+      // 电池在放电且家用负载高（热水器可能在跑）——切 Timed + charge 0.1kW + discharge 0 保护电池
+      console.log(`[热水器保护] homeLoad=${ess.homeLoad.toFixed(1)}kW, battPower=${ess.battPower.toFixed(1)}kW → 停止放电，让电网供热水器`);
+      await essApi.setMode(1, 'hw-protect-timed');
+      await essApi.setChargeKw(0.1, 'hw-protect-min-charge', 'executor');
+      await essApi.setDischargeKw(0, 'hw-protect-no-discharge', 'executor');
+      action = 'hw-protect';
+      logData(db, ess, amber, slot, 'hw-protect', { homeLoad: ess.homeLoad, battPower: ess.battPower });
+    } else {
     // 自用/待机：充电窗口由 plan-today 决定，executor 不做机会充电
     // 若逆变器还在 Timed 模式，检查后续是否有 sell 时段——有的话保留 Timed
-    {
       if (ess.reportedMode === 1) {
         const nowMins = syd.hh * 60 + syd.mi;
         const hasFutureSell = intervals.some(s => {
@@ -895,7 +904,7 @@ async function main() {
         }
       }
       action = slot.action;
-    }
+    } // end else (no hw-protect)
 
   }
 
