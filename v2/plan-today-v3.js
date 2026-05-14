@@ -636,9 +636,19 @@ async function main() {
     // 需要充多少槽来覆盖卖电
     const sellKwh = sellSlots.length * SELL_KWH_PER_HOUR / 2;
     const chargeForSell = chargeCandidates.slice(0, sellSlots.length); // 粗略等量
-    const avgChargeCost = chargeForSell.length > 0
+    let avgChargeCost = chargeForSell.length > 0
       ? chargeForSell.reduce((s, x) => s + x.buyC, 0) / chargeForSell.length
-      : 0; // 电池已有电，沉没成本=0，卖出即赚
+      : 0;
+    // 没有可用充电槽时，用今天实际充电均价（不能当0算，电不是免费的）
+    if (avgChargeCost === 0) {
+      try {
+        const todayAvg = db.prepare(
+          "SELECT AVG(buy_price) as avg_buy FROM energy_log WHERE date(ts, '+10 hours')=? AND charge_kw > 0 AND buy_price > 0"
+        ).get(today);
+        avgChargeCost = todayAvg?.avg_buy || 10.0; // 兜底 10¢
+        console.log(`[利润校验] 无可用充电槽，用今日实际充电均价: ${avgChargeCost.toFixed(1)}¢`);
+      } catch { avgChargeCost = 10.0; }
+    }
     const minRequired = avgChargeCost * (1 + SELL_PROFIT_MARGIN);
     console.log(`[利润校验] avgFeedIn=${avgFeedIn.toFixed(1)}¢ avgChargeCost=${avgChargeCost.toFixed(1)}¢ 需要>=${minRequired.toFixed(1)}¢ (${(SELL_PROFIT_MARGIN*100).toFixed(0)}%利润)`);
     if (avgFeedIn < minRequired) {
@@ -687,7 +697,7 @@ async function main() {
     }
     const achievableKwh = currentSocPct / 100 * BATT_KWH + estChargeKwh;
     const achievablePct = Math.round(achievableKwh / BATT_KWH * 100);
-    const surplusKwh = Math.max(0, achievableKwh - (OVERNIGHT_RESERVE_PCT / 100 * BATT_KWH));
+    const surplusKwh = Math.max(0, achievableKwh - (NO_SELL_RESERVE_PCT / 100 * BATT_KWH));
     const maxSellSlots = Math.floor(surplusKwh / (SELL_KWH_PER_HOUR / 2));
     console.log(`[可行性] 最大可充到 ${achievablePct}% (${achievableKwh.toFixed(1)}kWh)，过夜保底 ${NO_SELL_RESERVE_PCT}%，可卖 ${maxSellSlots} 槽`);
     if (maxSellSlots < sellSlots.length) {
