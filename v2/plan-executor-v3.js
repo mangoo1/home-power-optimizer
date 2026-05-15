@@ -867,6 +867,110 @@ async function main() {
     }
   } catch(e) { console.warn('[cost_log] 写入失败:', e.message); }
 
+  // 7c. daily_summary upsert
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS daily_summary (
+      date TEXT PRIMARY KEY,
+      intervals INTEGER DEFAULT 0,
+      home_kwh REAL DEFAULT 0,
+      grid_buy_kwh REAL DEFAULT 0,
+      grid_sell_kwh REAL DEFAULT 0,
+      cost_aud REAL DEFAULT 0,
+      earnings_aud REAL DEFAULT 0,
+      demand_peak_kw REAL DEFAULT 0,
+      demand_charge_est REAL DEFAULT 0,
+      avg_soc REAL DEFAULT 0,
+      min_soc REAL DEFAULT 100,
+      max_soc REAL DEFAULT 0,
+      meter_buy_start REAL,
+      meter_buy_end REAL,
+      meter_sell_start REAL,
+      meter_sell_end REAL,
+      pv_kwh REAL DEFAULT 0,
+      charge_grid_kwh REAL DEFAULT 0,
+      discharge_kwh REAL DEFAULT 0,
+      mode_changes INTEGER DEFAULT 0,
+      sell_sessions INTEGER DEFAULT 0,
+      charge_sessions INTEGER DEFAULT 0
+    )`);
+    const today = `${syd.y}-${String(syd.mo).padStart(2,'0')}-${String(syd.d).padStart(2,'0')}`;
+    const meterBuyDelta  = ess.meterBuy != null ? (() => {
+      try {
+        const prev = db.prepare("SELECT meter_buy_total FROM energy_log WHERE meter_buy_total IS NOT NULL ORDER BY ts DESC LIMIT 1 OFFSET 1").get();
+        if (prev) { const d = parseFloat((ess.meterBuy - prev.meter_buy_total).toFixed(4)); return (d >= 0 && d < 2) ? d : 0; }
+      } catch {} return 0;
+    })() : 0;
+    const meterSellDelta = ess.meterSell != null ? (() => {
+      try {
+        const prev = db.prepare("SELECT meter_sell_total FROM energy_log WHERE meter_sell_total IS NOT NULL ORDER BY ts DESC LIMIT 1 OFFSET 1").get();
+        if (prev) { const d = parseFloat((ess.meterSell - prev.meter_sell_total).toFixed(4)); return (d >= 0 && d < 2) ? d : 0; }
+      } catch {} return 0;
+    })() : 0;
+    const intervalCostAud = meterBuyDelta * (amber?.buyPrice ?? 0) / 100;
+    const intervalEarnAud = meterSellDelta * (amber?.feedInPrice ?? 0) / 100;
+    const modeChanged = (action.includes('mode-switch') || action.includes('switch')) ? 1 : 0;
+    const isSelling = (action === 'sell' || (slot && slot.action === 'sell')) ? 1 : 0;
+    const isCharging = (action.includes('charge') || (slot && String(slot.action).includes('charge'))) ? 1 : 0;
+    const demandPeak = (amber?.demandWindow && ess.gridPower < 0) ? Math.abs(ess.gridPower) : 0;
+
+    db.prepare(`
+      INSERT INTO daily_summary (date, intervals, home_kwh, grid_buy_kwh, grid_sell_kwh,
+        cost_aud, earnings_aud, demand_peak_kw, demand_charge_est,
+        avg_soc, min_soc, max_soc,
+        meter_buy_start, meter_buy_end, meter_sell_start, meter_sell_end,
+        pv_kwh, charge_grid_kwh, discharge_kwh,
+        mode_changes, sell_sessions, charge_sessions)
+      VALUES (@date, 1, @homeKwh, @buyKwh, @sellKwh,
+        @cost, @earn, @peak, @peakCharge,
+        @soc, @soc, @soc,
+        @meterBuy, @meterBuy, @meterSell, @meterSell,
+        @pvKwh, @chargeKwh, @dischargeKwh,
+        @modeChg, @sellSess, @chargeSess)
+      ON CONFLICT(date) DO UPDATE SET
+        intervals        = intervals + 1,
+        home_kwh         = COALESCE(@homeKwh, home_kwh),
+        grid_buy_kwh     = CASE WHEN @meterBuy IS NOT NULL AND meter_buy_start IS NOT NULL
+                           THEN ROUND(@meterBuy - meter_buy_start, 3) ELSE grid_buy_kwh END,
+        grid_sell_kwh    = CASE WHEN @meterSell IS NOT NULL AND meter_sell_start IS NOT NULL
+                           THEN ROUND(@meterSell - meter_sell_start, 3) ELSE grid_sell_kwh END,
+        cost_aud         = cost_aud + @cost,
+        earnings_aud     = earnings_aud + @earn,
+        demand_peak_kw   = MAX(demand_peak_kw, @peak),
+        demand_charge_est = MAX(demand_peak_kw, @peak) * 0.6104,
+        avg_soc          = (avg_soc * intervals + @soc) / (intervals + 1),
+        min_soc          = MIN(min_soc, @soc),
+        max_soc          = MAX(max_soc, @soc),
+        meter_buy_end    = COALESCE(@meterBuy, meter_buy_end),
+        meter_sell_end   = COALESCE(@meterSell, meter_sell_end),
+        meter_buy_start  = COALESCE(meter_buy_start, @meterBuy),
+        meter_sell_start = COALESCE(meter_sell_start, @meterSell),
+        pv_kwh           = COALESCE(@pvKwh, pv_kwh),
+        charge_grid_kwh  = COALESCE(@chargeKwh, charge_grid_kwh),
+        discharge_kwh    = COALESCE(@dischargeKwh, discharge_kwh),
+        mode_changes     = mode_changes + @modeChg,
+        sell_sessions    = sell_sessions + @sellSess,
+        charge_sessions  = charge_sessions + @chargeSess
+    `).run({
+      date: today,
+      homeKwh:       ess.todayHomeKwh ?? null,
+      buyKwh:        meterBuyDelta,
+      sellKwh:       meterSellDelta,
+      cost:          intervalCostAud,
+      earn:          intervalEarnAud,
+      peak:          demandPeak,
+      peakCharge:    demandPeak * 0.6104,
+      soc:           ess.soc ?? 0,
+      meterBuy:      ess.meterBuy ?? null,
+      meterSell:     ess.meterSell ?? null,
+      pvKwh:         ess.todayPvKwh ?? null,
+      chargeKwh:     ess.todayChargeKwh ?? null,
+      dischargeKwh:  ess.todayDischargeKwh ?? null,
+      modeChg:       modeChanged,
+      sellSess:      isSelling,
+      chargeSess:    isCharging,
+    });
+  } catch(e) { console.warn('[daily_summary] 写入失败:', e.message); }
+
   // 8. 热水器
   await handleHotWaterWindow(planRow, db, syd);
   await handleGfHotWater(db, syd);
