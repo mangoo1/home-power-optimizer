@@ -702,31 +702,10 @@ async function main() {
   } else if (slot.action === 'charge' || slot.action === 'charge+hw') {
     const realBuyPrice = amber?.buyPrice ?? null;
 
-    if (ess.soc !== null && ess.soc >= chargeTargetPct) {
-      // SOC 已达目标
-      const pvAbsorb = parseFloat(Math.max(0, (pvPower ?? 0) - (homeLoad ?? 0.6)).toFixed(2));
-      const hwRunning = (homeLoad ?? 0) >= 3.0; // 热水器在跑（homeLoad ≥ 3kW）
-
-      if (hwRunning) {
-        // 热水器在跑：保持 Timed + 最小充电，让电网供热水器，电池待机
-        // 不能切 Self-use，否则电池会放电供热水器
-        if (ess.reportedMode !== 1) {
-          const chargeWindows = planRow ? JSON.parse(planRow.charge_windows_json || '[]') : [];
-          await restoreTimedMode(chargeWindows, `hw-backup: soc=${ess.soc}% hw-running homeLoad=${homeLoad}kW`);
-        }
-        await updateChargeKw(0.1, `hw-backup: soc=${ess.soc}%≥${chargeTargetPct}% homeLoad=${homeLoad}kW，保持Timed让电网供热水器`);
-        console.log(`[充电] SOC ${ess.soc}% ≥ ${chargeTargetPct}%，但热水器在跑(${homeLoad}kW)，保持Timed+0.1kW，电网供家用`);
-        action = 'charge-hw-backup';
-      } else if (pvAbsorb >= 0.2) {
-        await updateChargeKw(pvAbsorb, `pv-absorb: soc=${ess.soc}% pv=${pvPower}kW home=${homeLoad}kW`);
-        console.log(`[充电] SOC ${ess.soc}% ≥ ${chargeTargetPct}%，PV消纳 ${pvAbsorb}kW`);
-        action = 'charge-pv-only';
-      } else {
-        await switchToSelfUse(`charge-done: soc=${ess.soc}% >= target=${chargeTargetPct}%`);
-        console.log(`[充电] SOC ${ess.soc}% ≥ ${chargeTargetPct}%，已达标，切self-use`);
-        action = 'charge-done';
-      }
-    } else if (!strategy.isV3 && realBuyPrice != null && realBuyPrice > strategy.buyMaxC) {
+    // charge 槽：信任计划，只要在 charge 槽里就继续充电
+    // chargeTargetPct 只是过夜保底线，不用来决定是否停充
+    // plan-today 已经计算好哪些槽需要充电，executor 只管执行
+    if (!strategy.isV3 && realBuyPrice != null && realBuyPrice > strategy.buyMaxC) {
       // v2 兼容：极端高价 abort
       console.log(`[充电] v2模式 实际电价 ${realBuyPrice.toFixed(1)}¢ > ${strategy.buyMaxC}¢，暂停充电`);
       await switchToSelfUse(`charge-skip: realBuy=${realBuyPrice.toFixed(1)}c > buyMax=${strategy.buyMaxC}c`);
