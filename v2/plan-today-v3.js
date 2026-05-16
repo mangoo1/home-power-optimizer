@@ -51,7 +51,7 @@ const NO_SELL_RESERVE_PCT   = 55;     // 不卖电时过夜保底 55%（覆盖15
 const SELL_KWH_PER_HOUR    = 5.0;    // 每小时卖电约5kWh
 const SELL_PCT_PER_HOUR    = 12;     // ≈ 5/42 × 100 ≈ 12%
 const SELL_WINDOW_START    = 16;     // 卖电窗口起始 16:00
-const SELL_WINDOW_END      = 21;     // 卖电窗口结束 21:00（最晚）
+const SELL_WINDOW_END      = 22;     // 卖电窗口结束 22:00（扩展到覆盖晚高峰尾部）
 const CHARGE_DEADLINE_HOUR = 15;     // 充电截止时间 15:00（之后转 self-use 等卖电）
 const SELL_MIN_FEEDIN_C    = e('SELL_FLOOR_C', 5.0); // 最低卖电价 5¢
 const SELL_PROFIT_MARGIN   = e('SELL_PROFIT_MARGIN', 0.25); // 卖电利润率门槛（保留变量兼容）
@@ -331,12 +331,16 @@ function scheduleHotWater(slots) {
 }
 
 // ── 核心：新卖电策略 ──────────────────────────────────────────
-function planSellSlots(slots) {
-  // 从 16:00-21:00 选所有 feedIn >= SELL_MIN_FEEDIN_C 的槽，按价格从高到低
+function planSellSlots(slots, avgChargeCostC) {
+  // 用实际买入均价计算利润率门槛：feedIn > avgChargeCost × 1.25（25%利润）
+  const costBasis = avgChargeCostC || 10.0;
+  const minFeedIn = Math.max(SELL_MIN_FEEDIN_C, costBasis * (1 + SELL_PROFIT_MARGIN));
+  console.log(`[卖电选槽] 成本基准=${costBasis.toFixed(1)}¢ 最低feedIn=${minFeedIn.toFixed(1)}¢ (25%利润率) 窗口=${SELL_WINDOW_START}:00-${SELL_WINDOW_END}:00`);
+
   const candidates = slots
     .filter(s => {
       const h = parseInt(s.key.split(':')[0]);
-      return h >= SELL_WINDOW_START && h < SELL_WINDOW_END && !s.dw && s.feedInC >= SELL_MIN_FEEDIN_C;
+      return h >= SELL_WINDOW_START && h < SELL_WINDOW_END && !s.dw && s.feedInC >= minFeedIn;
     })
     .sort((a, b) => b.feedInC - a.feedInC);
 
@@ -345,6 +349,7 @@ function planSellSlots(slots) {
   const maxSellSlots = Math.floor((100 - OVERNIGHT_RESERVE_PCT) / (SELL_PCT_PER_HOUR / 2)); // 每半小时6%
   const sellSlots = candidates.slice(0, maxSellSlots);
 
+  console.log(`[卖电选槽] 候选${candidates.length}个，选${sellSlots.length}个（上限${maxSellSlots}）`);
   return sellSlots;
 }
 
@@ -581,7 +586,17 @@ async function main() {
   console.log(`[Amber] ${allSlots.length} 个半小时槽 (未来${slots.length}个), DW: ${slots.some(s => s.dw)}`);
 
   // 核心：选卖电槽（带利润校验）
-  let sellSlots = planSellSlots(slots);
+  // 先算今日实际买电均价作为成本基准
+  let avgChargeCostC = 10.0;
+  try {
+    const todayAvg = db.prepare(
+      "SELECT AVG(buy_price) as avg_buy FROM energy_log WHERE date(ts, '+10 hours')=? AND charge_kw > 0 AND buy_price > 0"
+    ).get(today);
+    if (todayAvg?.avg_buy > 0) avgChargeCostC = todayAvg.avg_buy;
+    console.log(`[成本] 今日实际充电均价: ${avgChargeCostC.toFixed(1)}¢`);
+  } catch { console.log(`[成本] 查询失败，用默认 ${avgChargeCostC}¢`); }
+
+  let sellSlots = planSellSlots(slots, avgChargeCostC);
 
   // 热水器调度（用全天槽位排，不受"已过去"过滤影响）
   let { mainHw, gfHw } = scheduleHotWater(allSlots);
@@ -696,9 +711,11 @@ async function main() {
     }
     const achievableKwh = currentSocPct / 100 * BATT_KWH + estChargeKwh;
     const achievablePct = Math.round(achievableKwh / BATT_KWH * 100);
-    const surplusKwh = Math.max(0, achievableKwh - (NO_SELL_RESERVE_PCT / 100 * BATT_KWH));
+    // 卖电时用 OVERNIGHT_RESERVE_PCT (35%) 作为保底，不是 NO_SELL_RESERVE_PCT (55%)
+    const reservePct = sellSlots.length > 0 ? OVERNIGHT_RESERVE_PCT : NO_SELL_RESERVE_PCT;
+    const surplusKwh = Math.max(0, achievableKwh - (reservePct / 100 * BATT_KWH));
     const maxSellSlots = Math.floor(surplusKwh / (SELL_KWH_PER_HOUR / 2));
-    console.log(`[可行性] 最大可充到 ${achievablePct}% (${achievableKwh.toFixed(1)}kWh)，过夜保底 ${NO_SELL_RESERVE_PCT}%，可卖 ${maxSellSlots} 槽`);
+    console.log(`[可行性] 最大可充到 ${achievablePct}% (${achievableKwh.toFixed(1)}kWh)，过夜保底 ${reservePct}%，可卖 ${maxSellSlots} 槽`);
     if (maxSellSlots < sellSlots.length) {
       console.log(`[可行性] ⚠️ 削减卖电: ${sellSlots.length} → ${maxSellSlots}（选最贵的）`);
       sellSlots = sellSlots.sort((a, b) => b.feedInC - a.feedInC).slice(0, maxSellSlots);
