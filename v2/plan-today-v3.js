@@ -711,11 +711,30 @@ async function main() {
     }
     const achievableKwh = currentSocPct / 100 * BATT_KWH + estChargeKwh;
     const achievablePct = Math.round(achievableKwh / BATT_KWH * 100);
-    // 卖电时用 OVERNIGHT_RESERVE_PCT (35%) 作为保底，不是 NO_SELL_RESERVE_PCT (55%)
-    const reservePct = sellSlots.length > 0 ? OVERNIGHT_RESERVE_PCT : NO_SELL_RESERVE_PCT;
-    const surplusKwh = Math.max(0, achievableKwh - (reservePct / 100 * BATT_KWH));
-    const maxSellSlots = Math.floor(surplusKwh / (SELL_KWH_PER_HOUR / 2));
-    console.log(`[可行性] 最大可充到 ${achievablePct}% (${achievableKwh.toFixed(1)}kWh)，过夜保底 ${reservePct}%，可卖 ${maxSellSlots} 槽`);
+    // 保底线根据卖电结束时间动态计算：
+    // - 卖电最晚到 ~21:00，之后只需过夜 (35% ≈ 14.7kWh)
+    // - 但卖电前还有 self-use 消耗（下午用电 ~1.2kW）
+    // - 用最后一个卖电槽的时间来算需要保留多少
+    const lastSellHour = sellSlots.length > 0 
+      ? Math.max(...sellSlots.map(s => parseInt(s.key.split(':')[0]))) + 1
+      : 21;
+    // 从 lastSellHour 到次日 10:00 的用电估算（包括早晨 07-10 用电）
+    const hoursToTen = lastSellHour <= 10 ? (10 - lastSellHour) : (24 - lastSellHour + 10);
+    // 晚间 ~1kW（到23:00），深夜 0.35kW（23:00-07:00），早晨 ~1.5kW（07:00-10:00）
+    let nightKwh = 0;
+    for (let h = lastSellHour; h !== 10; h = (h + 1) % 24) {
+      if (h >= 21 && h < 23) nightKwh += 1.0;       // 晚间
+      else if (h >= 23 || h < 7) nightKwh += 0.35;   // 深夜
+      else if (h >= 7 && h < 10) nightKwh += 1.5;    // 早晨（不含热水器）
+      else nightKwh += 1.0;                           // 其他
+    }
+    const reserveKwh = nightKwh * 1.3; // 30% buffer（确保过夜安全）
+    const reservePct = Math.max(OVERNIGHT_RESERVE_PCT, Math.round(reserveKwh / BATT_KWH * 100));
+    const surplusKwh = Math.max(0, achievableKwh - reserveKwh);
+    // 每个卖电槽实际消耗 = 放电2.5kWh + 卖电窗口内self-use约0.3kWh
+    const effectiveKwhPerSlot = (SELL_KWH_PER_HOUR / 2) + 0.3;
+    const maxSellSlots = Math.floor(surplusKwh / effectiveKwhPerSlot);
+    console.log(`[可行性] 最大可充到 ${achievablePct}% (${achievableKwh.toFixed(1)}kWh)，卖到${lastSellHour}:00后需${reserveKwh.toFixed(1)}kWh(${reservePct}%)过夜，可卖 ${maxSellSlots} 槽`);
     if (maxSellSlots < sellSlots.length) {
       console.log(`[可行性] ⚠️ 削减卖电: ${sellSlots.length} → ${maxSellSlots}（选最贵的）`);
       sellSlots = sellSlots.sort((a, b) => b.feedInC - a.feedInC).slice(0, maxSellSlots);
