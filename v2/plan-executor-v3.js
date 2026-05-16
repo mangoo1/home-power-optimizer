@@ -703,9 +703,21 @@ async function main() {
     const realBuyPrice = amber?.buyPrice ?? null;
 
     if (ess.soc !== null && ess.soc >= chargeTargetPct) {
-      // SOC 已达目标：只消纳 PV
+      // SOC 已达目标
       const pvAbsorb = parseFloat(Math.max(0, (pvPower ?? 0) - (homeLoad ?? 0.6)).toFixed(2));
-      if (pvAbsorb >= 0.2) {
+      const hwRunning = (homeLoad ?? 0) >= 3.0; // 热水器在跑（homeLoad ≥ 3kW）
+
+      if (hwRunning) {
+        // 热水器在跑：保持 Timed + 最小充电，让电网供热水器，电池待机
+        // 不能切 Self-use，否则电池会放电供热水器
+        if (ess.reportedMode !== 1) {
+          const chargeWindows = planRow ? JSON.parse(planRow.charge_windows_json || '[]') : [];
+          await restoreTimedMode(chargeWindows, `hw-backup: soc=${ess.soc}% hw-running homeLoad=${homeLoad}kW`);
+        }
+        await updateChargeKw(0.1, `hw-backup: soc=${ess.soc}%≥${chargeTargetPct}% homeLoad=${homeLoad}kW，保持Timed让电网供热水器`);
+        console.log(`[充电] SOC ${ess.soc}% ≥ ${chargeTargetPct}%，但热水器在跑(${homeLoad}kW)，保持Timed+0.1kW，电网供家用`);
+        action = 'charge-hw-backup';
+      } else if (pvAbsorb >= 0.2) {
         await updateChargeKw(pvAbsorb, `pv-absorb: soc=${ess.soc}% pv=${pvPower}kW home=${homeLoad}kW`);
         console.log(`[充电] SOC ${ess.soc}% ≥ ${chargeTargetPct}%，PV消纳 ${pvAbsorb}kW`);
         action = 'charge-pv-only';
