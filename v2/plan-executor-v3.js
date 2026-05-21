@@ -258,8 +258,15 @@ async function updateSellKw(kw, reason = 'sell') {
 }
 
 async function switchToSelfUse(reason = 'self-use') {
+  // 切 Self-use 前先清充放电时间窗口，防止残留 Timed 设置
+  await essApi.setParam('0xC0BA', 0, reason, 'plan-executor-v3');
+  await essApi.setParam('0xC0BC', 0, reason, 'plan-executor-v3');
+  await essApi.setParam('0xC014', 0, reason, 'plan-executor-v3');
+  await essApi.setParam('0xC016', 0, reason, 'plan-executor-v3');
+  await essApi.setParam('0xC018', 0, reason, 'plan-executor-v3');
+  await essApi.setParam('0xC01A', 0, reason, 'plan-executor-v3');
   const ok = await essApi.switchToSelfUse(reason, 'plan-executor-v3');
-  console.log(`[模式] 切回 Self-use ${ok?'✅':'❌'} (${reason})`);
+  console.log(`[模式] 切回 Self-use ${ok?'✅':'❌'} 已清充放电窗口 (${reason})`);
   return ok;
 }
 
@@ -400,42 +407,30 @@ function logData(db, ess, amber, slot, action, extra = {}) {
   }
 }
 
-// ── 热水器控制（Tuya MCP）────────────────────────────────────
+// ── 热水器控制（自建 Tuya API）────────────────────────────────
 const HW_MAIN_ID = 'bf160bbe78f4f1ce6dpkdp';
 const HW_GF_ID   = 'bf3c28e8181e5e980eoobm';
-const HW_TUYA_CWD = '/home/deven/.openclaw/workspace';
+const tuya = require('./tuya-api');
 
 async function tuyaControl(deviceId, on) {
-  const cmd = on ? 'tuya_turn_on_device' : 'tuya_turn_off_device';
-  const { execSync } = require('child_process');
-
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const result = execSync(
-        `npx mcporter call tuya ${cmd} ${deviceId} switch`,
-        { cwd: HW_TUYA_CWD, timeout: 15000, encoding: 'utf8' }
-      );
-      const r = JSON.parse(result);
-      if (!r.success) { console.warn(`[tuyaControl] attempt ${attempt} API returned success=false`); continue; }
+      await tuya.switchDevice(deviceId, on);
     } catch (e) {
-      console.warn(`[tuyaControl] attempt ${attempt} command failed: ${e.message}`);
+      console.warn(`[tuyaControl] attempt ${attempt} switch failed: ${e.message}`);
       if (attempt < 3) await new Promise(r => setTimeout(r, 3000));
       continue;
     }
 
     await new Promise(r => setTimeout(r, 3000));
     try {
-      const statusRaw = execSync(
-        `npx mcporter call tuya tuya_get_device_status ${deviceId}`,
-        { cwd: HW_TUYA_CWD, timeout: 15000, encoding: 'utf8' }
-      );
-      const s = JSON.parse(statusRaw);
-      const actualSwitch = s?.data?.switch;
+      const status = await tuya.getDeviceStatus(deviceId);
+      const actualSwitch = status['switch'];
       if (actualSwitch === on) {
         console.log(`[tuyaControl] ${deviceId} confirmed ${on ? 'ON' : 'OFF'} (attempt ${attempt})`);
         return true;
       }
-      console.warn(`[tuyaControl] attempt ${attempt} state mismatch: expected ${on}, got ${actualSwitch} — retrying...`);
+      console.warn(`[tuyaControl] attempt ${attempt} state mismatch: expected ${on}, got ${actualSwitch}`);
     } catch (e) {
       console.warn(`[tuyaControl] attempt ${attempt} status check failed: ${e.message}`);
     }
@@ -444,6 +439,34 @@ async function tuyaControl(deviceId, on) {
 
   console.error(`[tuyaControl] FAILED to confirm ${deviceId} → ${on ? 'ON' : 'OFF'} after 3 attempts`);
   return false;
+}
+
+/**
+ * 开热水器并设置 Tuya 云定时自动关机（保底）
+ * @param {string} deviceId
+ * @param {boolean} on
+ * @param {number} autoOffMin - 自动关机分钟数（仅 on=true 时有效）
+ */
+async function tuyaControlWithTimer(deviceId, on, autoOffMin = 120) {
+  if (on) {
+    try {
+      const ok = await tuya.turnOnWithAutoOff(deviceId, autoOffMin);
+      if (ok) {
+        console.log(`[tuyaControl] ${deviceId} ON + timer auto-OFF in ${autoOffMin}min ✅`);
+        return true;
+      }
+    } catch (e) {
+      console.warn(`[tuyaControl] turnOnWithAutoOff failed: ${e.message}, falling back to basic switch`);
+      // 降级：至少把开关打开
+      return await tuyaControl(deviceId, true);
+    }
+  } else {
+    // 关机时也清除定时任务
+    try { await tuya.clearTimers(deviceId); } catch (e) {
+      console.warn(`[tuyaControl] clear timers on OFF failed: ${e.message}`);
+    }
+    return await tuyaControl(deviceId, false);
+  }
 }
 
 function nowLocal() {
@@ -474,9 +497,11 @@ function logHwAction(db, deviceId, deviceName, on, opts = {}) {
   } catch(e) { console.warn('[hw_log] 写入失败:', e.message); }
 }
 
-async function controlHotWater(on) {
-  const ok = await tuyaControl(HW_MAIN_ID, on);
-  console.log(`[主热水器] ${on ? '开' : '关'} ${ok ? '✅' : '❌'}`);
+async function controlHotWater(on, autoOffMin = 120) {
+  const ok = on
+    ? await tuyaControlWithTimer(HW_MAIN_ID, true, autoOffMin)
+    : await tuyaControlWithTimer(HW_MAIN_ID, false);
+  console.log(`[主热水器] ${on ? '开' : '关'} ${ok ? '✅' : '❌'}${on ? ` (timer: ${autoOffMin}min)` : ''}`);
   return ok;
 }
 
@@ -519,7 +544,17 @@ async function handleHotWaterWindow(planRow, db, syd) {
       const isOnTask = task.action === 'on';
       const key = isOnTask ? onKey : offKey;
       if (!db.prepare("SELECT 1 FROM kv_store WHERE key=?").get(key)) {
-        const ok = await controlHotWater(isOnTask);
+        // 开机时计算运行时长（从 on task 到 off task 的分钟数）
+        let autoOffMin = 120; // 默认 2h
+        if (isOnTask) {
+          const offTask = tasks.find(t => t.action === 'off');
+          if (offTask) {
+            const [oh, om] = offTask.time.split(':').map(Number);
+            autoOffMin = (oh * 60 + om) - taskMins;
+            if (autoOffMin <= 0) autoOffMin = 120;
+          }
+        }
+        const ok = await controlHotWater(isOnTask, autoOffMin);
         if (ok) {
           logHwAction(db, HW_MAIN_ID, '主热水器', isOnTask, { triggeredBy: 'executor-v3', planWindow: task.time });
           db.prepare("INSERT OR REPLACE INTO kv_store (key,value) VALUES (?,?)").run(key, '1');
@@ -561,13 +596,8 @@ async function handleGfHotWater(db, syd) {
   ).get(`hw_gf:${today}:%`);
   if (lastOffTask) {
     try {
-      const { execSync } = require('child_process');
-      const statusRaw = execSync(
-        `npx mcporter call tuya tuya_get_device_status ${HW_GF_ID}`,
-        { cwd: HW_TUYA_CWD, timeout: 15000, encoding: 'utf8' }
-      );
-      const s = JSON.parse(statusRaw);
-      if (s?.data?.switch === true) {
+      const status = await tuya.getDeviceStatus(HW_GF_ID);
+      if (status['switch'] === true) {
         console.warn(`[GF热水器] ⚠️ 状态回查：应该关但实际还开着！重新关闭...`);
         const ok = await tuyaControl(HW_GF_ID, false);
         if (ok) {
@@ -599,7 +629,26 @@ async function handleGfHotWater(db, syd) {
       const isOn = task.action === 'on';
       const key = `hw_gf:${today}:${task.time}:${task.action}`;
       if (!db.prepare("SELECT 1 FROM kv_store WHERE key=?").get(key)) {
-        const ok = await tuyaControl(HW_GF_ID, isOn);
+        // GF 热水器也加 timer 保底
+        let ok;
+        if (isOn) {
+          const offTask = tasks.find(t => t.action === 'off');
+          let autoOffMin = 120;
+          if (offTask) {
+            const [oh, om] = offTask.time.split(':').map(Number);
+            autoOffMin = (oh * 60 + om) - taskMins;
+            if (autoOffMin <= 0) autoOffMin = 120;
+          }
+          try {
+            ok = await tuya.turnOnWithAutoOff(HW_GF_ID, autoOffMin);
+          } catch (e) {
+            console.warn(`[GF热水器] turnOnWithAutoOff failed: ${e.message}, fallback`);
+            ok = await tuyaControl(HW_GF_ID, true);
+          }
+        } else {
+          try { await tuya.clearTimers(HW_GF_ID); } catch (e) { console.warn(`[GF热水器] clear timers: ${e.message}`); }
+          ok = await tuyaControl(HW_GF_ID, false);
+        }
         console.log(`[GF热水器] ${isOn ? '开' : '关'} ${task.time} ${ok ? '✅' : '❌'}`);
         if (ok) {
           logHwAction(db, HW_GF_ID, 'GF热水器', isOn, { triggeredBy: 'executor-v3', planWindow: task.time });
@@ -702,10 +751,13 @@ async function main() {
   } else if (slot.action === 'charge' || slot.action === 'charge+hw') {
     const realBuyPrice = amber?.buyPrice ?? null;
 
-    // charge 槽：信任计划，只要在 charge 槽里就继续充电
-    // chargeTargetPct 只是过夜保底线，不用来决定是否停充
-    // plan-today 已经计算好哪些槽需要充电，executor 只管执行
-    if (!strategy.isV3 && realBuyPrice != null && realBuyPrice > strategy.buyMaxC) {
+    // SOC 达标检查：充到目标就停，切 Self-use
+    if (ess.soc !== null && ess.soc >= chargeTargetPct) {
+      console.log(`[充电] SOC ${ess.soc}% >= 目标 ${chargeTargetPct}%，停止充电`);
+      await switchToSelfUse(`charge-done: SOC ${ess.soc}% >= target ${chargeTargetPct}%`);
+      logData(db, ess, amber, slot, 'charge-complete', { soc: ess.soc, target: chargeTargetPct });
+      action = 'charge-complete';
+    } else if (!strategy.isV3 && realBuyPrice != null && realBuyPrice > strategy.buyMaxC) {
       // v2 兼容：极端高价 abort
       console.log(`[充电] v2模式 实际电价 ${realBuyPrice.toFixed(1)}¢ > ${strategy.buyMaxC}¢，暂停充电`);
       await switchToSelfUse(`charge-skip: realBuy=${realBuyPrice.toFixed(1)}c > buyMax=${strategy.buyMaxC}c`);
@@ -719,11 +771,30 @@ async function main() {
       logData(db, ess, amber, slot, 'charge-skip-price', { buyPrice: realBuyPrice });
       action = 'charge-skip';
     } else {
-      // 正常充电
+      // 正常充电 — 设完整充电时间窗口
+      const chargeSlots = intervals.filter(s => s.action === 'charge' || s.action === 'charge+hw');
+      const lastCharge = chargeSlots[chargeSlots.length - 1];
+      const lastChargeKey = lastCharge?.key || lastCharge?.nemTime?.substring(11,16) || '';
+      const lastChargeH = parseInt(lastChargeKey.substring(0,2) || '15');
+      const lastChargeM = parseInt(lastChargeKey.substring(3,5) || '0');
+      const chargeEndHHMM = Math.min(lastChargeH * 100 + lastChargeM + 30, 2359);
+
+      const chargeWindows = planRow ? JSON.parse(planRow.charge_windows_json || '[]') : [];
+      const w = chargeWindows?.[0];
+      const chargeStartHHMM = w ? w.startHour * 100 : 800;
+
       if (ess.reportedMode !== 1) {
         console.log(`[模式] charge时段但mode=${ess.reportedMode}，切回 Timed`);
-        const chargeWindows = planRow ? JSON.parse(planRow.charge_windows_json || '[]') : [];
-        await restoreTimedMode(chargeWindows, `restore-timed: mode-was-${ess.reportedMode}`);
+      }
+      await essApi.restoreTimedMode({
+        startHHMM: chargeStartHHMM,
+        endHHMM: chargeEndHHMM,
+        chargeKw: MAX_CHARGE_KW,
+        sellKw: 0,
+        sellStartHHMM: 0,
+        sellEndHHMM: 0
+      }, `charge-timed: window ${String(chargeStartHHMM).padStart(4,'0')}-${String(chargeEndHHMM).padStart(4,'0')}`, 'plan-executor-v3');
+      if (ess.reportedMode !== 1) {
         logData(db, ess, amber, slot, 'mode-switch-timed', { modeFrom: ess.reportedMode, modeTo: 1 });
       }
       const safeChargeKw = calcSafeChargeKw(homeLoad, pvPower, ess.gridPower, ess.battPower);
@@ -749,16 +820,34 @@ async function main() {
       logData(db, ess, amber, slot, 'mode-switch-selfuse', { modeFrom: ess.reportedMode, modeTo: 0, sellKw: 0 });
     } else if (strategy.isV3) {
       // ── v3 卖电逻辑：action=sell 就卖，不做利润检查 ──
-      // 确保逆变器在 Timed 模式
+      // 找最后一个 sell 槽的结束时间，设放电时间窗口
+      const sellSlots = intervals.filter(s => s.action === 'sell');
+      const lastSell = sellSlots[sellSlots.length - 1];
+      const lastSellKey = lastSell?.key || lastSell?.nemTime?.substring(11,16) || '';
+      const lastSellH = parseInt(lastSellKey.substring(0,2) || '23');
+      const lastSellM = parseInt(lastSellKey.substring(3,5) || '30');
+      const sellEndHHMM = lastSellH * 100 + lastSellM + 30; // 半小时后结束
+
+      const curKey = slot.key || slot.nemTime?.substring(11,16) || '';
+      const curH = parseInt(curKey.substring(0,2) || '0');
+      const curM = parseInt(curKey.substring(3,5) || '0');
+      const sellStartHHMM = curH * 100 + curM;
+
+      // 确保逆变器在 Timed 模式，同时设好放电时间窗口
+      await essApi.restoreTimedMode({
+        chargeKw: 0,
+        sellStartHHMM,
+        sellEndHHMM: Math.min(sellEndHHMM, 2359),
+        sellKw: null  // sellKw 单独设
+      }, 'sell-timed-v3', 'plan-executor-v3');
       if (ess.reportedMode !== 1) {
-        await essApi.setParam('0x300C', 1, 'sell-restore-timed', 'plan-executor-v3');
-        console.log(`[卖电] 模式 ${ess.reportedMode} → Timed(1)`);
+        console.log(`[卖电] 模式 ${ess.reportedMode} → Timed(1)，放电窗口 ${String(sellStartHHMM).padStart(4,'0')}–${String(Math.min(sellEndHHMM,2359)).padStart(4,'0')}`);
       }
       const plannedSellKw = slot.sellKw > 0 ? slot.sellKw : MAX_SELL_KW;
       const actualSellKw = parseFloat(Math.max(0.5, Math.min(MAX_SELL_KW, plannedSellKw)).toFixed(2));
       await updateSellKw(actualSellKw, `sell-slot-v3: feedIn=${amber?.feedInPrice?.toFixed(1) ?? '?'}c`);
       extraSellKw = actualSellKw;
-      console.log(`[卖电] v3模式 feedIn=${amber?.feedInPrice?.toFixed(1) ?? '?'}¢，直接卖电 ${actualSellKw}kW`);
+      console.log(`[卖电] v3模式 feedIn=${amber?.feedInPrice?.toFixed(1) ?? '?'}¢，卖电 ${actualSellKw}kW，窗口到 ${String(Math.min(sellEndHHMM,2359)).padStart(4,'0')}`);
       action = 'sell';
     } else {
       // ── v2 兼容卖电逻辑：检查最低卖电价 ──
