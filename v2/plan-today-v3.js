@@ -200,6 +200,32 @@ function getPvForecast(db, today) {
   return pvByHour;
 }
 
+/**
+ * 获取明天的 PV 预测总发电量（kWh）和平均云量（%）
+ * 用于判断是否需要保守卖电（明天天气差 → 少卖多留）
+ */
+function getTomorrowPvEstimate(db, today) {
+  const row = db.prepare('SELECT forecast_json FROM solar_forecast WHERE date=? ORDER BY fetched_at DESC LIMIT 1').get(today);
+  if (!row) return { tomorrowKwh: null, tomorrowCloudPct: null };
+  const fc = JSON.parse(row.forecast_json);
+  const tomorrow = new Date(new Date(today + 'T00:00:00+10:00').getTime() + 86400000).toISOString().slice(0, 10);
+  let totalKwh = 0, cloudSum = 0, cloudCount = 0;
+  for (let i = 0; i < fc.time.length; i++) {
+    if (!fc.time[i].startsWith(tomorrow)) continue;
+    const h = parseInt(fc.time[i].substring(11, 13));
+    if (h < 6 || h > 18) continue;
+    const swRad = fc.sw[i] ?? 0;
+    const cloud = fc.cloud[i] ?? 0;
+    const cloudFactor = 1 - (cloud / 100) * 0.7;
+    totalKwh += Math.max(0, swRad * PV_SCALE * cloudFactor);
+    cloudSum += cloud;
+    cloudCount++;
+  }
+  const tomorrowCloudPct = cloudCount > 0 ? cloudSum / cloudCount : null;
+  console.log(`[明日PV] 预测发电: ${totalKwh.toFixed(1)}kWh, 平均云量: ${tomorrowCloudPct?.toFixed(0) ?? '?'}%`);
+  return { tomorrowKwh: totalKwh, tomorrowCloudPct };
+}
+
 // ── 家庭负载估算 ──────────────────────────────────────────────
 function homeLoadKw(hour, minute, hwSlots) {
   let base;
@@ -673,6 +699,37 @@ async function main() {
     }
   }
 
+  // ── 明天天气调整：天气差时保守卖电 ──────────────────────────
+  if (sellSlots.length > 0) {
+    const { tomorrowKwh, tomorrowCloudPct } = getTomorrowPvEstimate(db, today);
+    // 明天 PV < 10kWh 或云量 > 60% → 天气差，保守卖电
+    const poorWeather = (tomorrowKwh !== null && tomorrowKwh < 10) || (tomorrowCloudPct !== null && tomorrowCloudPct > 60);
+    if (poorWeather) {
+      // 天气差时：提高过夜保底到 55%，根据当前SOC限制卖电
+      const conservativeReservePct = NO_SELL_RESERVE_PCT; // 55%
+      const conservativeReserveKwh = conservativeReservePct / 100 * BATT_KWH;
+      const currentSocKwh = currentSocPct / 100 * BATT_KWH;
+      const availableForSellKwh = Math.max(0, currentSocKwh - conservativeReserveKwh);
+      const maxSellSlots = Math.floor(availableForSellKwh / (SELL_KWH_PER_HOUR * 0.5)); // 每半小时2.5kWh
+      if (maxSellSlots <= 0) {
+        console.log(`[明日天气] 🚫 天气差(PV=${tomorrowKwh?.toFixed(1)}kWh, 云量=${tomorrowCloudPct?.toFixed(0)}%) + SOC ${currentSocPct}% 不足保底${conservativeReservePct}%，取消卖电`);
+        sellSlots = [];
+      } else if (sellSlots.length > maxSellSlots) {
+        console.log(`[明日天气] ⚠️ 天气差(PV=${tomorrowKwh?.toFixed(1)}kWh, 云量=${tomorrowCloudPct?.toFixed(0)}%)，SOC ${currentSocPct}%，卖电槽从${sellSlots.length}减到${maxSellSlots}（保底${conservativeReservePct}%）`);
+        sellSlots = sellSlots.slice(0, maxSellSlots);
+      } else {
+        console.log(`[明日天气] ⚠️ 天气差(PV=${tomorrowKwh?.toFixed(1)}kWh, 云量=${tomorrowCloudPct?.toFixed(0)}%)，SOC ${currentSocPct}%，卖电${sellSlots.length}槽在安全范围`);
+      }
+      // 极端天气（PV < 4kWh）：完全不卖电
+      if (tomorrowKwh !== null && tomorrowKwh < 4 && sellSlots.length > 0) {
+        console.log(`[明日天气] 🚫 极端差天气(PV<4kWh)，取消所有卖电，全部留电过夜`);
+        sellSlots = [];
+      }
+    } else {
+      console.log(`[明日天气] ✅ 天气正常(PV=${tomorrowKwh?.toFixed(1)}kWh, 云量=${tomorrowCloudPct?.toFixed(0)}%)，正常卖电`);
+    }
+  }
+
   // 生成计划
   // 构建热水器时段 Set（key 格式 "HH:MM"）
   const hwSlots = new Set();
@@ -885,7 +942,108 @@ async function main() {
   db.close();
 }
 
-main().catch(e => {
-  console.error('[ERROR]', e.message);
-  process.exit(1);
-});
+// ── --hw-only 模式：只重算热水器时段，更新现有 plan ──────────
+async function hwOnlyMain() {
+  const syd = sydneyNow();
+  const today = syd.date;
+  console.log(`\n===== hw-only mode  ${today} ${syd.hh}:${String(syd.mi).padStart(2,'0')} Sydney =====`);
+
+  const db = new Database(DB_PATH);
+  db.exec("CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT)");
+
+  // 检查哪台热水器已开过
+  const mainDone = !!db.prepare("SELECT 1 FROM kv_store WHERE key=?").get(`hw_main:${today}:on`);
+  const gfDone   = !!db.prepare("SELECT 1 FROM kv_store WHERE key=?").get(`hw_gf:${today}:open_time`);
+
+  console.log(`[状态] 主热水器: ${mainDone ? '已开过 ✓' : '未开'}  GF热水器: ${gfDone ? '已开过 ✓' : '未开'}`);
+
+  if (mainDone && gfDone) {
+    console.log('两台热水器今天都已开过，无需重算。');
+    db.close();
+    return;
+  }
+
+  // 拉 Amber 价格
+  console.log('[Amber] 拉取价格...');
+  const rawAmber = await fetchAmberPrices();
+  const allSlots = aggregateAmberTo30min(rawAmber, today);
+
+  // 过滤掉已过去的时段
+  const nowKey = `${String(syd.hh).padStart(2,'0')}:${syd.mi < 30 ? '00' : '30'}`;
+  const futureSlots = allSlots.filter(s => s.key >= nowKey);
+  console.log(`[Amber] ${allSlots.length} 个半小时槽 (未来${futureSlots.length}个)`);
+
+  if (futureSlots.length === 0) {
+    console.log('没有未来时段可排，退出。');
+    db.close();
+    return;
+  }
+
+  // 用未来时段重算热水器
+  const { mainHw, gfHw } = scheduleHotWater(futureSlots);
+
+  // 构建新的 hardwareTasks
+  const newTasks = [];
+  if (mainDone) {
+    // 保留已完成的（不加 task，executor 已经处理了）
+  } else if (mainHw) {
+    newTasks.push({ device: 'main_hw', action: 'on',  time: mainHw.startKey });
+    newTasks.push({ device: 'main_hw', action: 'off', time: mainHw.endKey });
+  } else {
+    console.log('⚠️ 无法为主热水器找到合适时段！');
+  }
+
+  if (gfDone) {
+    // 保留已完成的
+  } else if (gfHw) {
+    newTasks.push({ device: 'gf_hw', action: 'on',  time: gfHw.startKey });
+    newTasks.push({ device: 'gf_hw', action: 'off', time: gfHw.endKey });
+  } else {
+    console.log('⚠️ 无法为 GF 热水器找到合适时段！');
+  }
+
+  // 读取当前 active plan
+  const plan = db.prepare("SELECT notes, rowid FROM daily_plan WHERE date=? AND is_active=1 ORDER BY rowid DESC LIMIT 1").get(today);
+  if (!plan) {
+    console.log('⚠️ 没有找到今天的 active plan，无法更新。请先运行完整 plan。');
+    db.close();
+    return;
+  }
+
+  // 解析 notes，替换 hardwareTasks
+  const notes = JSON.parse(plan.notes || '{}');
+  const oldTasks = notes.hardwareTasks || [];
+
+  // 保留已完成热水器的旧 task
+  const preservedTasks = [];
+  if (mainDone) {
+    preservedTasks.push(...oldTasks.filter(t => t.device === 'main_hw'));
+  }
+  if (gfDone) {
+    preservedTasks.push(...oldTasks.filter(t => t.device === 'gf_hw'));
+  }
+
+  notes.hardwareTasks = [...preservedTasks, ...newTasks];
+
+  // 更新 DB
+  db.prepare("UPDATE daily_plan SET notes=? WHERE rowid=?").run(JSON.stringify(notes), plan.rowid);
+
+  console.log('\n[更新完成]');
+  console.log('  旧 hardwareTasks:', JSON.stringify(oldTasks));
+  console.log('  新 hardwareTasks:', JSON.stringify(notes.hardwareTasks));
+
+  db.close();
+}
+
+// ── 入口 ──────────────────────────────────────────────────────
+if (process.argv.includes('--hw-only')) {
+  hwOnlyMain().catch(e => {
+    console.error('[ERROR]', e.message);
+    process.exit(1);
+  });
+} else {
+  main().catch(e => {
+    console.error('[ERROR]', e.message);
+    process.exit(1);
+  });
+}
