@@ -202,7 +202,7 @@ function getPvForecast(db, today) {
 
 /**
  * 获取明天的 PV 预测总发电量（kWh）和平均云量（%）
- * 用于判断是否需要保守卖电（明天天气差 → 少卖多留）
+ * 同时查 Open-Meteo 和 wttr.in，取较高云量值（保守）
  */
 function getTomorrowPvEstimate(db, today) {
   const row = db.prepare('SELECT forecast_json FROM solar_forecast WHERE date=? ORDER BY fetched_at DESC LIMIT 1').get(today);
@@ -221,9 +221,28 @@ function getTomorrowPvEstimate(db, today) {
     cloudSum += cloud;
     cloudCount++;
   }
-  const tomorrowCloudPct = cloudCount > 0 ? cloudSum / cloudCount : null;
-  console.log(`[明日PV] 预测发电: ${totalKwh.toFixed(1)}kWh, 平均云量: ${tomorrowCloudPct?.toFixed(0) ?? '?'}%`);
-  return { tomorrowKwh: totalKwh, tomorrowCloudPct };
+  const openMeteoCloud = cloudCount > 0 ? cloudSum / cloudCount : null;
+  console.log(`[明日PV] Open-Meteo: 预测发电 ${totalKwh.toFixed(1)}kWh, 云量 ${openMeteoCloud?.toFixed(0) ?? '?'}%`);
+  return { tomorrowKwh: totalKwh, tomorrowCloudPct: openMeteoCloud };
+}
+
+/**
+ * 从 wttr.in 获取明天平均云量（同步 HTTP，作为 Open-Meteo 的交叉验证）
+ */
+async function getWttrTomorrowCloud() {
+  try {
+    const data = await httpsGet('https://wttr.in/Sydney?format=j1');
+    if (!data?.weather?.[1]?.hourly) return null;
+    const hourly = data.weather[1].hourly;
+    let cloudSum = 0;
+    for (const h of hourly) cloudSum += parseInt(h.cloudcover || 0);
+    const avg = cloudSum / hourly.length;
+    console.log(`[明日PV] wttr.in: 云量 ${avg.toFixed(0)}%`);
+    return avg;
+  } catch (e) {
+    console.warn(`[明日PV] wttr.in 查询失败: ${e.message}`);
+    return null;
+  }
 }
 
 // ── 家庭负载估算 ──────────────────────────────────────────────
@@ -702,31 +721,25 @@ async function main() {
   // ── 明天天气调整：天气差时保守卖电 ──────────────────────────
   if (sellSlots.length > 0) {
     const { tomorrowKwh, tomorrowCloudPct } = getTomorrowPvEstimate(db, today);
-    // 明天 PV < 10kWh 或云量 > 60% → 天气差，保守卖电
-    const poorWeather = (tomorrowKwh !== null && tomorrowKwh < 10) || (tomorrowCloudPct !== null && tomorrowCloudPct > 60);
-    if (poorWeather) {
-      // 天气差时：提高过夜保底到 55%，根据当前SOC限制卖电
-      const conservativeReservePct = NO_SELL_RESERVE_PCT; // 55%
-      const conservativeReserveKwh = conservativeReservePct / 100 * BATT_KWH;
-      const currentSocKwh = currentSocPct / 100 * BATT_KWH;
-      const availableForSellKwh = Math.max(0, currentSocKwh - conservativeReserveKwh);
-      const maxSellSlots = Math.floor(availableForSellKwh / (SELL_KWH_PER_HOUR * 0.5)); // 每半小时2.5kWh
-      if (maxSellSlots <= 0) {
-        console.log(`[明日天气] 🚫 天气差(PV=${tomorrowKwh?.toFixed(1)}kWh, 云量=${tomorrowCloudPct?.toFixed(0)}%) + SOC ${currentSocPct}% 不足保底${conservativeReservePct}%，取消卖电`);
+    const wttrCloud = await getWttrTomorrowCloud();
+    // 取两家预报中较高的云量（保守原则）
+    const finalCloud = Math.max(tomorrowCloudPct ?? 0, wttrCloud ?? 0);
+    console.log(`[明日天气] 综合云量: ${finalCloud.toFixed(0)}% (Open-Meteo=${tomorrowCloudPct?.toFixed(0) ?? '?'}%, wttr=${wttrCloud?.toFixed(0) ?? '?'}%)`);
+    // 明天云量 > 80% → 供应少 → 明天电价大概率高 → 留电明天卖利润更好
+    const tomorrowPoorSolar = finalCloud > 80;
+    if (tomorrowPoorSolar) {
+      // 比较今天卖电均价 vs 保守估计的明天高峰卖价
+      // 冬天阴天傍晚 feedIn 通常 20-35¢，今天如果 < 20¢ 就不值得卖
+      const todayAvgFeedIn = sellSlots.reduce((s, x) => s + x.feedInC, 0) / sellSlots.length;
+      const TOMORROW_EXPECTED_FEEDIN_C = 22; // 阴天傍晚保守估计
+      if (todayAvgFeedIn < TOMORROW_EXPECTED_FEEDIN_C) {
+        console.log(`[明日天气] 💰 明天云量${tomorrowCloudPct?.toFixed(0)}%→电价预计走高，今天卖价${todayAvgFeedIn.toFixed(1)}¢ < 明天预期${TOMORROW_EXPECTED_FEEDIN_C}¢，取消今天卖电，留电明天卖`);
         sellSlots = [];
-      } else if (sellSlots.length > maxSellSlots) {
-        console.log(`[明日天气] ⚠️ 天气差(PV=${tomorrowKwh?.toFixed(1)}kWh, 云量=${tomorrowCloudPct?.toFixed(0)}%)，SOC ${currentSocPct}%，卖电槽从${sellSlots.length}减到${maxSellSlots}（保底${conservativeReservePct}%）`);
-        sellSlots = sellSlots.slice(0, maxSellSlots);
       } else {
-        console.log(`[明日天气] ⚠️ 天气差(PV=${tomorrowKwh?.toFixed(1)}kWh, 云量=${tomorrowCloudPct?.toFixed(0)}%)，SOC ${currentSocPct}%，卖电${sellSlots.length}槽在安全范围`);
-      }
-      // 极端天气（PV < 4kWh）：完全不卖电
-      if (tomorrowKwh !== null && tomorrowKwh < 4 && sellSlots.length > 0) {
-        console.log(`[明日天气] 🚫 极端差天气(PV<4kWh)，取消所有卖电，全部留电过夜`);
-        sellSlots = [];
+        console.log(`[明日天气] ⚠️ 明天云量${tomorrowCloudPct?.toFixed(0)}%，但今天卖价${todayAvgFeedIn.toFixed(1)}¢已够高，继续卖`);
       }
     } else {
-      console.log(`[明日天气] ✅ 天气正常(PV=${tomorrowKwh?.toFixed(1)}kWh, 云量=${tomorrowCloudPct?.toFixed(0)}%)，正常卖电`);
+      console.log(`[明日天气] ✅ 明天云量${tomorrowCloudPct?.toFixed(0) ?? '?'}%正常，按计划卖电`);
     }
   }
 
