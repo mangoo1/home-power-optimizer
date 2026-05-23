@@ -47,7 +47,7 @@ const DB_PATH        = path.join(__dirname, '..', 'data', 'energy.db');
 
 // ── 新策略常量 ────────────────────────────────────────────────
 const OVERNIGHT_RESERVE_PCT = 35;     // 卖电时过夜保底 35%
-const NO_SELL_RESERVE_PCT   = 55;     // 不卖电时过夜保底 55%（覆盖15:00→次日10:00）
+const NO_SELL_RESERVE_PCT   = 65;     // 不卖电时过夜保底 65%（覆盖15:00→次日10:00，~27kWh）
 const SELL_KWH_PER_HOUR    = 5.0;    // 每小时卖电约5kWh
 const SELL_PCT_PER_HOUR    = 12;     // ≈ 5/42 × 100 ≈ 12%
 const SELL_WINDOW_START    = 16;     // 卖电窗口起始 16:00
@@ -272,7 +272,7 @@ function scheduleHotWater(slots) {
       break;
     }
   }
-  const allHwDeadlineMins = dangerStartMins - 30; // 所有热水器在危险前30分结束
+  const allHwDeadlineMins = Math.min(dangerStartMins - 30, 15 * 60); // 所有热水器15:00前结束
 
   console.log(`[热水器] 危险起点=${Math.floor(dangerStartMins/60)}:${String(dangerStartMins%60).padStart(2,'0')} 截止=${Math.floor(allHwDeadlineMins/60)}:${String(allHwDeadlineMins%60).padStart(2,'0')}`);
 
@@ -725,21 +725,22 @@ async function main() {
     // 取两家预报中较高的云量（保守原则）
     const finalCloud = Math.max(tomorrowCloudPct ?? 0, wttrCloud ?? 0);
     console.log(`[明日天气] 综合云量: ${finalCloud.toFixed(0)}% (Open-Meteo=${tomorrowCloudPct?.toFixed(0) ?? '?'}%, wttr=${wttrCloud?.toFixed(0) ?? '?'}%)`);
-    // 明天云量 > 80% → 供应少 → 明天电价大概率高 → 留电明天卖利润更好
+    // 明天云量 > 80% → PV 少 → 明天充电困难 → 保留更多过夜电量，但仍然卖掉余量
+    // 原则：今天有利润就卖（feedIn > 成本×1.25），明天低价再充；
+    //       明天阴天意味着保底要多留（提高 overnight reserve），不是完全不卖
     const tomorrowPoorSolar = finalCloud > 80;
     if (tomorrowPoorSolar) {
-      // 比较今天卖电均价 vs 保守估计的明天高峰卖价
-      // 冬天阴天傍晚 feedIn 通常 20-35¢，今天如果 < 20¢ 就不值得卖
-      const todayAvgFeedIn = sellSlots.reduce((s, x) => s + x.feedInC, 0) / sellSlots.length;
-      const TOMORROW_EXPECTED_FEEDIN_C = 22; // 阴天傍晚保守估计
-      if (todayAvgFeedIn < TOMORROW_EXPECTED_FEEDIN_C) {
-        console.log(`[明日天气] 💰 明天云量${tomorrowCloudPct?.toFixed(0)}%→电价预计走高，今天卖价${todayAvgFeedIn.toFixed(1)}¢ < 明天预期${TOMORROW_EXPECTED_FEEDIN_C}¢，取消今天卖电，留电明天卖`);
-        sellSlots = [];
+      // 减少卖电槽数量（保留更多电），但不完全取消
+      const maxSellSlotsReduced = Math.max(2, Math.floor(sellSlots.length * 0.5));
+      const removed = sellSlots.length - maxSellSlotsReduced;
+      if (removed > 0) {
+        sellSlots = sellSlots.slice(0, maxSellSlotsReduced);
+        console.log(`[明日天气] ⚠️ 明天云量${finalCloud.toFixed(0)}%偏高，减少卖电槽: 保留${maxSellSlotsReduced}个（削减${removed}个），多留电过夜`);
       } else {
-        console.log(`[明日天气] ⚠️ 明天云量${tomorrowCloudPct?.toFixed(0)}%，但今天卖价${todayAvgFeedIn.toFixed(1)}¢已够高，继续卖`);
+        console.log(`[明日天气] ⚠️ 明天云量${finalCloud.toFixed(0)}%偏高，卖电槽已很少(${sellSlots.length}个)，保持不变`);
       }
     } else {
-      console.log(`[明日天气] ✅ 明天云量${tomorrowCloudPct?.toFixed(0) ?? '?'}%正常，按计划卖电`);
+      console.log(`[明日天气] ✅ 明天云量${finalCloud.toFixed(0) ?? '?'}%正常，按计划卖电`);
     }
   }
 
