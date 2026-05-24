@@ -777,7 +777,9 @@ async function main() {
       const lastChargeKey = lastCharge?.key || lastCharge?.nemTime?.substring(11,16) || '';
       const lastChargeH = parseInt(lastChargeKey.substring(0,2) || '15');
       const lastChargeM = parseInt(lastChargeKey.substring(3,5) || '0');
-      const chargeEndHHMM = Math.min(lastChargeH * 100 + lastChargeM + 30, 2359);
+      // +30分钟，正确处理分钟进位（如 12:30 + 30min = 13:00 = 1300，不是 1260）
+      const endMin = lastChargeM + 30;
+      const chargeEndHHMM = Math.min((lastChargeH + Math.floor(endMin / 60)) * 100 + (endMin % 60), 2359);
 
       const chargeWindows = planRow ? JSON.parse(planRow.charge_windows_json || '[]') : [];
       const w = chargeWindows?.[0];
