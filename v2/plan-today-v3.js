@@ -403,7 +403,9 @@ function calcChargeTarget(sellSlotCount) {
   const sellPct = sellSlotCount * (SELL_PCT_PER_HOUR / 2);
   const basePct = sellSlotCount > 0 ? OVERNIGHT_RESERVE_PCT : NO_SELL_RESERVE_PCT;
   const target = Math.min(100, basePct + sellPct);
-  return target;
+  // 充电目标绝不低于 NO_SELL_RESERVE_PCT（65%），确保过夜安全
+  // 即使只有少量卖电槽，也至少充到 65%
+  return Math.max(target, NO_SELL_RESERVE_PCT);
 }
 
 // ── 生成完整计划 ──────────────────────────────────────────────
@@ -423,9 +425,12 @@ function buildPlan(slots, pvByHour, currentSocPct, sellSlots, hwSlots) {
     ? sellSlots.reduce((s, x) => s + x.feedInC, 0) / sellSlots.length
     : 0;
   // 买价上限：卖电 feedIn 倒推，保证 25% 利润率或 3¢ 差价（取宽松的）
-  const buyMaxDynamic = sellSlots.length > 0
+  // 但如果 SOC < NO_SELL_RESERVE(65%)，放宽买价上限到 20¢（过夜安全优先）
+  const sellBuyMax = sellSlots.length > 0
     ? Math.max(avgFeedInC / (1 + SELL_PROFIT_MARGIN), avgFeedInC - MIN_PROFIT_SPREAD_C)
     : 12.0;
+  const survivalBuyMax = currentSocPct < NO_SELL_RESERVE_PCT ? 20.0 : sellBuyMax;
+  const buyMaxDynamic = Math.max(sellBuyMax, survivalBuyMax);
   console.log(`[充电] 动态买价上限: ${buyMaxDynamic.toFixed(1)}¢ (avgFeedIn=${avgFeedInC.toFixed(1)}¢)`);
 
   const chargeCandidates = slots
@@ -520,9 +525,14 @@ function buildPlan(slots, pvByHour, currentSocPct, sellSlots, hwSlots) {
       const gridRoom = parseFloat(Math.min(maxChargeKw, BREAKER_KW - hl - CHARGE_BUFFER).toFixed(2));
       chargeKw = Math.max(0.5, gridRoom);
       reason = `cheap buy=${s.buyC}¢<${(avgSellC*0.8).toFixed(1)}¢ grid-charge`;
-    } else if (hwSlots && hwSlots.has(s.key) && hl > 3) {
-      // 热水器运行时段：绝不能 self-use（会放电给热水器，浪费电池）
-      // 强制小功率充电或 backup，让电网供热水器
+    } else if (hl > 3 && socKwh < chargeTargetKwh) {
+      // 高负载时段（热水器等）+ SOC未达标：必须充电，否则 self-use 会放电给热水器
+      // 不管是否在 hwSlots 里——只要 homeLoad > 3kW 就说明大功率设备在跑
+      action = 'charge';
+      chargeKw = Math.max(0.1, maxChargeKw);
+      reason = `热水器运行中，禁止放电 buy=${s.buyC}¢`;
+    } else if (hl > 3) {
+      // 高负载但 SOC 已达标：至少不放电，用 backup 模式让电网供热水器
       action = 'charge';
       chargeKw = Math.max(0.1, maxChargeKw);
       reason = `热水器运行中，禁止放电 buy=${s.buyC}¢`;
