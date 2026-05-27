@@ -833,14 +833,19 @@ async function main() {
   try { db.prepare('ALTER TABLE daily_plan ADD COLUMN hw_window_json TEXT').run(); } catch {}
   try { db.prepare('ALTER TABLE daily_plan ADD COLUMN gf_window_json TEXT').run(); } catch {}
 
-  // 如果当天有 manual source 且 is_active=1 的计划，不覆盖（手动优先）
+  // 如果当天有 manual source 且 override 仍有效，不覆盖（手动优先）
   const manualActive = db.prepare(
-    "SELECT id, version FROM daily_plan WHERE date=? AND is_active=1 AND source='manual' LIMIT 1"
+    "SELECT id, version, manual_override_until FROM daily_plan WHERE date=? AND is_active=1 AND source='manual' LIMIT 1"
   ).get(today);
   if (manualActive) {
-    console.log(`[计划] ⚠️ 当天已有手动计划 (id=${manualActive.id} v${manualActive.version})，跳过自动生成`);
-    db.close();
-    return;
+    const overrideUntil = manualActive.manual_override_until ? new Date(manualActive.manual_override_until) : null;
+    if (overrideUntil && overrideUntil > new Date()) {
+      console.log(`[计划] ⚠️ 手动计划有效 (id=${manualActive.id}, override until ${manualActive.manual_override_until})，跳过`);
+      db.close();
+      return;
+    }
+    // Manual override expired or null — allow replan (deactivate old)
+    console.log(`[计划] 手动计划 (id=${manualActive.id}) override 已过期，允许覆盖`);
   }
 
   // ── 增量更新：保留已过去时段 + 手动标记的时段 ──
