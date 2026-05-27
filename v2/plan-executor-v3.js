@@ -702,6 +702,19 @@ async function main() {
     if (overrideUntil > new Date()) {
       global._manualOverrideActive = true;
       console.log(`[LOCK] Manual override active until ${planRow.manual_override_until} — skipping mode changes`);
+    } else {
+      // Override just expired — trigger replan
+      console.log(`[LOCK] Manual override expired, triggering replan...`);
+      db.prepare('UPDATE daily_plan SET manual_override_until=NULL WHERE id=?').run(planRow.id);
+      try {
+        const { execSync } = require('child_process');
+        execSync('node v2/plan-today-v3.js', { cwd: path.join(__dirname, '..'), timeout: 60000, stdio: 'pipe' });
+        console.log(`[LOCK] Replan completed ✅`);
+      } catch (e) {
+        console.log(`[LOCK] Replan failed: ${e.message}`);
+      }
+      db.close();
+      return; // Let next cron cycle pick up the new plan
     }
   }
 
