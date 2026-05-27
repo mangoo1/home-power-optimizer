@@ -840,19 +840,13 @@ async function main() {
       action = 'sell-soc-floor';
       logData(db, ess, amber, slot, 'mode-switch-selfuse', { modeFrom: ess.reportedMode, modeTo: 0, sellKw: 0 });
     } else if (strategy.isV3) {
-      // ── v3 卖电逻辑：实时检查 feedIn 是否有利润 ──
+      // ── v3 卖电逻辑：实时检查 feedIn vs 当前买价 ──
       const feedIn = amber?.feedInPrice ?? null;
+      const buyPrice = amber?.buyPrice ?? null;
       
-      // 计算今天充电成本：从 energy_log 取今天 charge 时段的平均买价
-      const todayChargeCost = db.prepare(`
-        SELECT AVG(buy_price) as avg_cost FROM energy_log 
-        WHERE ts >= datetime('now', '-24 hours') AND batt_power > 1 AND buy_price > 0
-      `).get()?.avg_cost ?? 20;
-      const minSellPrice = todayChargeCost * 0.9; // 至少卖到充电成本的 90% 才不亏太多
-      
-      if (feedIn !== null && feedIn < minSellPrice) {
-        console.log(`[卖电] ❌ feedIn=${feedIn.toFixed(1)}¢ < 成本${minSellPrice.toFixed(1)}¢（充电均价${todayChargeCost.toFixed(1)}¢×0.9），停止卖电`);
-        await switchToSelfUse('sell-abort: feedIn-below-cost');
+      if (feedIn !== null && buyPrice !== null && feedIn <= buyPrice) {
+        console.log(`[卖电] ❌ feedIn=${feedIn.toFixed(1)}¢ ≤ buyPrice=${buyPrice.toFixed(1)}¢，不卖`);
+        await switchToSelfUse('sell-abort: feedIn<=buyPrice');
         action = 'sell-abort-low-feedin';
       } else {
       // 找最后一个 sell 槽的结束时间，设放电时间窗口
