@@ -24,6 +24,7 @@ require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') }
 const https    = require('https');
 const http     = require('http');
 const path     = require('path');
+const fs       = require('fs');
 const Database = require('better-sqlite3');
 const essApi   = require('./ess-api');
 
@@ -258,6 +259,10 @@ async function updateSellKw(kw, reason = 'sell') {
 }
 
 async function switchToSelfUse(reason = 'self-use') {
+  if (global._manualOverrideActive) {
+    console.log(`[LOCK] switchToSelfUse blocked (manual override) — reason: ${reason}`);
+    return false;
+  }
   // 切 Self-use 前先清充放电时间窗口，防止残留 Timed 设置
   await essApi.setParam('0xC0BA', 0, reason, 'plan-executor-v3');
   await essApi.setParam('0xC0BC', 0, reason, 'plan-executor-v3');
@@ -271,6 +276,10 @@ async function switchToSelfUse(reason = 'self-use') {
 }
 
 async function restoreTimedMode(chargeWindows, reason = 'restore-timed') {
+  if (global._manualOverrideActive) {
+    console.log(`[LOCK] restoreTimedMode blocked (manual override) — reason: ${reason}`);
+    return;
+  }
   const w = chargeWindows?.[0];
   const startHHMM = w ? w.startHour * 100 : 900;
   const endHHMM   = w ? (w.endHour - 1) * 100 + 30 : 1430;
@@ -291,7 +300,7 @@ function parsePlanStrategy(planRow) {
   let notes = {};
   try { notes = JSON.parse(planRow?.notes ?? '{}'); } catch {}
 
-  const isV3 = source === 'v3-sell' || notes.strategy === 'v3-sell';
+  const isV3 = source === 'v3-sell' || source === 'manual' || notes.strategy === 'v3-sell' || notes.strategy === 'manual';
 
   return {
     isV3,
@@ -667,6 +676,8 @@ async function handleGfHotWater(db, syd) {
 
 // ── 主流程 ────────────────────────────────────────────────────
 async function main() {
+  // Manual override check from DB (no lock file needed)
+
   const syd = sydneyTime();
   const now = new Date();
   console.log(`\n[${syd.date} ${syd.hh}:${String(syd.mi).padStart(2,'0')}] === plan-executor v3 ===`);
@@ -683,6 +694,15 @@ async function main() {
 
   if (!planRow) {
     console.log('[计划] 今天没有计划，仅记录数据');
+  }
+
+  // Check manual override from DB
+  if (planRow?.manual_override_until) {
+    const overrideUntil = new Date(planRow.manual_override_until);
+    if (overrideUntil > new Date()) {
+      global._manualOverrideActive = true;
+      console.log(`[LOCK] Manual override active until ${planRow.manual_override_until} — skipping mode changes`);
+    }
   }
 
   // 解析策略（v3 vs v2 兼容）
@@ -727,7 +747,7 @@ async function main() {
   // 4. 安全检查：总功率超断路器
   const homeLoad   = ess.homeLoad  ?? 0;
   const pvPower    = ess.pvPower   ?? 0;
-  const gridImport = ess.gridPower ?? 0;
+  const gridImport = Math.abs(Math.min(ess.gridPower ?? 0, 0)); // 负值=买入，取绝对值
   let extraChargeKw = null, extraSellKw = null;
 
   if (gridImport > BREAKER_KW - BREAKER_BUFFER) {
@@ -786,17 +806,16 @@ async function main() {
       const chargeStartHHMM = w ? w.startHour * 100 : 800;
 
       if (ess.reportedMode !== 1) {
+        // 不在 Timed 模式，需要切换并设时间窗口
         console.log(`[模式] charge时段但mode=${ess.reportedMode}，切回 Timed`);
-      }
-      await essApi.restoreTimedMode({
-        startHHMM: chargeStartHHMM,
-        endHHMM: chargeEndHHMM,
-        chargeKw: MAX_CHARGE_KW,
-        sellKw: 0,
-        sellStartHHMM: 0,
-        sellEndHHMM: 0
-      }, `charge-timed: window ${String(chargeStartHHMM).padStart(4,'0')}-${String(chargeEndHHMM).padStart(4,'0')}`, 'plan-executor-v3');
-      if (ess.reportedMode !== 1) {
+        await essApi.restoreTimedMode({
+          startHHMM: chargeStartHHMM,
+          endHHMM: chargeEndHHMM,
+          chargeKw: MAX_CHARGE_KW,
+          sellKw: 0,
+          sellStartHHMM: 0,
+          sellEndHHMM: 0
+        }, `charge-timed: window ${String(chargeStartHHMM).padStart(4,'0')}-${String(chargeEndHHMM).padStart(4,'0')}`, 'plan-executor-v3');
         logData(db, ess, amber, slot, 'mode-switch-timed', { modeFrom: ess.reportedMode, modeTo: 1 });
       }
       const safeChargeKw = calcSafeChargeKw(homeLoad, pvPower, ess.gridPower, ess.battPower);
@@ -821,7 +840,21 @@ async function main() {
       action = 'sell-soc-floor';
       logData(db, ess, amber, slot, 'mode-switch-selfuse', { modeFrom: ess.reportedMode, modeTo: 0, sellKw: 0 });
     } else if (strategy.isV3) {
-      // ── v3 卖电逻辑：action=sell 就卖，不做利润检查 ──
+      // ── v3 卖电逻辑：实时检查 feedIn 是否有利润 ──
+      const feedIn = amber?.feedInPrice ?? null;
+      
+      // 计算今天充电成本：从 energy_log 取今天 charge 时段的平均买价
+      const todayChargeCost = db.prepare(`
+        SELECT AVG(buy_price) as avg_cost FROM energy_log 
+        WHERE ts >= datetime('now', '-24 hours') AND batt_power > 1 AND buy_price > 0
+      `).get()?.avg_cost ?? 20;
+      const minSellPrice = todayChargeCost * 0.9; // 至少卖到充电成本的 90% 才不亏太多
+      
+      if (feedIn !== null && feedIn < minSellPrice) {
+        console.log(`[卖电] ❌ feedIn=${feedIn.toFixed(1)}¢ < 成本${minSellPrice.toFixed(1)}¢（充电均价${todayChargeCost.toFixed(1)}¢×0.9），停止卖电`);
+        await switchToSelfUse('sell-abort: feedIn-below-cost');
+        action = 'sell-abort-low-feedin';
+      } else {
       // 找最后一个 sell 槽的结束时间，设放电时间窗口
       const sellSlots = intervals.filter(s => s.action === 'sell');
       const lastSell = sellSlots[sellSlots.length - 1];
@@ -849,8 +882,9 @@ async function main() {
       const actualSellKw = parseFloat(Math.max(0.5, Math.min(MAX_SELL_KW, plannedSellKw)).toFixed(2));
       await updateSellKw(actualSellKw, `sell-slot-v3: feedIn=${amber?.feedInPrice?.toFixed(1) ?? '?'}c`);
       extraSellKw = actualSellKw;
-      console.log(`[卖电] v3模式 feedIn=${amber?.feedInPrice?.toFixed(1) ?? '?'}¢，卖电 ${actualSellKw}kW，窗口到 ${String(Math.min(sellEndHHMM,2359)).padStart(4,'0')}`);
+      console.log(`[卖电] v3模式 feedIn=${feedIn?.toFixed(1) ?? '?'}¢，卖电 ${actualSellKw}kW，窗口到 ${String(Math.min(sellEndHHMM,2359)).padStart(4,'0')}`);
       action = 'sell';
+      } // end feedIn check
     } else {
       // ── v2 兼容卖电逻辑：检查最低卖电价 ──
       if (amber && amber.feedInPrice != null) {

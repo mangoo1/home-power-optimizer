@@ -503,14 +503,8 @@ async function loadPlan() {
   const [nowH, nowM] = nowSydStr.replace('24:', '00:').split(':').map(Number);
   const nowMins = nowH * 60 + nowM;
 
-  // Filter to today's slots only, 06:00 onwards (skip overnight carry-over)
-  const todayStr = date; // YYYY-MM-DD
-  let todaySlots = intervals.filter(iv => {
-    const k = iv.key || iv.nemTime || '';
-    if (!k.includes(todayStr)) return false;
-    const hh = parseInt((k.split('T')[1] || '').substring(0, 2), 10);
-    return hh >= 6;
-  });
+  // Use all intervals from today's plan (already day-scoped from DB query)
+  let todaySlots = intervals;
 
   // ── Fallback: build blocks from charge_windows_json when intervals_json is empty ──
   // Used when plan is a manual override (no interval detail) or from rules engine
@@ -558,8 +552,9 @@ async function loadPlan() {
   let blocks = [];
   let cur = null;
   for (const iv of todaySlots) {
-    const slotKey = iv.key || iv.nemTime;
-    const timeStr = slotKey.split('T')[1]?.substring(0, 5) || '??:??';
+    const slotKey = iv.key || iv.nemTime || '';
+    // Support both "HH:MM" and "YYYY-MM-DDTHH:MM:SS+..." formats
+    const timeStr = slotKey.includes('T') ? slotKey.split('T')[1].substring(0, 5) : slotKey.substring(0, 5) || '??:??';
     const [hh, mm] = timeStr.split(':').map(Number);
     const slotMins = hh * 60 + mm;
     const action   = iv.action || 'self-use';

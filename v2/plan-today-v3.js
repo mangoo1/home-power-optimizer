@@ -833,6 +833,42 @@ async function main() {
   try { db.prepare('ALTER TABLE daily_plan ADD COLUMN hw_window_json TEXT').run(); } catch {}
   try { db.prepare('ALTER TABLE daily_plan ADD COLUMN gf_window_json TEXT').run(); } catch {}
 
+  // 如果当天有 manual source 且 is_active=1 的计划，不覆盖（手动优先）
+  const manualActive = db.prepare(
+    "SELECT id, version FROM daily_plan WHERE date=? AND is_active=1 AND source='manual' LIMIT 1"
+  ).get(today);
+  if (manualActive) {
+    console.log(`[计划] ⚠️ 当天已有手动计划 (id=${manualActive.id} v${manualActive.version})，跳过自动生成`);
+    db.close();
+    return;
+  }
+
+  // ── 增量更新：保留已过去时段 + 手动标记的时段 ──
+  const existingPlan = db.prepare(
+    "SELECT intervals_json FROM daily_plan WHERE date=? AND is_active=1 ORDER BY rowid DESC LIMIT 1"
+  ).get(today);
+  if (existingPlan?.intervals_json) {
+    const existingIntervals = JSON.parse(existingPlan.intervals_json);
+    const nowMins = new Date().toLocaleString('en-AU', {timeZone:'Australia/Sydney', hour:'2-digit', minute:'2-digit', hour12:false})
+      .split(':').reduce((h,m) => parseInt(h)*60+parseInt(m), 0);
+    
+    for (const ei of existingIntervals) {
+      const [h,m] = (ei.key||'00:00').split(':').map(Number);
+      const slotMins = h*60+m;
+      const isManual = ei.reason?.startsWith('manual:');
+      const isPast = slotMins < nowMins;
+      
+      if (isPast || isManual) {
+        // Find matching slot in new plan and override with existing
+        const idx = plan.findIndex(s => s.key === ei.key);
+        if (idx >= 0) {
+          plan[idx] = ei;
+        }
+      }
+    }
+    console.log(`[增量] 保留已过去/手动时段，更新未来自动时段`);
+  }
+
   db.prepare('UPDATE daily_plan SET is_active=0 WHERE date=? AND is_active=1').run(today);
   const lastVer = db.prepare('SELECT MAX(version) as v FROM daily_plan WHERE date=?').get(today);
   const version = (lastVer?.v ?? 0) + 1;
