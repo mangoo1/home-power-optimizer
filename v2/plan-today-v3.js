@@ -398,20 +398,50 @@ function planSellSlots(slots, avgChargeCostC) {
   return sellSlots;
 }
 
-function calcChargeTarget(sellSlotCount) {
-  // 每个半小时槽消耗 6% SOC（= 12% / 2）
-  const sellPct = sellSlotCount * (SELL_PCT_PER_HOUR / 2);
-  const basePct = sellSlotCount > 0 ? OVERNIGHT_RESERVE_PCT : NO_SELL_RESERVE_PCT;
-  const target = Math.min(100, basePct + sellPct);
-  // 充电目标绝不低于 NO_SELL_RESERVE_PCT（65%），确保过夜安全
-  // 即使只有少量卖电槽，也至少充到 65%
-  return Math.max(target, NO_SELL_RESERVE_PCT);
+function calcChargeTarget(sellSlotCount, tomorrowKwh = null, tomorrowCloudPct = null) {
+  // 核心逻辑：充电目标 = 卖电消耗 + 过夜用电需求
+  // 过夜用电需求根据明天天气动态调整：
+  //   明天晴（PV > 10kWh）→ 过夜保底低（明天 PV 能充回来）
+  //   明天阴（PV < 5kWh）→ 过夜保底高（明天充电靠网电，不确定电价）
+
+  // 1. 卖电消耗
+  const sellPct = sellSlotCount * (SELL_PCT_PER_HOUR / 2); // 每半小时 6%
+
+  // 2. 过夜保底（根据明天 PV 预测动态调整）
+  let overnightPct;
+  if (tomorrowKwh !== null && tomorrowKwh > 12) {
+    // 明天晴天：PV 充足（>12kWh），保底可以低
+    overnightPct = 35;
+    console.log(`[充电目标] 明天PV预测${tomorrowKwh.toFixed(1)}kWh(好)，过夜保底35%`);
+  } else if (tomorrowKwh !== null && tomorrowKwh > 6) {
+    // 明天一般：PV 中等（6-12kWh），保底适中
+    overnightPct = 50;
+    console.log(`[充电目标] 明天PV预测${tomorrowKwh.toFixed(1)}kWh(中等)，过夜保底50%`);
+  } else if (tomorrowKwh !== null) {
+    // 明天阴天：PV 差（<6kWh），保底要高
+    overnightPct = 65;
+    console.log(`[充电目标] 明天PV预测${tomorrowKwh.toFixed(1)}kWh(差)，过夜保底65%`);
+  } else {
+    // 没有预测数据，用保守默认值
+    overnightPct = 50;
+    console.log(`[充电目标] 无明天PV预测，默认过夜保底50%`);
+  }
+
+  // 如果明天云量特别高（>80%），再加一层保守
+  if (tomorrowCloudPct !== null && tomorrowCloudPct > 80 && overnightPct < 60) {
+    overnightPct = 60;
+    console.log(`[充电目标] 明天云量${tomorrowCloudPct.toFixed(0)}%偏高，上调保底到60%`);
+  }
+
+  const target = Math.min(100, overnightPct + sellPct);
+  console.log(`[充电目标] 过夜${overnightPct}% + 卖电${sellPct}% = 目标${target}%`);
+  return target;
 }
 
 // ── 生成完整计划 ──────────────────────────────────────────────
-function buildPlan(slots, pvByHour, currentSocPct, sellSlots, hwSlots) {
+function buildPlan(slots, pvByHour, currentSocPct, sellSlots, hwSlots, tomorrowPv = {}) {
   const sellKeys = new Set(sellSlots.map(s => s.key));
-  const chargeTargetPct = calcChargeTarget(sellSlots.length);
+  const chargeTargetPct = calcChargeTarget(sellSlots.length, tomorrowPv.kwh ?? null, tomorrowPv.cloudPct ?? null);
   const chargeTargetKwh = chargeTargetPct / 100 * BATT_KWH;
   const currentKwh = currentSocPct / 100 * BATT_KWH;
   const neededKwhRaw = Math.max(0, chargeTargetKwh - currentKwh);
@@ -716,12 +746,13 @@ async function main() {
   }
 
   // ── 明天天气调整：天气差时保守卖电 ──────────────────────────
+  const { tomorrowKwh, tomorrowCloudPct } = getTomorrowPvEstimate(db, today);
+  const wttrCloud = await getWttrTomorrowCloud();
+  // 取两家预报中较高的云量（保守原则）
+  const finalCloud = Math.max(tomorrowCloudPct ?? 0, wttrCloud ?? 0);
+  console.log(`[明日天气] 综合云量: ${finalCloud.toFixed(0)}% (Open-Meteo=${tomorrowCloudPct?.toFixed(0) ?? '?'}%, wttr=${wttrCloud?.toFixed(0) ?? '?'}%)`);
+
   if (sellSlots.length > 0) {
-    const { tomorrowKwh, tomorrowCloudPct } = getTomorrowPvEstimate(db, today);
-    const wttrCloud = await getWttrTomorrowCloud();
-    // 取两家预报中较高的云量（保守原则）
-    const finalCloud = Math.max(tomorrowCloudPct ?? 0, wttrCloud ?? 0);
-    console.log(`[明日天气] 综合云量: ${finalCloud.toFixed(0)}% (Open-Meteo=${tomorrowCloudPct?.toFixed(0) ?? '?'}%, wttr=${wttrCloud?.toFixed(0) ?? '?'}%)`);
     // 明天云量 > 80% → PV 少 → 明天充电困难 → 保留更多过夜电量，但仍然卖掉余量
     // 原则：今天有利润就卖（feedIn > 成本×1.25），明天低价再充；
     //       明天阴天意味着保底要多留（提高 overnight reserve），不是完全不卖
@@ -809,7 +840,7 @@ async function main() {
     }
   }
 
-  const { plan, chargeTargetPct, sellSlotCount } = buildPlan(slots, pvByHour, currentSocPct, sellSlots, hwSlots);
+  const { plan, chargeTargetPct, sellSlotCount } = buildPlan(slots, pvByHour, currentSocPct, sellSlots, hwSlots, { kwh: tomorrowKwh, cloudPct: finalCloud });
 
   // 打印
   const report = printPlan(plan, currentSocPct, today, chargeTargetPct, sellSlotCount);
