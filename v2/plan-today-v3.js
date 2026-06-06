@@ -47,7 +47,7 @@ const DB_PATH        = path.join(__dirname, '..', 'data', 'energy.db');
 
 // ── 新策略常量 ────────────────────────────────────────────────
 const OVERNIGHT_RESERVE_PCT = 35;     // 卖电时过夜保底 35%
-const NO_SELL_RESERVE_PCT   = 65;     // 不卖电时过夜保底 65%（覆盖15:00→次日10:00，~27kWh）
+const NO_SELL_RESERVE_PCT   = 80;     // 不卖电时过夜保底 80%（Deven 2026-06-01）
 const SELL_KWH_PER_HOUR    = 5.0;    // 每小时卖电约5kWh
 const SELL_PCT_PER_HOUR    = 12;     // ≈ 5/42 × 100 ≈ 12%
 const SELL_WINDOW_START    = 16;     // 卖电窗口起始 16:00
@@ -385,7 +385,7 @@ function planSellSlots(slots, avgChargeCostC) {
   const candidates = slots
     .filter(s => {
       const h = parseInt(s.key.split(':')[0]);
-      return h >= SELL_WINDOW_START && h < SELL_WINDOW_END && !s.dw && s.feedInC >= minFeedIn;
+      return h >= SELL_WINDOW_START && h < SELL_WINDOW_END && s.feedInC >= minFeedIn;
     })
     .sort((a, b) => b.feedInC - a.feedInC);
 
@@ -414,7 +414,8 @@ function buildPlan(slots, pvByHour, currentSocPct, sellSlots, hwSlots) {
   const chargeTargetPct = calcChargeTarget(sellSlots.length);
   const chargeTargetKwh = chargeTargetPct / 100 * BATT_KWH;
   const currentKwh = currentSocPct / 100 * BATT_KWH;
-  const neededKwh = Math.max(0, chargeTargetKwh - currentKwh);
+  const neededKwhRaw = Math.max(0, chargeTargetKwh - currentKwh);
+  const neededKwh = neededKwhRaw * 1.10; // +10% buffer，但不多选贵槽
 
   console.log(`\n[策略] 过夜保底: ${OVERNIGHT_RESERVE_PCT}% | 卖电槽: ${sellSlots.length}个(${sellSlots.length * 0.5}h) | 充电目标: ${chargeTargetPct}% (${chargeTargetKwh.toFixed(1)}kWh)`);
   console.log(`[策略] 当前: ${currentSocPct}% (${currentKwh.toFixed(1)}kWh) | 需充: ${neededKwh.toFixed(1)}kWh`);
@@ -425,12 +426,11 @@ function buildPlan(slots, pvByHour, currentSocPct, sellSlots, hwSlots) {
     ? sellSlots.reduce((s, x) => s + x.feedInC, 0) / sellSlots.length
     : 0;
   // 买价上限：卖电 feedIn 倒推，保证 25% 利润率或 3¢ 差价（取宽松的）
-  // 但如果 SOC < NO_SELL_RESERVE(65%)，放宽买价上限到 20¢（过夜安全优先）
+  // 不再因 SOC 低就放宽——纯按价格选最便宜时段，不多花冤枉钱
   const sellBuyMax = sellSlots.length > 0
     ? Math.max(avgFeedInC / (1 + SELL_PROFIT_MARGIN), avgFeedInC - MIN_PROFIT_SPREAD_C)
     : 12.0;
-  const survivalBuyMax = currentSocPct < NO_SELL_RESERVE_PCT ? 20.0 : sellBuyMax;
-  const buyMaxDynamic = Math.max(sellBuyMax, survivalBuyMax);
+  const buyMaxDynamic = sellBuyMax;
   console.log(`[充电] 动态买价上限: ${buyMaxDynamic.toFixed(1)}¢ (avgFeedIn=${avgFeedInC.toFixed(1)}¢)`);
 
   const chargeCandidates = slots
@@ -455,26 +455,8 @@ function buildPlan(slots, pvByHour, currentSocPct, sellSlots, hwSlots) {
     accKwh += slotKwh;
   }
 
-  // 填充电连续性：首到尾之间所有非DW槽都补上（避免中间空洞导致切换）
-  // 但跳过充电功率 < 1kW 的垃圾槽
-  const sortedCK = [...chargeKeys].sort();
-  if (sortedCK.length >= 2) {
-    const first = sortedCK[0], last = sortedCK[sortedCK.length - 1];
-    for (const s of slots) {
-      const h = parseInt(s.key.split(':')[0]);
-      if (!chargeKeys.has(s.key) && s.key >= first && s.key <= last && !s.dw && h < CHARGE_DEADLINE_HOUR && s.buyC <= buyMaxDynamic) {
-        // 检查该槽是否有足够充电空间
-        const [sh, sm] = s.key.split(':').map(Number);
-        const pv = pvByHour[sh] ?? 0;
-        const hl = homeLoadKw(sh, sm, hwSlots);
-        const gridHeadroom = BREAKER_KW - Math.max(0, hl - pv) - CHARGE_BUFFER;
-        const maxKw = Math.min(MAX_CHARGE_KW, Math.max(0, gridHeadroom));
-        if (maxKw < 1.0) continue; // 跳过低功率垃圾槽
-        chargeKeys.add(s.key);
-      }
-    }
-  }
-  // 同样从原始选择中移除低功率槽
+  // 不再做连续性填充——纯按价格选槽，executor 能处理非连续充电
+  // 只移除低功率垃圾槽
   for (const key of [...chargeKeys]) {
     const [h, m] = key.split(':').map(Number);
     const pv = pvByHour[h] ?? 0;
@@ -507,7 +489,12 @@ function buildPlan(slots, pvByHour, currentSocPct, sellSlots, hwSlots) {
 
     let action = 'self-use', chargeKw = 0, sellKw = 0, reason = '';
 
-    if (s.dw) {
+    if (s.dw && sellKeys.has(s.key) && socKwh > OVERNIGHT_RESERVE_PCT / 100 * BATT_KWH) {
+      // DW 期间可以卖电（不增加 demand charge），但不能充电
+      action = 'sell';
+      sellKw = MAX_SELL_KW;
+      reason = `DW+sell feedIn=${s.feedInC}¢`;
+    } else if (s.dw) {
       action = 'standby';
       reason = 'DW';
     } else if (chargeKeys.has(s.key) && socKwh < chargeTargetKwh) {

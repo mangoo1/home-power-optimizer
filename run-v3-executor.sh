@@ -8,4 +8,9 @@ set -a
 source /home/deven/.openclaw/workspace/home-power-optimizer/.env
 set +a
 cd /home/deven/.openclaw/workspace/home-power-optimizer
-/usr/bin/node v2/plan-executor-v3.js >> data/executor-v3.log 2>&1
+# 4 minute timeout — if executor hangs, kill it so next cron can run
+timeout 240 /usr/bin/node v2/plan-executor-v3.js >> data/executor-v3.log 2>&1
+EXIT_CODE=$?
+if [ $EXIT_CODE -eq 124 ]; then
+  echo "[$(date)] TIMEOUT: executor killed after 240s" >> data/executor-v3.log
+fi
