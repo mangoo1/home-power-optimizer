@@ -338,7 +338,7 @@ async function loadCharts() {
   const daysBack = currentRange === '7d' ? 7 : currentRange === '48h' ? 2 : 1;
   const ds = await query(`SELECT date, cost_aud, earnings_aud FROM daily_summary ORDER BY date DESC LIMIT ${daysBack}`);
   ds.reverse();
-  const dsLabels = ds.map(r => v(r[0])?.substring(5));
+  const dsLabels = ds.map(r => { const d = v(r[0]); return (d && d.length >= 10) ? d.substring(5) : (d || '?'); });
   const dsCost   = ds.map(r => parseFloat(v(r[1]) || 0).toFixed(3));
   const dsEarn   = ds.map(r => parseFloat(v(r[2]) || 0).toFixed(3));
   const dsNet    = ds.map((r,i) => (parseFloat(dsCost[i]) - parseFloat(dsEarn[i])).toFixed(3));
@@ -383,9 +383,8 @@ async function loadCharts() {
     options: chartDefaults()
   });
 
-  const sydneyNow = toSydney(new Date().toISOString());
   document.getElementById('updated').textContent =
-    '更新时间: ' + sydneyNowStr() + ' AEDT | 自动刷新 5分钟';
+    '更新时间: ' + sydneyNowStr() + ' AEST | 自动刷新 5分钟';
 }
 
 async function load() {
