@@ -784,12 +784,22 @@ async function main() {
   } else if (slot.action === 'charge' || slot.action === 'charge+hw') {
     const realBuyPrice = amber?.buyPrice ?? null;
 
-    // SOC 达标检查：充到目标就停，切 Self-use
+    // SOC 达标检查：到目标后，如果电价便宜就低功率充电（电网供家用），否则切 Self-use
     if (ess.soc !== null && ess.soc >= chargeTargetPct) {
-      console.log(`[充电] SOC ${ess.soc}% >= 目标 ${chargeTargetPct}%，停止充电`);
-      await switchToSelfUse(`charge-done: SOC ${ess.soc}% >= target ${chargeTargetPct}%`);
-      logData(db, ess, amber, slot, 'charge-complete', { soc: ess.soc, target: chargeTargetPct });
-      action = 'charge-complete';
+      const cheapEnough = realBuyPrice != null && realBuyPrice < 10; // <10¢ 算便宜
+      if (cheapEnough) {
+        // 电价便宜：保持 Timed 模式，低功率充电（0.5kW），电网供家用，不用电池
+        const maintainKw = 0.5;
+        console.log(`[充电] SOC ${ess.soc}% >= 目标 ${chargeTargetPct}%，电价 ${realBuyPrice.toFixed(1)}¢ 便宜，维持低功率充电 ${maintainKw}kW`);
+        await essApi.setChargePower(maintainKw, 'maintain-charge');
+        logData(db, ess, amber, slot, 'charge-maintain', { soc: ess.soc, target: chargeTargetPct, chargeKw: maintainKw, buyPrice: realBuyPrice });
+        action = 'charge-maintain';
+      } else {
+        console.log(`[充电] SOC ${ess.soc}% >= 目标 ${chargeTargetPct}%，电价 ${realBuyPrice?.toFixed(1) ?? '?'}¢ 不便宜，停止充电`);
+        await switchToSelfUse(`charge-done: SOC ${ess.soc}% >= target ${chargeTargetPct}%`);
+        logData(db, ess, amber, slot, 'charge-complete', { soc: ess.soc, target: chargeTargetPct });
+        action = 'charge-complete';
+      }
     } else if (!strategy.isV3 && realBuyPrice != null && realBuyPrice > strategy.buyMaxC) {
       // v2 兼容：极端高价 abort
       console.log(`[充电] v2模式 实际电价 ${realBuyPrice.toFixed(1)}¢ > ${strategy.buyMaxC}¢，暂停充电`);
@@ -857,9 +867,11 @@ async function main() {
       const feedIn = amber?.feedInPrice ?? null;
       const buyPrice = amber?.buyPrice ?? null;
       
-      if (feedIn !== null && buyPrice !== null && feedIn <= buyPrice) {
-        console.log(`[卖电] ❌ feedIn=${feedIn.toFixed(1)}¢ ≤ buyPrice=${buyPrice.toFixed(1)}¢，不卖`);
-        await switchToSelfUse('sell-abort: feedIn<=buyPrice');
+      // 只有 feedIn 极低（< 5¢）才 abort 卖电；feedIn < buyPrice 是正常的（网费差），不能用来阻止卖电
+      const SELL_FLOOR_C = 5;
+      if (feedIn !== null && feedIn < SELL_FLOOR_C) {
+        console.log(`[卖电] ❌ feedIn=${feedIn.toFixed(1)}¢ < ${SELL_FLOOR_C}¢ 地板价，不卖`);
+        await switchToSelfUse('sell-abort: feedIn below floor');
         action = 'sell-abort-low-feedin';
       } else {
       // 找最后一个 sell 槽的结束时间，设放电时间窗口
@@ -868,7 +880,9 @@ async function main() {
       const lastSellKey = lastSell?.key || lastSell?.nemTime?.substring(11,16) || '';
       const lastSellH = parseInt(lastSellKey.substring(0,2) || '23');
       const lastSellM = parseInt(lastSellKey.substring(3,5) || '30');
-      const sellEndHHMM = lastSellH * 100 + lastSellM + 30; // 半小时后结束
+      // 半小时后结束，正确处理分钟溢出（如 20:30 + 30min = 21:00，不是 20:60）
+      const endTotalMin = lastSellH * 60 + lastSellM + 30;
+      const sellEndHHMM = Math.floor(endTotalMin / 60) * 100 + (endTotalMin % 60);
 
       const curKey = slot.key || slot.nemTime?.substring(11,16) || '';
       const curH = parseInt(curKey.substring(0,2) || '0');
