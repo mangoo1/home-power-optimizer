@@ -455,18 +455,19 @@ function buildPlan(slots, pvByHour, currentSocPct, sellSlots, hwSlots, tomorrowP
   const avgFeedInC = sellSlots.length > 0
     ? sellSlots.reduce((s, x) => s + x.feedInC, 0) / sellSlots.length
     : 0;
-  // 买价上限：卖电 feedIn 倒推，保证 25% 利润率或 3¢ 差价（取宽松的）
-  // 不再因 SOC 低就放宽——纯按价格选最便宜时段，不多花冤枉钱
+  // 两层充电选槽策略：
+  // 1) 基础需求：非 DW 时段，按价格排序选最便宜的，不设绝对上限（只要不是 DW 就行）
+  // 2) 卖电额外充电：才看利润率
   const sellBuyMax = sellSlots.length > 0
     ? Math.max(avgFeedInC / (1 + SELL_PROFIT_MARGIN), avgFeedInC - MIN_PROFIT_SPREAD_C)
     : 12.0;
-  const buyMaxDynamic = sellBuyMax;
-  console.log(`[充电] 动态买价上限: ${buyMaxDynamic.toFixed(1)}¢ (avgFeedIn=${avgFeedInC.toFixed(1)}¢)`);
+  console.log(`[充电] 卖电买价上限: ${sellBuyMax.toFixed(1)}¢ (avgFeedIn=${avgFeedInC.toFixed(1)}¢)`);
 
+  // 基础充电候选：所有非 DW 时段，按价格排序（不设绝对上限）
   const chargeCandidates = slots
     .filter(s => {
       const h = parseInt(s.key.split(':')[0]);
-      return h < CHARGE_DEADLINE_HOUR && !s.dw && s.buyC > 0 && s.buyC <= buyMaxDynamic;
+      return h < CHARGE_DEADLINE_HOUR && !s.dw && s.buyC > 0;
     })
     .sort((a, b) => a.buyC - b.buyC);
 
