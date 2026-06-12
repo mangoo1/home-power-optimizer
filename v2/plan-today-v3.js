@@ -263,6 +263,15 @@ function homeLoadKw(hour, minute, hwSlots) {
 
 // ── 热水器调度 ────────────────────────────────────────────────
 function scheduleHotWater(slots) {
+  // 固定时间窗口模式（热水器由物理定时器控制，不走 Tuya）
+  if (process.env.TUYA_DISABLED === '1') {
+    console.log('[热水器] Tuya 已禁用，使用固定时间窗口: main_hw 10:00-12:00, gf_hw 12:30-14:30');
+    return {
+      mainHw: { startKey: '10:00', endKey: '12:00', avgBuyC: 0, slots: [] },
+      gfHw:   { startKey: '12:30', endKey: '14:30', avgBuyC: 0, slots: [] },
+    };
+  }
+
   // 找危险截止时间（DW 或高价 >= HW_GRID_MAX_C，14:00 以后）
   let dangerStartMins = 17 * 60; // 默认 17:00
   for (const s of slots) {

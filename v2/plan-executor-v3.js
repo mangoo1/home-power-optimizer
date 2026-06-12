@@ -422,6 +422,10 @@ const HW_GF_ID   = 'bf3c28e8181e5e980eoobm';
 const tuya = require('./tuya-api');
 
 async function tuyaControl(deviceId, on) {
+  if (process.env.TUYA_DISABLED === '1') {
+    console.log(`[tuyaControl] Tuya 已禁用（定时器控制），跳过 ${deviceId} → ${on ? 'ON' : 'OFF'}`);
+    return true;
+  }
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       await tuya.switchDevice(deviceId, on);
@@ -507,6 +511,10 @@ function logHwAction(db, deviceId, deviceName, on, opts = {}) {
 }
 
 async function controlHotWater(on, autoOffMin = 120) {
+  if (process.env.TUYA_DISABLED === '1') {
+    console.log(`[主热水器] Tuya 已禁用（定时器控制），跳过 ${on ? '开' : '关'} 操作`);
+    return true; // 假装成功，不影响后续逻辑
+  }
   const ok = on
     ? await tuyaControlWithTimer(HW_MAIN_ID, true, autoOffMin)
     : await tuyaControlWithTimer(HW_MAIN_ID, false);
