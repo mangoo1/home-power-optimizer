@@ -950,7 +950,15 @@ async function main() {
     action = 'hotwater';
 
   } else if (slot.action === 'standby' || slot.action === 'self-use') {
-    if (ess.reportedMode === 1) {
+    // 热水器保护：homeLoad 高且电池在放电 → 切 Timed + charge 0.1kW + discharge 0，让电网供热水器
+    if (ess.homeLoad > 4.0 && ess.battPower < -1.0) {
+      console.log(`[热水器保护] homeLoad=${ess.homeLoad.toFixed(1)}kW, battPower=${ess.battPower.toFixed(1)}kW → 停止放电，让电网供热水器`);
+      await essApi.setMode(1, 'hw-protect-timed');
+      await essApi.setChargeKw(0.1, 'hw-protect-min-charge', 'executor');
+      await essApi.setDischargeKw(0, 'hw-protect-no-discharge', 'executor');
+      action = 'hw-protect';
+      logData(db, ess, amber, slot, 'hw-protect', { homeLoad: ess.homeLoad, battPower: ess.battPower });
+    } else if (ess.reportedMode === 1) {
       const hasFutureSell = intervals.some(s => {
         if (s.action !== 'sell') return false;
         const h = parseInt(s.nemTime?.substring(11,13) ?? s.key?.substring(0,2) ?? '0');
@@ -964,7 +972,7 @@ async function main() {
         logData(db, ess, amber, slot, 'mode-switch-selfuse', { modeFrom: 1, modeTo: 0 });
       }
     }
-    action = slot.action;
+    action = action || slot.action;
   }
 
   // 6. SOC 低电量记录
