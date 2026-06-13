@@ -964,9 +964,8 @@ async function main() {
     // 热水器保护：homeLoad 高且电池在放电 → 切 Timed + charge 0.1kW + discharge 0，让电网供热水器
     if (ess.homeLoad > 4.0 && ess.battPower < -1.0) {
       console.log(`[热水器保护] homeLoad=${ess.homeLoad.toFixed(1)}kW, battPower=${ess.battPower.toFixed(1)}kW → 停止放电，让电网供热水器`);
-      await essApi.setMode(1, 'hw-protect-timed');
-      await essApi.setChargeKw(0.1, 'hw-protect-min-charge', 'executor');
-      await essApi.setDischargeKw(0, 'hw-protect-no-discharge', 'executor');
+      await essApi.restoreTimedMode({ startHHMM: 0, endHHMM: 2359, chargeKw: 0.1, sellStartHHMM: 0, sellEndHHMM: 0, sellKw: 0 }, 'hw-protect-timed', 'plan-executor-v3');
+      await essApi.setChargeKw(0.1, 'hw-protect-min-charge', 'plan-executor-v3');
       action = 'hw-protect';
       logData(db, ess, amber, slot, 'hw-protect', { homeLoad: ess.homeLoad, battPower: ess.battPower });
     } else if (ess.reportedMode === 1) {
