@@ -792,15 +792,18 @@ async function main() {
   } else if (slot.action === 'charge' || slot.action === 'charge+hw') {
     const realBuyPrice = amber?.buyPrice ?? null;
 
-    // SOC 达标检查：到目标后，如果电价便宜就低功率充电（电网供家用），否则切 Self-use
+    // SOC 达标检查：到目标后的处理
+    // 关键：热水器时段（homeLoad>3kW）绝不能切 Self-use，否则电池会放电供热水器
     if (ess.soc !== null && ess.soc >= chargeTargetPct) {
+      const hwRunning = ess.homeLoad != null && ess.homeLoad > 3; // 热水器大概率在跑
       const cheapEnough = realBuyPrice != null && realBuyPrice < 10; // <10¢ 算便宜
-      if (cheapEnough) {
-        // 电价便宜：保持 Timed 模式，低功率充电（0.5kW），电网供家用，不用电池
-        const maintainKw = 0.5;
-        console.log(`[充电] SOC ${ess.soc}% >= 目标 ${chargeTargetPct}%，电价 ${realBuyPrice.toFixed(1)}¢ 便宜，维持低功率充电 ${maintainKw}kW`);
-        await essApi.setChargePower(maintainKw, 'maintain-charge');
-        logData(db, ess, amber, slot, 'charge-maintain', { soc: ess.soc, target: chargeTargetPct, chargeKw: maintainKw, buyPrice: realBuyPrice });
+
+      if (hwRunning || cheapEnough) {
+        // 热水器运行中 或 电价便宜：保持 Timed 模式，低功率充电（0.1kW），让电网供热水器/家用
+        const maintainKw = 0.1;
+        console.log(`[充电] SOC ${ess.soc}% >= 目标 ${chargeTargetPct}%，${hwRunning ? '热水器运行中' : '电价便宜'}，维持 Timed 充电 ${maintainKw}kW（电网供家用）`);
+        await essApi.setChargeKw(maintainKw, `maintain-charge: ${hwRunning ? 'hw-running' : 'cheap'}`, 'plan-executor-v3');
+        logData(db, ess, amber, slot, 'charge-maintain', { soc: ess.soc, target: chargeTargetPct, chargeKw: maintainKw, buyPrice: realBuyPrice, hwRunning });
         action = 'charge-maintain';
       } else {
         console.log(`[充电] SOC ${ess.soc}% >= 目标 ${chargeTargetPct}%，电价 ${realBuyPrice?.toFixed(1) ?? '?'}¢ 不便宜，停止充电`);
