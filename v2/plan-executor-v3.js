@@ -961,9 +961,9 @@ async function main() {
     action = 'hotwater';
 
   } else if (slot.action === 'standby' || slot.action === 'self-use') {
-    // self-use/standby 时段：电池放电供家用（包括热水器）是正确行为，不干预
+    // self-use/standby 时段：电池放电供家用是正确行为
+    // 但如果逆变器在 Timed 模式，必须切回 Self-use（防止意外卖电）
     if (ess.reportedMode === 1) {
-    } else if (ess.reportedMode === 1) {
       const hasFutureSell = intervals.some(s => {
         if (s.action !== 'sell') return false;
         const h = parseInt(s.nemTime?.substring(11,13) ?? s.key?.substring(0,2) ?? '0');
@@ -973,6 +973,7 @@ async function main() {
       if (hasFutureSell) {
         console.log(`[模式] self-use 时段但后续有 sell 窗口，保留 Timed 模式`);
       } else {
+        console.log(`[模式] standby/self-use 时段检测到 Timed(1)，切回 Self-use`);
         await switchToSelfUse('self-use-slot');
         logData(db, ess, amber, slot, 'mode-switch-selfuse', { modeFrom: 1, modeTo: 0 });
       }

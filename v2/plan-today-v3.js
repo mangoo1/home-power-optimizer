@@ -988,36 +988,8 @@ async function main() {
     sellEndHHMM = hhmm(Math.floor(endMins/60), endMins%60);
   }
 
-  console.log(`[逆变器] 充电: ${chargeStartHHMM}–${chargeEndHHMM} | 卖电: ${sellStartHHMM}–${sellEndHHMM}`);
-
-  const sydNow = new Date(); // TZ already set to Australia/Sydney
-  const yesterday = new Date(sydNow - 86400*1000).toISOString().slice(0,10);
-  const tomorrow  = new Date(+sydNow + 86400*1000).toISOString().slice(0,10);
-  // 时钟同步字符串：YYYY-MM-DD HH:MM:SS（Sydney 本地时间）
-  const pad = n => String(n).padStart(2,'0');
-  const clockStr = `${sydNow.getFullYear()}-${pad(sydNow.getMonth()+1)}-${pad(sydNow.getDate())} ${pad(sydNow.getHours())}:${pad(sydNow.getMinutes())}:${pad(sydNow.getSeconds())}`;
-
-  const steps = [
-    [`syncClock=${clockStr}`,          () => httpsPost('https://eu.ess-link.com/api/app/deviceInfo/setDeviceDateParam',
-      { data: clockStr, macHex: ESS_MAC_HEX, index: '0x3050' }, ESS_HEADERS).then(r => r.code === 200).catch(() => false)],
-    ['mode=Timed(1)',                  () => setParam('0x300C', 1)],
-    [`chargeStart=${chargeStartHHMM}`, () => setParam('0xC014', chargeStartHHMM)],
-    [`chargeEnd=${chargeEndHHMM}`,     () => setParam('0xC016', chargeEndHHMM)],
-    [`chargeKw=${MAX_CHARGE_KW}`,      () => setParam('0xC0BA', MAX_CHARGE_KW)],
-    [`sellStart=${sellStartHHMM}`,     () => setParam('0xC018', sellStartHHMM)],
-    [`sellEnd=${sellEndHHMM}`,         () => setParam('0xC01A', sellEndHHMM)],
-    [`sellKw=${MAX_SELL_KW}`,          () => setParam('0xC0BC', MAX_SELL_KW)],
-    ['otherMode=0',                    () => setParam('0x314E', 0)],
-    ['weekdays=all',                   () => setWeekParam('0xC0B4', [1,2,3,4,5,6,0])],
-    [`startDate=${yesterday}`,         () => setDateParam('0xC0B6', yesterday)],
-    [`endDate=${tomorrow}`,            () => setDateParam('0xC0B8', tomorrow)],
-  ];
-
-  for (const [label, fn] of steps) {
-    const ok = await fn();
-    console.log(`  ${ok ? '✅' : '❌'} ${label}`);
-    await new Promise(r => setTimeout(r, 350));
-  }
+  console.log(`[逆变器] plan-today 不设逆变器，由 executor 根据计划执行`);
+  console.log(`[计划窗口] 充电: ${chargeStartHHMM}–${chargeEndHHMM} | 卖电: ${sellStartHHMM}–${sellEndHHMM}`);
 
   // ── Turso 同步 ─────────────────────────────────────────────
   try {
