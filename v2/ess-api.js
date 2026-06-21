@@ -136,31 +136,107 @@ async function setSellKw(kw, reason = 'unknown', caller = 'unknown') {
   return setParam('0xC0BC', kw, reason, caller);
 }
 
-/** 恢复 Timed 模式，写入完整充电窗口 + 更新 Effective End Date */
+/** 设置星期参数（0xC0B4 weekdays），用专用 API 端点 */
+async function setWeekParam(index, data, reason = 'unknown', caller = 'unknown') {
+  const ok_result = await httpsPost(
+    '/api/app/deviceInfo/setDeviceWeekParam',
+    { macHex: _mac, index, data },
+    _token
+  ).catch(() => ({}));
+  const ok = ok_result.code === 200;
+  try {
+    if (_db) {
+      _db.prepare(`
+        INSERT INTO ess_param_log (ts, param_index, param_value, ok, reason, caller)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(new Date().toISOString(), index, JSON.stringify(data), ok ? 1 : 0, `week:${reason}`, caller);
+    }
+  } catch { /* 日志失败不影响主流程 */ }
+  return ok;
+}
+
+/** 设置日期参数（0xC0B6 startDate），用专用 API 端点 */
+async function setDateOrTimeParam(index, data, reason = 'unknown', caller = 'unknown') {
+  const ok_result = await httpsPost(
+    '/api/app/deviceInfo/setDeviceDateOrTimeParam',
+    { macHex: _mac, index, data },
+    _token
+  ).catch(() => ({}));
+  const ok = ok_result.code === 200;
+  try {
+    if (_db) {
+      _db.prepare(`
+        INSERT INTO ess_param_log (ts, param_index, param_value, ok, reason, caller)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(new Date().toISOString(), index, String(data), ok ? 1 : 0, `date:${reason}`, caller);
+    }
+  } catch { /* 日志失败不影响主流程 */ }
+  return ok;
+}
+
+/** 同步逆变器时钟（0x3050），用 setDeviceDateParam 端点 */
+async function syncInverterClock(reason = 'unknown', caller = 'unknown') {
+  const now = new Date();
+  // 格式: YYYY-MM-DD HH:mm:ss（Sydney 时间）
+  const syd = new Date(now.toLocaleString('en-US', { timeZone: 'Australia/Sydney' }));
+  const pad = (n) => String(n).padStart(2, '0');
+  const clockStr = `${syd.getFullYear()}-${pad(syd.getMonth()+1)}-${pad(syd.getDate())} ${pad(syd.getHours())}:${pad(syd.getMinutes())}:${pad(syd.getSeconds())}`;
+  const ok_result = await httpsPost(
+    '/api/app/deviceInfo/setDeviceDateParam',
+    { macHex: _mac, index: '0x3050', data: clockStr },
+    _token
+  ).catch(() => ({}));
+  const ok = ok_result.code === 200;
+  try {
+    if (_db) {
+      _db.prepare(`
+        INSERT INTO ess_param_log (ts, param_index, param_value, ok, reason, caller)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(new Date().toISOString(), '0x3050', clockStr, ok ? 1 : 0, `syncClock:${reason}`, caller);
+    }
+  } catch { /* 日志失败不影响主流程 */ }
+  return ok;
+}
+
+/** 计算 yesterday/tomorrow 日期字符串 (Sydney TZ, YYYY-MM-DD 格式) */
+function _sydneyDateStrings() {
+  const now = new Date();
+  const sydStr = now.toLocaleString('en-US', { timeZone: 'Australia/Sydney' });
+  const syd = new Date(sydStr);
+  const pad = (n) => String(n).padStart(2, '0');
+  const fmt = (d) => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+  const yesterday = new Date(syd); yesterday.setDate(yesterday.getDate() - 1);
+  const tomorrow  = new Date(syd); tomorrow.setDate(tomorrow.getDate() + 1);
+  return { yesterday: fmt(yesterday), tomorrow: fmt(tomorrow), today: fmt(syd) };
+}
+
+/** 恢复 Timed 模式，写入完整充电窗口 + weekdays + dates + clock sync */
 async function restoreTimedMode({ startHHMM, endHHMM, chargeKw, sellStartHHMM, sellEndHHMM, sellKw } = {}, reason = 'unknown', caller = 'unknown') {
+  // 1. 同步逆变器时钟
+  await syncInverterClock(reason, caller);
+  // 2. 切 Timed 模式
   await setParam('0x300C', 1, reason, caller);
+  // 3. 充电时间窗口
   if (startHHMM      != null) await setParam('0xC014', startHHMM,      reason, caller);
   if (endHHMM        != null) await setParam('0xC016', endHHMM,        reason, caller);
   if (chargeKw       != null) await setParam('0xC0BA', chargeKw,       reason, caller);
+  // 4. 放电时间窗口
   if (sellStartHHMM  != null) await setParam('0xC018', sellStartHHMM,  reason, caller);
   if (sellEndHHMM    != null) await setParam('0xC01A', sellEndHHMM,    reason, caller);
   if (sellKw         != null) await setParam('0xC0BC', sellKw,         reason, caller);
-  // 始终更新 Effective End Date (0xC0B8) 为 7 天后，防止日期过期导致 Timed 模式不执行
+  // 5. 星期 = 全部（每天都生效）
+  await setWeekParam('0xC0B4', [1,2,3,4,5,6,0], reason, caller);
+  // 6. 开始日期 = yesterday，结束日期 = tomorrow（确保今天在范围内）
+  const { yesterday, tomorrow } = _sydneyDateStrings();
+  await setDateOrTimeParam('0xC0B6', yesterday, `startDate:${reason}`, caller);
+  // 7. 更新 Effective End Date
   await updateEffectiveEndDate(reason, caller);
 }
 
-/** 更新 Effective End Date (0xC0B8) 为 7 天后的 Sydney 23:59 (unix timestamp) */
+/** 更新 Effective End Date (0xC0B8) — 用日期 API 端点设为 tomorrow */
 async function updateEffectiveEndDate(reason = 'unknown', caller = 'unknown') {
-  // 设 Effective End Date (0xC0B8) 为明天 21:59 UTC
-  // 逆变器接受 unix timestamp (seconds)，但太远的日期会解析错误
-  // 所以每天刷新，只设 +2 天，保证一直有效
-  const now = new Date();
-  const twoDaysLater = new Date(now.getTime() + 2 * 24 * 3600 * 1000);
-  // 设为那天的 21:59 UTC（和 ESS-Link app 端行为一致）
-  twoDaysLater.setUTCHours(21, 59, 0, 0);
-  const unixTs = Math.floor(twoDaysLater.getTime() / 1000);
-  const dateStr = twoDaysLater.toISOString().slice(0, 10);
-  await setParam('0xC0B8', unixTs, `effectiveEndDate: ${dateStr} (${reason})`, caller);
+  const { tomorrow } = _sydneyDateStrings();
+  await setDateOrTimeParam('0xC0B8', tomorrow, `effectiveEndDate:${reason}`, caller);
 }
 
 /** 紧急停止：充放电功率全部清零 */
@@ -183,6 +259,9 @@ module.exports = {
   init,
   ensureLogTable,
   setParam,
+  setWeekParam,
+  setDateOrTimeParam,
+  syncInverterClock,
   switchToSelfUse,
   setChargeKw,
   setSellKw,
