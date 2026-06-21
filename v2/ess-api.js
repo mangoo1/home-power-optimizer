@@ -151,20 +151,16 @@ async function restoreTimedMode({ startHHMM, endHHMM, chargeKw, sellStartHHMM, s
 
 /** 更新 Effective End Date (0xC0B8) 为 7 天后的 Sydney 23:59 (unix timestamp) */
 async function updateEffectiveEndDate(reason = 'unknown', caller = 'unknown') {
+  // 设 Effective End Date (0xC0B8) 为明天 21:59 UTC
+  // 逆变器接受 unix timestamp (seconds)，但太远的日期会解析错误
+  // 所以每天刷新，只设 +2 天，保证一直有效
   const now = new Date();
-  // 7 天后的 Sydney 23:59
-  const future = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
-  const sydneyEnd = new Date(future.toLocaleString('en-US', { timeZone: 'Australia/Sydney' }));
-  sydneyEnd.setHours(23, 59, 0, 0);
-  // Convert back to UTC unix timestamp
-  const offsetMs = future.getTime() - sydneyEnd.getTime();
-  const endDateUnix = Math.floor((future.getTime() - offsetMs + (23*60+59)*60*1000 - sydneyEnd.getHours()*3600000 - sydneyEnd.getMinutes()*60000) / 1000);
-  // Simpler: just add 7 days and set to end of day in Sydney
-  const sevenDaysLater = new Date(now.getTime() + 7 * 24 * 3600 * 1000);
-  const sydStr = sevenDaysLater.toLocaleDateString('en-CA', { timeZone: 'Australia/Sydney' }); // YYYY-MM-DD
-  const endOfDay = new Date(sydStr + 'T23:59:00+10:00'); // AEST (close enough, ±1h DST doesn't matter for end date)
-  const unixTs = Math.floor(endOfDay.getTime() / 1000);
-  await setParam('0xC0B8', unixTs, `effectiveEndDate: ${sydStr} (${reason})`, caller);
+  const twoDaysLater = new Date(now.getTime() + 2 * 24 * 3600 * 1000);
+  // 设为那天的 21:59 UTC（和 ESS-Link app 端行为一致）
+  twoDaysLater.setUTCHours(21, 59, 0, 0);
+  const unixTs = Math.floor(twoDaysLater.getTime() / 1000);
+  const dateStr = twoDaysLater.toISOString().slice(0, 10);
+  await setParam('0xC0B8', unixTs, `effectiveEndDate: ${dateStr} (${reason})`, caller);
 }
 
 /** 紧急停止：充放电功率全部清零 */
