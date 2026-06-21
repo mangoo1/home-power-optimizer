@@ -136,7 +136,7 @@ async function setSellKw(kw, reason = 'unknown', caller = 'unknown') {
   return setParam('0xC0BC', kw, reason, caller);
 }
 
-/** 恢复 Timed 模式，写入完整充电窗口 */
+/** 恢复 Timed 模式，写入完整充电窗口 + 更新 Effective End Date */
 async function restoreTimedMode({ startHHMM, endHHMM, chargeKw, sellStartHHMM, sellEndHHMM, sellKw } = {}, reason = 'unknown', caller = 'unknown') {
   await setParam('0x300C', 1, reason, caller);
   if (startHHMM      != null) await setParam('0xC014', startHHMM,      reason, caller);
@@ -145,6 +145,26 @@ async function restoreTimedMode({ startHHMM, endHHMM, chargeKw, sellStartHHMM, s
   if (sellStartHHMM  != null) await setParam('0xC018', sellStartHHMM,  reason, caller);
   if (sellEndHHMM    != null) await setParam('0xC01A', sellEndHHMM,    reason, caller);
   if (sellKw         != null) await setParam('0xC0BC', sellKw,         reason, caller);
+  // 始终更新 Effective End Date (0xC0B8) 为 7 天后，防止日期过期导致 Timed 模式不执行
+  await updateEffectiveEndDate(reason, caller);
+}
+
+/** 更新 Effective End Date (0xC0B8) 为 7 天后的 Sydney 23:59 (unix timestamp) */
+async function updateEffectiveEndDate(reason = 'unknown', caller = 'unknown') {
+  const now = new Date();
+  // 7 天后的 Sydney 23:59
+  const future = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+  const sydneyEnd = new Date(future.toLocaleString('en-US', { timeZone: 'Australia/Sydney' }));
+  sydneyEnd.setHours(23, 59, 0, 0);
+  // Convert back to UTC unix timestamp
+  const offsetMs = future.getTime() - sydneyEnd.getTime();
+  const endDateUnix = Math.floor((future.getTime() - offsetMs + (23*60+59)*60*1000 - sydneyEnd.getHours()*3600000 - sydneyEnd.getMinutes()*60000) / 1000);
+  // Simpler: just add 7 days and set to end of day in Sydney
+  const sevenDaysLater = new Date(now.getTime() + 7 * 24 * 3600 * 1000);
+  const sydStr = sevenDaysLater.toLocaleDateString('en-CA', { timeZone: 'Australia/Sydney' }); // YYYY-MM-DD
+  const endOfDay = new Date(sydStr + 'T23:59:00+10:00'); // AEST (close enough, ±1h DST doesn't matter for end date)
+  const unixTs = Math.floor(endOfDay.getTime() / 1000);
+  await setParam('0xC0B8', unixTs, `effectiveEndDate: ${sydStr} (${reason})`, caller);
 }
 
 /** 紧急停止：充放电功率全部清零 */
@@ -171,6 +191,7 @@ module.exports = {
   setChargeKw,
   setSellKw,
   restoreTimedMode,
+  updateEffectiveEndDate,
   emergencyStop,
   calcSafeChargeKw,
   MAX_CHARGE_KW,

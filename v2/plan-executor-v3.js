@@ -793,25 +793,41 @@ async function main() {
     const realBuyPrice = amber?.buyPrice ?? null;
 
     // SOC 达标检查：到目标后的处理
+    // 新逻辑（2026-06-20）：充电时段内，只要电价合理（<15¢）且 SOC<85%，继续充电不停
     // 关键：热水器时段（homeLoad>3kW）绝不能切 Self-use，否则电池会放电供热水器
-    if (ess.soc !== null && ess.soc >= chargeTargetPct) {
-      const hwRunning = ess.homeLoad != null && ess.homeLoad > 3; // 热水器大概率在跑
-      const cheapEnough = realBuyPrice != null && realBuyPrice < 10; // <10¢ 算便宜
+    const hwRunning = ess.homeLoad != null && ess.homeLoad > 3; // 热水器大概率在跑
+    const cheapEnough = realBuyPrice != null && realBuyPrice < 15; // <15¢ 继续充
+    const socCapped = ess.soc !== null && ess.soc >= 85; // 硬上限 85%
 
-      if (hwRunning || cheapEnough) {
-        // 热水器运行中 或 电价便宜：保持 Timed 模式，低功率充电（0.1kW），让电网供热水器/家用
+    if (socCapped) {
+      // 85% 硬上限：停止充电
+      if (hwRunning) {
         const maintainKw = 0.1;
-        console.log(`[充电] SOC ${ess.soc}% >= 目标 ${chargeTargetPct}%，${hwRunning ? '热水器运行中' : '电价便宜'}，维持 Timed 充电 ${maintainKw}kW（电网供家用）`);
-        await essApi.setChargeKw(maintainKw, `maintain-charge: ${hwRunning ? 'hw-running' : 'cheap'}`, 'plan-executor-v3');
+        console.log(`[充电] SOC ${ess.soc}% >= 85% 硬上限，热水器运行中，维持 ${maintainKw}kW`);
+        await essApi.setChargeKw(maintainKw, `maintain-charge: soc-capped hw-running`, 'plan-executor-v3');
         logData(db, ess, amber, slot, 'charge-maintain', { soc: ess.soc, target: chargeTargetPct, chargeKw: maintainKw, buyPrice: realBuyPrice, hwRunning });
         action = 'charge-maintain';
       } else {
-        console.log(`[充电] SOC ${ess.soc}% >= 目标 ${chargeTargetPct}%，电价 ${realBuyPrice?.toFixed(1) ?? '?'}¢ 不便宜，停止充电`);
-        await switchToSelfUse(`charge-done: SOC ${ess.soc}% >= target ${chargeTargetPct}%`);
+        console.log(`[充电] SOC ${ess.soc}% >= 85% 硬上限，停止充电`);
+        await switchToSelfUse(`charge-done: SOC ${ess.soc}% >= 85% hard cap`);
         logData(db, ess, amber, slot, 'charge-complete', { soc: ess.soc, target: chargeTargetPct });
         action = 'charge-complete';
       }
-    } else if (!strategy.isV3 && realBuyPrice != null && realBuyPrice > strategy.buyMaxC) {
+    } else if (ess.soc !== null && ess.soc >= chargeTargetPct && !cheapEnough && !hwRunning) {
+      // SOC 达标 + 电价贵 + 没热水器：停止充电
+      console.log(`[充电] SOC ${ess.soc}% >= 目标 ${chargeTargetPct}%，电价 ${realBuyPrice?.toFixed(1) ?? '?'}¢ >= 15¢，停止充电`);
+      await switchToSelfUse(`charge-done: SOC ${ess.soc}% >= target ${chargeTargetPct}% price=${realBuyPrice?.toFixed(1)}c`);
+      logData(db, ess, amber, slot, 'charge-complete', { soc: ess.soc, target: chargeTargetPct });
+      action = 'charge-complete';
+    } else if (ess.soc !== null && ess.soc >= chargeTargetPct) {
+      // SOC 达标但电价便宜或热水器在跑：继续充电（不浪费便宜电）
+      console.log(`[充电] SOC ${ess.soc}% >= 目标 ${chargeTargetPct}%，但${hwRunning ? '热水器运行中' : `电价${realBuyPrice?.toFixed(1)}¢便宜`}，继续充电`);
+      // fall through — don't set action, let normal charge logic below handle it
+    }
+
+    if (action === 'monitor') {
+    // 正常充电逻辑（SOC < target 或 SOC >= target 但继续充）
+    if (!strategy.isV3 && realBuyPrice != null && realBuyPrice > strategy.buyMaxC) {
       // v2 兼容：极端高价 abort
       console.log(`[充电] v2模式 实际电价 ${realBuyPrice.toFixed(1)}¢ > ${strategy.buyMaxC}¢，暂停充电`);
       await switchToSelfUse(`charge-skip: realBuy=${realBuyPrice.toFixed(1)}c > buyMax=${strategy.buyMaxC}c`);
@@ -858,8 +874,15 @@ async function main() {
         console.log(`[功率] homeLoad=${homeLoad.toFixed(2)}kW，充电 ${targetKw}kW（断路器上限）`);
       }
       await updateChargeKw(targetKw, `charge-slot: home=${homeLoad.toFixed(2)}kW safe=${safeChargeKw}kW`);
+      // 每小时整点更新一次 Effective End Date，防止日期过期
+      const { mi: currentMin } = sydneyTime();
+      if (currentMin < 5) {
+        await essApi.updateEffectiveEndDate('charge-hourly-refresh', 'plan-executor-v3');
+        console.log(`[日期] 已更新 Effective End Date (每小时刷新)`);
+      }
       action = 'charge';
     }
+    } // end if (!action)
 
   } else if (slot.action === 'sell') {
     // 卖电时段
