@@ -419,20 +419,20 @@ function calcChargeTarget(sellSlotCount, tomorrowKwh = null, tomorrowCloudPct = 
   // 2. 过夜保底（根据明天 PV 预测动态调整）
   let overnightPct;
   if (tomorrowKwh !== null && tomorrowKwh > 12) {
-    // 明天晴天：PV 充足（>12kWh），保底可以低
-    overnightPct = 35;
-    console.log(`[充电目标] 明天PV预测${tomorrowKwh.toFixed(1)}kWh(好)，过夜保底35%`);
-  } else if (tomorrowKwh !== null && tomorrowKwh > 6) {
-    // 明天一般：PV 中等（6-12kWh），保底适中
+    // 明天晴天：PV 充足（>12kWh），保底可以适中
     overnightPct = 50;
-    console.log(`[充电目标] 明天PV预测${tomorrowKwh.toFixed(1)}kWh(中等)，过夜保底50%`);
-  } else if (tomorrowKwh !== null) {
-    // 明天阴天：PV 差（<6kWh），保底要高
+    console.log(`[充电目标] 明天PV预测${tomorrowKwh.toFixed(1)}kWh(好)，过夜保底50%`);
+  } else if (tomorrowKwh !== null && tomorrowKwh > 6) {
+    // 明天一般：PV 中等（6-12kWh），保底要高
     overnightPct = 65;
-    console.log(`[充电目标] 明天PV预测${tomorrowKwh.toFixed(1)}kWh(差)，过夜保底65%`);
+    console.log(`[充电目标] 明天PV预测${tomorrowKwh.toFixed(1)}kWh(中等)，过夜保底65%`);
+  } else if (tomorrowKwh !== null) {
+    // 明天阴天：PV 差（<6kWh），保底最高
+    overnightPct = 75;
+    console.log(`[充电目标] 明天PV预测${tomorrowKwh.toFixed(1)}kWh(差)，过夜保底75%`);
   } else {
     // 没有预测数据，用保守默认值
-    overnightPct = 50;
+    overnightPct = 65;
     console.log(`[充电目标] 无明天PV预测，默认过夜保底50%`);
   }
 
@@ -861,19 +861,19 @@ async function main() {
   try { db.prepare('ALTER TABLE daily_plan ADD COLUMN hw_window_json TEXT').run(); } catch {}
   try { db.prepare('ALTER TABLE daily_plan ADD COLUMN gf_window_json TEXT').run(); } catch {}
 
-  // 如果当天有 manual source 且 override 仍有效，不覆盖（手动优先）
-  const manualActive = db.prepare(
-    "SELECT id, version, manual_override_until FROM daily_plan WHERE date=? AND is_active=1 AND source='manual' LIMIT 1"
+  // 如果当天活跃计划有 manual_override_until 且仍有效，不覆盖（手动优先）
+  const activeWithOverride = db.prepare(
+    "SELECT id, version, manual_override_until, source FROM daily_plan WHERE date=? AND is_active=1 AND manual_override_until IS NOT NULL LIMIT 1"
   ).get(today);
-  if (manualActive) {
-    const overrideUntil = manualActive.manual_override_until ? new Date(manualActive.manual_override_until) : null;
-    if (overrideUntil && overrideUntil > new Date()) {
-      console.log(`[计划] ⚠️ 手动计划有效 (id=${manualActive.id}, override until ${manualActive.manual_override_until})，跳过`);
+  if (activeWithOverride) {
+    const overrideUntil = new Date(activeWithOverride.manual_override_until);
+    if (overrideUntil > new Date()) {
+      console.log(`[计划] ⚠️ 手动覆盖有效 (id=${activeWithOverride.id}, source=${activeWithOverride.source}, override until ${activeWithOverride.manual_override_until})，跳过重新生成`);
       db.close();
       return;
     }
-    // Manual override expired or null — allow replan (deactivate old)
-    console.log(`[计划] 手动计划 (id=${manualActive.id}) override 已过期，允许覆盖`);
+    // Manual override expired — allow replan
+    console.log(`[计划] override 已过期 (id=${activeWithOverride.id})，允许覆盖`);
   }
 
   // ── 增量更新：保留已过去时段 + 手动标记的时段 ──
@@ -888,18 +888,23 @@ async function main() {
     for (const ei of existingIntervals) {
       const [h,m] = (ei.key||'00:00').split(':').map(Number);
       const slotMins = h*60+m;
-      const isManual = ei.reason?.startsWith('manual:');
+      const isManual = ei.reason?.startsWith('manual:') || ei.reason?.startsWith('Deven:');
       const isPast = slotMins < nowMins;
       
       if (isPast || isManual) {
-        // Find matching slot in new plan and override with existing
         const idx = plan.findIndex(s => s.key === ei.key);
         if (idx >= 0) {
+          // Overwrite future slot with manual/past data
           plan[idx] = ei;
+        } else {
+          // Slot not in new plan (past time) — insert it
+          plan.push(ei);
         }
       }
     }
-    console.log(`[增量] 保留已过去/手动时段，更新未来自动时段`);
+    // Sort by key to maintain chronological order
+    plan.sort((a, b) => a.key.localeCompare(b.key));
+    console.log(`[增量] 保留已过去/手动时段(${plan.filter(s => { const [h,m]=(s.key||'00:00').split(':').map(Number); return h*60+m < nowMins; }).length}个过去, ${plan.filter(s => s.reason?.startsWith('manual:') || s.reason?.startsWith('Deven:')).length}个手动)，更新未来自动时段`);
   }
 
   db.prepare('UPDATE daily_plan SET is_active=0 WHERE date=? AND is_active=1').run(today);
