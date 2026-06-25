@@ -53,6 +53,7 @@ const SELL_PCT_PER_HOUR    = 12;     // ≈ 5/42 × 100 ≈ 12%
 const SELL_WINDOW_START    = 16;     // 卖电窗口起始 16:00
 const SELL_WINDOW_END      = 22;     // 卖电窗口结束 22:00（扩展到覆盖晚高峰尾部）
 const CHARGE_DEADLINE_HOUR = 15;     // 充电截止时间 15:00（之后转 self-use 等卖电）
+const CHARGE_MAX_BUY_C     = 22;     // 充电绝对价格上限 22¢ — 超过此价不充，宁可目标打折
 const SELL_MIN_FEEDIN_C    = e('SELL_FLOOR_C', 5.0); // 最低卖电价 5¢
 const SELL_PROFIT_MARGIN   = e('SELL_PROFIT_MARGIN', 0.25); // 卖电利润率门槛（保留变量兼容）
 const MIN_PROFIT_SPREAD_C = e('MIN_PROFIT_SPREAD_C', 3.0);  // 卖电绝对差价门槛：feedIn均价 > 充电均价 + 3¢ 即可卖
@@ -448,7 +449,7 @@ function calcChargeTarget(sellSlotCount, tomorrowKwh = null, tomorrowCloudPct = 
 }
 
 // ── 生成完整计划 ──────────────────────────────────────────────
-function buildPlan(slots, pvByHour, currentSocPct, sellSlots, hwSlots, tomorrowPv = {}) {
+function buildPlan(slots, pvByHour, currentSocPct, sellSlots, hwSlots, tomorrowPv = {}, nowKey = '00:00') {
   const sellKeys = new Set(sellSlots.map(s => s.key));
   const chargeTargetPct = calcChargeTarget(sellSlots.length, tomorrowPv.kwh ?? null, tomorrowPv.cloudPct ?? null);
   const chargeTargetKwh = chargeTargetPct / 100 * BATT_KWH;
@@ -472,11 +473,11 @@ function buildPlan(slots, pvByHour, currentSocPct, sellSlots, hwSlots, tomorrowP
     : 12.0;
   console.log(`[充电] 卖电买价上限: ${sellBuyMax.toFixed(1)}¢ (avgFeedIn=${avgFeedInC.toFixed(1)}¢)`);
 
-  // 基础充电候选：所有非 DW 时段，按价格排序（不设绝对上限）
+  // 基础充电候选：非 DW 时段 + 价格 <= CHARGE_MAX_BUY_C + 未来时段，按价格排序
   const chargeCandidates = slots
     .filter(s => {
       const h = parseInt(s.key.split(':')[0]);
-      return h < CHARGE_DEADLINE_HOUR && !s.dw && s.buyC > 0;
+      return s.key >= nowKey && h < CHARGE_DEADLINE_HOUR && !s.dw && s.buyC > 0 && s.buyC <= CHARGE_MAX_BUY_C;
     })
     .sort((a, b) => a.buyC - b.buyC);
 
@@ -662,10 +663,12 @@ async function main() {
   console.log('[Amber] 拉取价格...');
   const rawAmber = await fetchAmberPrices();
   const allSlots = aggregateAmberTo30min(rawAmber, today);
-  // 过滤掉已过去的时段
+  // 计划覆盖全天 00:00–23:30，不过滤已过去时段（executor 负责只执行当前时段）
+  // 但选槽决策只看未来时段（不选已过去的槽充电）
   const nowKey = `${String(syd.hh).padStart(2,'0')}:${syd.mi < 30 ? '00' : '30'}`;
-  const slots = allSlots.filter(s => s.key >= nowKey);
-  console.log(`[Amber] ${allSlots.length} 个半小时槽 (未来${slots.length}个), DW: ${slots.some(s => s.dw)}`);
+  const slots = allSlots; // 全天时段都保留到计划里
+  const futureSlots = allSlots.filter(s => s.key >= nowKey); // 仅用于选槽决策
+  console.log(`[Amber] ${allSlots.length} 个半小时槽 (未来${futureSlots.length}个), DW: ${allSlots.some(s => s.dw)}`);
 
   // 核心：选卖电槽（带利润校验）
   // 先算今日实际买电均价作为成本基准
@@ -678,7 +681,7 @@ async function main() {
     console.log(`[成本] 今日实际充电均价: ${avgChargeCostC.toFixed(1)}¢`);
   } catch { console.log(`[成本] 查询失败，用默认 ${avgChargeCostC}¢`); }
 
-  let sellSlots = planSellSlots(slots, avgChargeCostC);
+  let sellSlots = planSellSlots(futureSlots, avgChargeCostC);
 
   // 热水器调度（用全天槽位排，不受"已过去"过滤影响）
   let { mainHw, gfHw } = scheduleHotWater(allSlots);
@@ -806,7 +809,7 @@ async function main() {
     const chargeCandidates = slots
       .filter(s => {
         const h = parseInt(s.key.split(':')[0]);
-        return !s.dw && s.buyC > 0 && (h < CHARGE_DEADLINE_HOUR || s.buyC < avgSellCFeas * 0.8);
+        return s.key >= nowKey && !s.dw && s.buyC > 0 && s.buyC <= CHARGE_MAX_BUY_C && (h < CHARGE_DEADLINE_HOUR || s.buyC < avgSellCFeas * 0.8);
       })
       .sort((a, b) => a.buyC - b.buyC);
     let estChargeKwh = 0;
@@ -850,7 +853,7 @@ async function main() {
     }
   }
 
-  const { plan, chargeTargetPct, sellSlotCount } = buildPlan(slots, pvByHour, currentSocPct, sellSlots, hwSlots, { kwh: tomorrowKwh, cloudPct: finalCloud });
+  const { plan, chargeTargetPct, sellSlotCount } = buildPlan(slots, pvByHour, currentSocPct, sellSlots, hwSlots, { kwh: tomorrowKwh, cloudPct: finalCloud }, nowKey);
 
   // 打印
   const report = printPlan(plan, currentSocPct, today, chargeTargetPct, sellSlotCount);

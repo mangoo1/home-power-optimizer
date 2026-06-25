@@ -695,13 +695,26 @@ async function main() {
 
   db.exec("CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT)");
 
-  // 1. 读今日计划
-  const planRow = db.prepare(
+  // 1. 读今日计划（如果没有，fallback 到昨天的计划——覆盖凌晨无计划时段）
+  let planRow = db.prepare(
     "SELECT * FROM daily_plan WHERE date=? AND is_active=1 ORDER BY rowid DESC LIMIT 1"
   ).get(syd.date);
 
   if (!planRow) {
-    console.log('[计划] 今天没有计划，仅记录数据');
+    // 凌晨可能今天计划还没生成，用昨天的
+    const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+    // 注意：syd.date 是 Sydney 日期，算昨天要用 Sydney 时间
+    const yParts = syd.date.split('-').map(Number);
+    const yDate = new Date(yParts[0], yParts[1]-1, yParts[2]-1);
+    const yesterdaySyd = `${yDate.getFullYear()}-${String(yDate.getMonth()+1).padStart(2,'0')}-${String(yDate.getDate()).padStart(2,'0')}`;
+    planRow = db.prepare(
+      "SELECT * FROM daily_plan WHERE date=? AND is_active=1 ORDER BY rowid DESC LIMIT 1"
+    ).get(yesterdaySyd);
+    if (planRow) {
+      console.log(`[计划] 今天(${syd.date})无计划，使用昨天(${yesterdaySyd})的计划`);
+    } else {
+      console.log('[计划] 今天和昨天都没有计划，仅记录数据');
+    }
   }
 
   // Check manual override from DB
@@ -797,7 +810,8 @@ async function main() {
     // 关键：热水器时段（homeLoad>3kW）绝不能切 Self-use，否则电池会放电供热水器
     const hwRunning = ess.homeLoad != null && ess.homeLoad > 3; // 热水器大概率在跑
     const cheapEnough = realBuyPrice != null && realBuyPrice < 15; // <15¢ 继续充
-    const socCapped = ess.soc !== null && ess.soc >= 85; // 硬上限 85%
+        const hardCap = Math.max(85, chargeTargetPct); // 默认85%硬上限，计划要求更高时跟计划走
+    const socCapped = ess.soc !== null && ess.soc >= hardCap;
 
     if (socCapped) {
       // 85% 硬上限：停止充电
@@ -869,11 +883,13 @@ async function main() {
         logData(db, ess, amber, slot, 'mode-switch-timed', { modeFrom: ess.reportedMode, modeTo: 1 });
       }
       const safeChargeKw = calcSafeChargeKw(homeLoad, pvPower, ess.gridPower, ess.battPower);
-      const targetKw = safeChargeKw;
+      // 尊重计划里的 chargeKw（如手动设了 0.1kW），但不超过断路器安全值
+      const planKw = slot.chargeKw ?? MAX_CHARGE_KW;
+      const targetKw = Math.min(planKw, safeChargeKw);
       if (targetKw < MAX_CHARGE_KW - 0.2) {
-        console.log(`[功率] homeLoad=${homeLoad.toFixed(2)}kW，充电 ${targetKw}kW（断路器上限）`);
+        console.log(`[功率] homeLoad=${homeLoad.toFixed(2)}kW，计划=${planKw}kW，充电 ${targetKw}kW`);
       }
-      await updateChargeKw(targetKw, `charge-slot: home=${homeLoad.toFixed(2)}kW safe=${safeChargeKw}kW`);
+      await updateChargeKw(targetKw, `charge-slot: home=${homeLoad.toFixed(2)}kW plan=${planKw}kW safe=${safeChargeKw}kW`);
       // 每小时整点更新一次 Effective End Date，防止日期过期
       const { mi: currentMin } = sydneyTime();
       if (currentMin < 5) {
