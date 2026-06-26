@@ -867,9 +867,29 @@ async function main() {
 
       const chargeWindows = planRow ? JSON.parse(planRow.charge_windows_json || '[]') : [];
       const w = chargeWindows?.[0];
-      const chargeStartHHMM = w ? w.startHour * 100 : 800;
+      // 如果没有 charge_windows_json，用第一个 charge slot 的时间作为开始（不能 fallback 到 800 ！）
+      const firstCharge = chargeSlots[0];
+      const firstChargeKey = firstCharge?.key || firstCharge?.nemTime?.substring(11,16) || '';
+      const firstChargeH = parseInt(firstChargeKey.substring(0,2) || '0');
+      const firstChargeM = parseInt(firstChargeKey.substring(3,5) || '0');
+      const chargeStartHHMM = w ? w.startHour * 100 : (firstChargeH * 100 + firstChargeM);
 
-      if (ess.reportedMode !== 1) {
+      // 安全校验：开始时间必须 <= 结束时间，否则逆变器不执行
+      if (chargeStartHHMM > chargeEndHHMM) {
+        const { hi, mi } = sydneyTime();
+        const fixedStart = hi * 100 + mi;
+        console.warn(`[告警] chargeStart(${chargeStartHHMM}) > chargeEnd(${chargeEndHHMM})，使用当前时间 ${fixedStart} 作为开始`);
+        // Use current time as start (we're in a charge slot right now)
+        await essApi.restoreTimedMode({
+          startHHMM: fixedStart,
+          endHHMM: chargeEndHHMM,
+          chargeKw: MAX_CHARGE_KW,
+          sellKw: 0,
+          sellStartHHMM: 0,
+          sellEndHHMM: 0
+        }, `charge-timed-fixed: window ${String(fixedStart).padStart(4,'0')}-${String(chargeEndHHMM).padStart(4,'0')}`, 'plan-executor-v3');
+        logData(db, ess, amber, slot, 'mode-switch-timed', { modeFrom: ess.reportedMode, modeTo: 1, fixedStart });
+      } else if (ess.reportedMode !== 1) {
         // 不在 Timed 模式，需要切换并设时间窗口
         console.log(`[模式] charge时段但mode=${ess.reportedMode}，切回 Timed`);
         await essApi.restoreTimedMode({
@@ -1010,7 +1030,13 @@ async function main() {
         return h*60+m > nowMins;
       });
       if (hasFutureSell) {
-        console.log(`[模式] self-use 时段但后续有 sell 窗口，保留 Timed 模式`);
+        // 保留 Timed 模式以便后续 sell 窗口不用再切，但必须停止充电！
+        // 否则逆变器会按之前 charge 时段遗留的功率继续充电（买贵电）
+        // 无条件清零充电功率 — 不管当前是否在充电，防止遗留配置
+        console.log(`[模式] self-use 时段保留 Timed（后续有 sell），清零充电功率`);
+        await essApi.setParam('0xC0BA', 0, 'self-use-stop-charge', 'plan-executor-v3');
+        action = 'self-use';
+        logData(db, ess, amber, slot, 'kept-timed-cleared-charge', { chargeKw: 0, battPower: ess.battPower });
       } else {
         console.log(`[模式] standby/self-use 时段检测到 Timed(1)，切回 Self-use`);
         await switchToSelfUse('self-use-slot');
