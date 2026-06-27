@@ -491,21 +491,14 @@ function buildPlan(slots, pvByHour, currentSocPct, sellSlots, hwSlots, tomorrowP
     const gridHeadroom = BREAKER_KW - Math.max(0, hl - pv) - CHARGE_BUFFER;
     const maxKw = Math.min(MAX_CHARGE_KW, Math.max(0, gridHeadroom));
     const slotKwh = maxKw * 0.5 * 0.95;
-    if (slotKwh < 0.5) continue;
+    // 即使预测高负载时段功率低，也保留（executor 动态调节，热水器可能不在跑）
+    // 只排除完全无法充电的情况（断路器完全没余量）
+    if (maxKw < 0.1) continue;
     chargeKeys.add(s.key);
     accKwh += slotKwh;
   }
 
-  // 不再做连续性填充——纯按价格选槽，executor 能处理非连续充电
-  // 只移除低功率垃圾槽
-  for (const key of [...chargeKeys]) {
-    const [h, m] = key.split(':').map(Number);
-    const pv = pvByHour[h] ?? 0;
-    const hl = homeLoadKw(h, m, hwSlots);
-    const gridHeadroom = BREAKER_KW - Math.max(0, hl - pv) - CHARGE_BUFFER;
-    const maxKw = Math.min(MAX_CHARGE_KW, Math.max(0, gridHeadroom));
-    if (maxKw < 1.0) chargeKeys.delete(key);
-  }
+  // executor 动态调节充电功率，不再基于预测移除"低功率"槽
 
   console.log(`[充电] 选中 ${chargeKeys.size} 槽, 预计充入 ${accKwh.toFixed(1)}kWh`);
   if (sellSlots.length > 0) {
@@ -540,7 +533,7 @@ function buildPlan(slots, pvByHour, currentSocPct, sellSlots, hwSlots, tomorrowP
       reason = 'DW';
     } else if (chargeKeys.has(s.key) && socKwh < chargeTargetKwh) {
       action = 'charge';
-      chargeKw = maxChargeKw;
+      chargeKw = MAX_CHARGE_KW;  // 计划一律写满功率，executor 根据实时 homeLoad 动态调节
       reason = `buy=${s.buyC}¢ → 充到${chargeTargetPct}%`;
     } else if (sellKeys.has(s.key) && socKwh > OVERNIGHT_RESERVE_PCT / 100 * BATT_KWH) {
       action = 'sell';
@@ -550,19 +543,17 @@ function buildPlan(slots, pvByHour, currentSocPct, sellSlots, hwSlots, tomorrowP
       // 低价补充：买价 < 卖电均价80% 且 < 8¢（绝对低价），才值得从电网充
       // 防止 10¢ 买入然后 10¢ 卖出的搞笑操作
       action = 'charge';
-      const gridRoom = parseFloat(Math.min(maxChargeKw, BREAKER_KW - hl - CHARGE_BUFFER).toFixed(2));
-      chargeKw = Math.max(0.5, gridRoom);
+      chargeKw = MAX_CHARGE_KW;  // executor 动态调节
       reason = `cheap buy=${s.buyC}¢<${(avgSellC*0.8).toFixed(1)}¢ grid-charge`;
     } else if (hl > 3 && socKwh < chargeTargetKwh) {
       // 高负载时段（热水器等）+ SOC未达标：必须充电，否则 self-use 会放电给热水器
-      // 不管是否在 hwSlots 里——只要 homeLoad > 3kW 就说明大功率设备在跑
       action = 'charge';
-      chargeKw = Math.max(0.1, maxChargeKw);
+      chargeKw = MAX_CHARGE_KW;  // executor 动态调节
       reason = `热水器运行中，禁止放电 buy=${s.buyC}¢`;
     } else if (hl > 3) {
       // 高负载但 SOC 已达标：至少不放电，用 backup 模式让电网供热水器
       action = 'charge';
-      chargeKw = Math.max(0.1, maxChargeKw);
+      chargeKw = MAX_CHARGE_KW;  // executor 动态调节
       reason = `热水器运行中，禁止放电 buy=${s.buyC}¢`;
     } else if (pv > 0.2 && socKwh < chargeTargetKwh) {
       // PV 消纳（纯太阳能余量，不管电价）
@@ -575,9 +566,10 @@ function buildPlan(slots, pvByHour, currentSocPct, sellSlots, hwSlots, tomorrowP
       reason = `buy=${s.buyC}¢ feedIn=${s.feedInC}¢`;
     }
 
-    // SOC 变化
+    // SOC 变化 — 用预测的实际可充功率估算（考虑热水器等高负载），不是计划的标称功率
+    const effectiveChargeKw = action === 'charge' ? Math.min(MAX_CHARGE_KW, maxChargeKw) : 0;
     const deltaKwh = action === 'charge'
-      ? chargeKw * 0.5 * 0.95
+      ? effectiveChargeKw * 0.5 * 0.95
       : action === 'sell'
         ? -sellKw * 0.5
         : net > 0
