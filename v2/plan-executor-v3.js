@@ -903,11 +903,13 @@ async function main() {
         logData(db, ess, amber, slot, 'mode-switch-timed', { modeFrom: ess.reportedMode, modeTo: 1 });
       }
       const safeChargeKw = calcSafeChargeKw(homeLoad, pvPower, ess.gridPower, ess.battPower);
-      // 尊重计划里的 chargeKw（如手动设了 0.1kW），但不超过断路器安全值
+      // 计划的 chargeKw 是基于预测 homeLoad 算的上限，实际应取实时断路器安全值
+      // 只有手动标记的 slot（reason 含 'manual:' 或 'Deven:'）才严格遵守 planKw
       const planKw = slot.chargeKw ?? MAX_CHARGE_KW;
-      const targetKw = Math.min(planKw, safeChargeKw);
+      const isManualSlot = slot.reason?.startsWith('manual:') || slot.reason?.startsWith('Deven:');
+      const targetKw = isManualSlot ? Math.min(planKw, safeChargeKw) : Math.min(safeChargeKw, MAX_CHARGE_KW);
       if (targetKw < MAX_CHARGE_KW - 0.2) {
-        console.log(`[功率] homeLoad=${homeLoad.toFixed(2)}kW，计划=${planKw}kW，充电 ${targetKw}kW`);
+        console.log(`[功率] homeLoad=${homeLoad.toFixed(2)}kW，计划=${planKw}kW，实际安全=${safeChargeKw.toFixed(2)}kW，充电 ${targetKw}kW`);
       }
       await updateChargeKw(targetKw, `charge-slot: home=${homeLoad.toFixed(2)}kW plan=${planKw}kW safe=${safeChargeKw}kW`);
       // 每小时整点更新一次 Effective End Date，防止日期过期
