@@ -41,8 +41,8 @@ const CHARGE_BUFFER  = e('CHARGE_BUFFER_KW', 0.5);
 const PV_SCALE       = e('PV_SCALE', 0.0032);
 const HW_LOAD_KW     = e('HW_LOAD_KW', 5.0);
 const HW_GRID_MAX_C  = e('HW_GRID_MAX_C', 15.0); // 热水器可接受的最高电价
-const HW_EARLIEST_H  = 8;   // 最早 08:00 开热水器
-const HW_DURATION_SLOTS = 4; // 每台热水器 4 × 30min = 2h
+const HW_EARLIEST_H  = 9;   // 最早 09:00 开热水器
+const HW_DURATION_SLOTS = 6; // 主热水器 6 × 30min = 3h (09:15-12:15)
 const DB_PATH        = path.join(__dirname, '..', 'data', 'energy.db');
 
 // ── 新策略常量 ────────────────────────────────────────────────
@@ -266,10 +266,10 @@ function homeLoadKw(hour, minute, hwSlots) {
 function scheduleHotWater(slots) {
   // 固定时间窗口模式（热水器由物理定时器控制，不走 Tuya）
   if (process.env.TUYA_DISABLED === '1') {
-    console.log('[热水器] Tuya 已禁用，使用固定时间窗口: main_hw 10:00-12:00, gf_hw 12:30-14:30');
+    console.log('[热水器] Tuya 已禁用，使用固定时间窗口: main_hw 09:00-12:30, gf_hw 12:30-15:00');
     return {
-      mainHw: { startKey: '10:00', endKey: '12:00', avgBuyC: 0, slots: [] },
-      gfHw:   { startKey: '12:30', endKey: '14:30', avgBuyC: 0, slots: [] },
+      mainHw: { startKey: '09:00', endKey: '12:30', avgBuyC: 0, slots: [] },
+      gfHw:   { startKey: '12:30', endKey: '15:00', avgBuyC: 0, slots: [] },
     };
   }
 
@@ -474,6 +474,10 @@ function buildPlan(slots, pvByHour, currentSocPct, sellSlots, hwSlots, tomorrowP
   console.log(`[充电] 卖电买价上限: ${sellBuyMax.toFixed(1)}¢ (avgFeedIn=${avgFeedInC.toFixed(1)}¢)`);
 
   // 基础充电候选：非 DW 时段 + 价格 <= CHARGE_MAX_BUY_C + 未来时段，按价格排序
+  // 分两层：过夜需求（不限利润率）+ 卖电额外充电（必须 buyC <= sellBuyMax）
+  const overnightKwh = Math.max(0, OVERNIGHT_RESERVE_PCT / 100 * BATT_KWH - currentKwh);
+  const sellExtraKwh = Math.max(0, neededKwh - overnightKwh);
+
   const chargeCandidates = slots
     .filter(s => {
       const h = parseInt(s.key.split(':')[0]);
@@ -485,6 +489,10 @@ function buildPlan(slots, pvByHour, currentSocPct, sellSlots, hwSlots, tomorrowP
   let accKwh = 0;
   for (const s of chargeCandidates) {
     if (accKwh >= neededKwh) break;
+    // 卖电额外充电部分：买价必须低于卖电利润门槛
+    if (accKwh >= overnightKwh && s.buyC > sellBuyMax) {
+      continue; // 太贵了，充了卖不回本
+    }
     const [h, m] = s.key.split(":").map(Number);
     const pv = pvByHour[h] ?? 0;
     const hl = homeLoadKw(h, m, hwSlots);
@@ -497,6 +505,7 @@ function buildPlan(slots, pvByHour, currentSocPct, sellSlots, hwSlots, tomorrowP
     chargeKeys.add(s.key);
     accKwh += slotKwh;
   }
+  console.log(`[充电] 过夜需求: ${overnightKwh.toFixed(1)}kWh | 卖电额外: ${sellExtraKwh.toFixed(1)}kWh | 卖电买价上限: ${sellBuyMax.toFixed(1)}¢`);
 
   // executor 动态调节充电功率，不再基于预测移除"低功率"槽
 
