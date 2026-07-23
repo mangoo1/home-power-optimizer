@@ -672,15 +672,29 @@ async function main() {
   console.log(`[Amber] ${allSlots.length} 个半小时槽 (未来${futureSlots.length}个), DW: ${allSlots.some(s => s.dw)}`);
 
   // 核心：选卖电槽（带利润校验）
-  // 先算今日实际买电均价作为成本基准
+  // 成本基准：用未来可充电时段的预测买价均值（便宜槽），而非已过去的实际均价
+  // 这样避免早上误充的贵电拉高 costBasis，导致傍晚不卖电
   let avgChargeCostC = 10.0;
+  const futureCheapSlots = futureSlots
+    .filter(s => {
+      const h = parseInt(s.key.split(':')[0]);
+      return h >= 6 && h < 16 && !s.dw && s.buyC > 0 && s.buyC <= CHARGE_MAX_BUY_C;
+    })
+    .sort((a, b) => a.buyC - b.buyC)
+    .slice(0, 12); // 取最便宜的12个槽（6h充电量）
+  if (futureCheapSlots.length > 0) {
+    avgChargeCostC = futureCheapSlots.reduce((sum, s) => sum + s.buyC, 0) / futureCheapSlots.length;
+  }
+  // 也查历史实际均价，取较低的那个（如果历史更便宜，用历史）
   try {
     const todayAvg = db.prepare(
       "SELECT AVG(buy_price) as avg_buy FROM energy_log WHERE date(ts, '+10 hours')=? AND charge_kw > 0 AND buy_price > 0"
     ).get(today);
-    if (todayAvg?.avg_buy > 0) avgChargeCostC = todayAvg.avg_buy;
-    console.log(`[成本] 今日实际充电均价: ${avgChargeCostC.toFixed(1)}¢`);
-  } catch { console.log(`[成本] 查询失败，用默认 ${avgChargeCostC}¢`); }
+    if (todayAvg?.avg_buy > 0 && todayAvg.avg_buy < avgChargeCostC) {
+      avgChargeCostC = todayAvg.avg_buy;
+    }
+  } catch {}
+  console.log(`[成本] 充电成本基准: ${avgChargeCostC.toFixed(1)}¢ (未来便宜槽均价)`);
 
   let sellSlots = planSellSlots(futureSlots, avgChargeCostC);
 
