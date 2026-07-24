@@ -872,8 +872,15 @@ async function main() {
       const firstChargeKey = firstCharge?.key || firstCharge?.nemTime?.substring(11,16) || '';
       const firstChargeH = parseInt(firstChargeKey.substring(0,2) || '0');
       const firstChargeM = parseInt(firstChargeKey.substring(3,5) || '0');
-      const chargeStartHHMM = w ? w.startHour * 100 : (firstChargeH * 100 + firstChargeM);
+      let chargeStartHHMM = w ? w.startHour * 100 : (firstChargeH * 100 + firstChargeM);
 
+      // 安全校验：如果当前正在 charge slot 但 start 在未来，提前到当前时间
+      const { hh: _nowH, mi: _nowM } = sydneyTime();
+      const nowHHMM = _nowH * 100 + _nowM;
+      if (chargeStartHHMM > nowHHMM && slot.action === 'charge') {
+        console.log(`[窗口修正] chargeStart=${chargeStartHHMM} > 当前${nowHHMM}，提前到 ${nowHHMM}`);
+        chargeStartHHMM = nowHHMM;
+      }
       // 安全校验：开始时间必须 <= 结束时间，否则逆变器不执行
       if (chargeStartHHMM > chargeEndHHMM) {
         const { hi, mi } = sydneyTime();

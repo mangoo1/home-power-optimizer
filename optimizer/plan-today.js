@@ -42,11 +42,13 @@ const PANEL_KWP        = 4.3;
 const PV_DISCOUNT      = 0.90;   // real-world derating factor (calibrated 2026-04-15 from 8 days data)
 const INTERVAL_H       = 0.5;    // 30-min slots
 
-// Sell threshold: feedIn must be >= this to consider selling
-const SELL_MIN_C       = 13.5;   // c/kWh absolute floor
+// Sell threshold: feedIn must exceed the charge cost (buy threshold) by this margin to be profitable
+const SELL_PROFIT_MARGIN = 1.25;  // feedIn > chargeCost * 1.25 (25% profit over what we paid)
+const SELL_MIN_C         = 10.0;  // absolute floor — never sell below 10c regardless of margin
 // Buy threshold multiplier: charge when price <= cheapest_avg * BUY_MULT
 const BUY_MULT         = 1.30;
 const BUY_HARD_MAX_C   = 12.0;   // never buy above this regardless
+const SELL_STOP_HOUR   = 21;     // no selling after this hour
 
 // ── Hot water heater config ───────────────────────────────────────────────────
 // Two separate heaters, each ~5kW, each needs 2 hours in daytime.
@@ -348,7 +350,6 @@ async function main() {
   // SOC floor for selling: time-dependent
   const SOC_MIN_SELL_MORNING   = 0.12 * BATTERY_KWH;  // 00:00–10:59
   const SOC_MIN_SELL_AFTERNOON = 0.35 * BATTERY_KWH;  // 11:00–23:59
-  const SELL_STOP_HOUR = 21;
 
   for (const slot of slots) {
     const h       = slot.hour;
@@ -379,7 +380,7 @@ async function main() {
     if (inDW) {
       // Demand window: no charging, allow selling if profitable
       const socMinSell = h < 11 ? SOC_MIN_SELL_MORNING : SOC_MIN_SELL_AFTERNOON;
-      if (feedinC >= SELL_MIN_C && socKwh > socMinSell && h < SELL_STOP_HOUR) {
+      if (feedinC >= SELL_MIN_C && feedinC > buyThresholdC * SELL_PROFIT_MARGIN && socKwh > socMinSell && h < SELL_STOP_HOUR) {
         action = 'sell';
         // Discharge at max safe rate
         const dischargeKwh = Math.min(MAX_DISCHARGE_KW * INTERVAL_H, socKwh - socMinSell);
@@ -405,8 +406,8 @@ async function main() {
       action    = chargeKw > 0 ? 'charge' : 'self-use';
       if (inHW && chargeKw > 0) action = 'charge+hw';  // mark hot water overlap
 
-    } else if (feedinC >= SELL_MIN_C && h < SELL_STOP_HOUR && h >= 6) {
-      // High feedIn: sell — only between 06:00 and SELL_STOP_HOUR (no overnight selling)
+    } else if (feedinC >= SELL_MIN_C && feedinC > buyThresholdC * SELL_PROFIT_MARGIN && h < SELL_STOP_HOUR && h >= 6) {
+      // Profitable sell: feedIn > charge cost * margin (sell only when we profit over what battery cost us)
       const socMinSell = h < 11 ? SOC_MIN_SELL_MORNING : SOC_MIN_SELL_AFTERNOON;
       if (socKwh > socMinSell) {
         action = 'sell';
@@ -455,7 +456,7 @@ async function main() {
   const finalSoc = Math.round((socKwh / BATTERY_KWH) * 100);
   console.log(`\n🔋 Projected end-of-day SOC: ${finalSoc}%`);
   console.log(`   Charge windows: buy ≤ ${buyThresholdC.toFixed(1)}c between 06:00–17:00`);
-  console.log(`   Sell windows:   feedIn ≥ ${SELL_MIN_C}c, SOC > floor, before 21:00`);
+  console.log(`   Sell windows:   feedIn ≥ ${SELL_MIN_C}c AND feedIn > buy×${SELL_PROFIT_MARGIN}, SOC > floor, before ${SELL_STOP_HOUR}:00`);
 
   // Charge windows summary
   const chargeSlots = intervals.filter(s => s.action === 'charge' && s.key.startsWith(today));
@@ -632,7 +633,12 @@ async function applyPlanToInverter(intervals, today) {
     const fh = parseInt(useSell.nemTime.substring(11,13));
     const fm = parseInt(useSell.nemTime.substring(14,16));
     sellStartHHMM = hhmm(fh, fm);
-    sellEndHHMM   = '2100';
+    // Use the last sell slot's end time (slot + 30min), capped at SELL_STOP_HOUR
+    const lastSellSlot = sellSlots[sellSlots.length - 1];
+    const lh = parseInt(lastSellSlot.nemTime.substring(11,13));
+    const lm = parseInt(lastSellSlot.nemTime.substring(14,16));
+    const endMins = Math.min(lh*60 + lm + 30, SELL_STOP_HOUR*60);
+    sellEndHHMM = hhmm(Math.floor(endMins/60), endMins%60);
     console.log(`[INVERTER] Sell window: ${sellStartHHMM}–${sellEndHHMM}, power=${sellKw}kW`);
   } else {
     console.log('[INVERTER] No sell slots today — collapsing sell window');
